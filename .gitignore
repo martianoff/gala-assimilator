@@ -1,0 +1,21 @@
+# GALA transpiler output
+*.gen.go
+
+# Build output
+/gala_assimilator
+/gala_assimilator.exe
+
+# Go
+/bin/
+*.test
+*.out
+
+# gala_team runtime / local state
+.gala_team/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
