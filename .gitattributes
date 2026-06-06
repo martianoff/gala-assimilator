@@ -1,0 +1,22 @@
+# Normalize line endings: store text as LF in the repo, check out LF everywhere.
+* text=auto eol=lf
+
+# Explicit text types
+*.gala   text eol=lf
+*.go     text eol=lf
+*.mod    text eol=lf
+*.sum    text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+
+# Generated GALA output — keep out of diffs/merges
+*.gen.go linguist-generated=true -diff
+
+# Binary files (never normalize)
+*.png    binary
+*.jpg    binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
