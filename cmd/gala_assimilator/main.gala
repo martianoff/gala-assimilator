@@ -6,8 +6,9 @@ import (
 )
 
 // Entry point: wire the engine's public port into the TUI and launch it.
-// MockEngine() is the deterministic offline engine for now; the real GoEngine
-// swaps in here by changing this one line.
+// GoEngine() is the real frontend — it scans the actual Go project the user
+// points S1 at (translation is still the mock translator until the real agent
+// backend is unblocked). Swap to engine.MockEngine() for a fixture-only run.
 func main() {
-    RunApp(engine.MockEngine())
+    RunApp(engine.GoEngine())
 }
