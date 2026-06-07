@@ -1,0 +1,38 @@
+package engine
+
+// Tests for backend selection and the Claude backend's construction. The LIVE
+// Claude pump (claudeSubmit / pumpClaude) is exercised only at runtime with real
+// credentials — these tests stay fully offline: they never reach a Submit, so no
+// `claude` subprocess is ever spawned.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    acp "github.com/martianoff/gala-acp"
+)
+
+// The default / offline backend drives the stub workspace to completion through
+// the acp-backed run pipeline — selection + scan + plan + run + gate end to end.
+func TestSelectBackendMockRunsToDone(t T) T {
+    val eng = SelectBackend("mock")
+    val finished = RunToCompletion(eng, eng.Run(eng.Plan(eng.Scan(ScanRequest(Root = ".")))))
+    return Eq(t, CountByDone(finished), 4)
+}
+
+// The "claude" backend CONSTRUCTS without IO (its live transport is only touched at
+// Submit time, which this test never reaches), and its pure port ops work: an
+// empty run checkpoints and resumes with no loss.
+func TestClaudeBackendConstructsAndCheckpoints(t T) T {
+    val eng   = SelectBackend("claude")
+    val empty = RunState(Units = EmptyArray[UnitRun](), Log = EmptyArray[EngineEvent]())
+    val rt    = eng.Resume(eng.Checkpoint(empty))
+    return Eq(t, rt.Units.Length(), 0)
+}
+
+// ClaudeTranslator is constructible (the hook a future offline fake-transport test
+// drives). Building the runner spawns nothing; its Cancel is a pure acknowledgement.
+func TestClaudeTranslatorConstructs(t T) T {
+    val runner = ClaudeTranslator()
+    return Eq(t, acp.CancelOutcomeTag(runner.Cancel("task-1")), "cancelled")
+}

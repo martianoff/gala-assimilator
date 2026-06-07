@@ -41,7 +41,7 @@ func allSixMessages() Array[Message] {
     val task = TaskId(Value = "task-1")
     return ArrayOf[Message](
         MsgTaskAssignment(Payload = sampleAssignment()),
-        MsgProgressEvent(Payload = ProgressEvent(Task = task, Phase = PhaseReading(), Note = "reading")),
+        MsgProgressEvent(Payload = ProgressUpdate(Task = task, Phase = PhaseReading(), Note = "reading")),
         MsgResult(Payload = Result(
             Task = task, TargetText = "x", Rationale = "identity",
             Flags = EmptyArray[UnsupportedFlag](),
@@ -97,9 +97,9 @@ func TestProgressPhaseExhaustive(t T) T {
     return Eq(t2, phaseTag(PhaseVerifying()), "verifying")
 }
 
-// A Verifying-phase ProgressEvent is constructible and matchable.
+// A Verifying-phase ProgressUpdate is constructible and matchable.
 func TestVerifyingProgressEvent(t T) T {
-    val ev = ProgressEvent(Task = TaskId(Value = "task-1"), Phase = PhaseVerifying(), Note = "self-checking")
+    val ev = ProgressUpdate(Task = TaskId(Value = "task-1"), Phase = PhaseVerifying(), Note = "self-checking")
     return ev.Phase match {
         case PhaseVerifying() => IsTrue(t, true)
         case PhaseReading()   => Fail(t, "expected Verifying")

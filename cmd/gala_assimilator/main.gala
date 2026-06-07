@@ -2,14 +2,19 @@ package main
 
 // BOOTSTRAP PLACEHOLDER — not the real application.
 //
-// This entrypoint exists only so the workspace builds end-to-end
-// (`gala build -o gala_assimilator ./cmd/gala_assimilator`) while the engine and
-// its UI are still being assembled. It deliberately pulls in NOTHING — no
-// gala_tui, no app/ui, no engine wiring — so the build gate stays honest about
-// what compiles today, and the engine package is exercised by `gala test`.
+// This entrypoint stays dependency-free on purpose. The migration engine now
+// builds on the gala-acp run contract, and its backends are selected via
+// `engine.SelectBackend(name)`:
+//   - "claude" — the LIVE Claude translator (gala-acp `agent` transport).
+//   - "go"     — the real Go-source frontend on the deterministic mock translator.
+//   - default  — the fully offline stub engine (no IO, no credentials).
 //
-// The real UI wiring (a gala_tui Program consuming the engine's EnginePort) lands
-// in a later milestone and replaces this banner.
+// cmd does NOT import the engine yet: under the GALA 0.49.2 toolchain a non-entry
+// package's self-import is not rewritten to the build workspace, so `cmd` importing
+// `app/engine` compiles via `gala build ./cmd` but breaks the whole-workspace
+// `gala test` (cmd is a non-entry there). The real gala_tui UI lands as the build
+// entry in a later milestone and wires `engine.SelectBackend` directly; until then
+// the engine is exercised end-to-end by `gala test`.
 func main() {
-    Println("gala-assimilator: bootstrap placeholder — engine foundation landed; UI wiring next milestone")
+    Println("gala-assimilator: engine on the gala-acp run contract — backends: mock (offline default), go (real scan), claude (live translation). UI wiring next milestone.")
 }
