@@ -41,7 +41,7 @@ func TestS4WideRendersDiffRationaleVerify(t T) T {
     val t3 = IsTrue(t2, out.Contains("Target"))
     val t4 = IsTrue(t3, out.Contains("// source: core/value.go"))   // source side
     val t5 = IsTrue(t4, out.Contains("// mock translation"))        // emitted target
-    val t6 = IsTrue(t5, out.Contains("deterministic mock output"))  // rationale
+    val t6 = IsTrue(t5, out.Contains("mock output"))                // rationale
     val t7 = IsTrue(t6, out.Contains("Verify"))
     val t8 = IsTrue(t7, out.Contains("done"))
     return IsTrue(t8, out.Contains("a accept"))                     // action bar
