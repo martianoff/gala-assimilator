@@ -6,9 +6,9 @@ import (
 )
 
 // Entry point: wire the engine's public port into the TUI and launch it.
-// GoEngine() is the real frontend — it scans the actual Go project the user
-// points S1 at (translation is still the mock translator until the real agent
-// backend is unblocked). Swap to engine.MockEngine() for a fixture-only run.
+// GoEngine() scans the real Go project the user points S1 at and drives it
+// through the same port the UI consumes; swap to engine.MockEngine() for a
+// deterministic fixture-only run. The UI drives whatever port it is given.
 func main() {
     RunApp(engine.GoEngine())
 }
