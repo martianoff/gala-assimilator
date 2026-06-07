@@ -111,14 +111,22 @@ sealed type ProgressPhase {
 // ----------------------------------------------------------------------------
 
 // TaskAssignment: engine -> agent. The unit to translate, the curated source
-// context, the target conventions, and — populated only on a retry — the prior
-// failure to learn from.
+// context, and the target conventions, plus two re-submission carriers that
+// keep the port one-shot/stateless:
+//   - PriorFailure: populated only on a RETRY (after a reviewer Reject), so the
+//     agent can learn from why the previous attempt was rejected.
+//   - Answers: the accumulated answers to prior Clarifications on this unit.
+//     Populated only on a RE-SUBMISSION after the agent ended a run with an
+//     OutcomeClarification (see runner.gala's clarification-resolution loop).
+//     Mirrors PriorFailure exactly: the engine never holds a live reply channel,
+//     it just threads the resolved Answers back in on the next assignment.
 struct TaskAssignment(
     Task         TaskId,
     Unit         UnitId,
     Source       SourceContext,
     Target       TargetConventions,
     PriorFailure Option[PriorFailure],
+    Answers      Array[Answer],
 )
 
 // ProgressEvent: agent -> engine. A streamed status note (reading / emitting /
