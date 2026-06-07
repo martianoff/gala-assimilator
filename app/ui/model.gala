@@ -1,6 +1,7 @@
 package ui
 
 import (
+    "github.com/martianoff/gala-assimilator/app/engine"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
 )
@@ -8,20 +9,21 @@ import (
 // ============================================================================
 // Model — the single immutable app state.
 //
-// Routing is a `state.ScreenStack` of route tokens (S1 root → S2 → S3 → S6).
-// Keyboard focus on S1 is a `state.FocusManager` ring; every interactive
-// control owns one pane id so Tab/Shift-Tab and mouse focus share one source
-// of truth. Viewport size (Cols/Rows) drives the responsive layout and is
-// refreshed from ResizeInput.
+// Routing is a ScreenStack of route tokens: S1 (interview) → S2 (plan summary)
+// → S3 (assimilation dashboard). The engine is consumed ONLY through its public
+// port (engine.EnginePort); the live run is carried as plain engine value types
+// (WorkspaceModel / MigrationPlan / RunState) — no engine internals.
+//
+// S1 keyboard focus is a FocusRing; S2/S3 each track their own small focus +
+// cursor/scroll state so mouse and keyboard reach the same actions everywhere.
 // ============================================================================
 
-// Route tokens for the ScreenStack. Kept as functions so there's one spelling.
+// Route tokens for the ScreenStack.
 func RouteS1() string = "S1"   // Setup / Interview
-func RouteS2() string = "S2"   // Scan (placeholder this milestone)
-func RouteS3() string = "S3"   // Plan (placeholder)
-func RouteS6() string = "S6"   // Report (placeholder)
+func RouteS2() string = "S2"   // Plan summary
+func RouteS3() string = "S3"   // Assimilation dashboard
 
-// Focus pane ids for S1 — order defines the Tab ring.
+// S1 focus pane ids — order defines the Tab ring.
 func PaneBrowse() string      = "browse"
 func PaneTarget() string      = "target"
 func PaneUnsupported() string = "unsupported"
@@ -29,6 +31,12 @@ func PaneRetry() string       = "retry"
 func PaneBackend() string     = "backend"
 func PaneAmbiguity() string   = "ambiguity"
 func PaneScan() string        = "scan"
+
+// S2 / S3 focus pane ids.
+func PaneStart() string = "start"  // S2 start-run button
+func PaneBack() string  = "back"   // S2 back button
+func PaneTree() string  = "tree"   // S3 unit tree
+func PaneLog() string   = "log"    // S3 activity log
 
 func s1Panes() Array[string] =
     ArrayOf[string](
@@ -41,21 +49,21 @@ func s1Panes() Array[string] =
         PaneScan(),
     )
 
-// Minimum viewport the full layout needs; below this the view shows a resize
-// notice instead of a broken layout.
+// Minimum viewport the full layout needs; below this a resize notice shows.
 func MinCols() int = 60
 func MinRows() int = 14
 
-// Above this width the retry-budget and agent-backend controls share one row;
-// below it they stack so nothing is clipped.
+// Above this width S1 combines retry+backend onto one row; S3 keeps the split
+// board side-by-side. Below it, both stack.
 func WideCols() int = 86
 
 struct Model(
-    Screens  ScreenStack,
-    Focus    FocusRing,
-    Port     EnginePort,
-    Cols     int,
-    Rows     int,
+    Screens ScreenStack,
+    Focus   FocusRing,
+    Port    engine.EnginePort,
+    Cols    int,
+    Rows    int,
+    // S1 interview
     SourceDir    string,
     Source       SourceInfo,
     TargetIdx    int,
@@ -63,12 +71,19 @@ struct Model(
     Retry        int,
     Backend      AgentBackend,
     AmbiguityIdx int,
-    Scanning bool,
-    LastScan Option[ScanOutcome],
+    Scanning     bool,
+    // engine run state (plain value types from the public port)
+    Workspace Option[engine.WorkspaceModel],
+    Plan      Option[engine.MigrationPlan],
+    Run       Option[engine.RunState],
+    // S2 / S3 navigation
+    S2Focus    string,
+    S3Focus    string,
+    TreeCursor int,
+    LogScroll  int,   // lines scrolled up from the tail (0 = following latest)
 )
 
-// browseDirs is the small set of sample project paths the Browse control
-// cycles through (a real file picker lands in a later milestone).
+// browseDirs is the small set of sample project paths the Browse control cycles.
 func browseDirs() Array[string] =
     ArrayOf[string](
         "/workdir/myproject",
@@ -77,25 +92,29 @@ func browseDirs() Array[string] =
     )
 
 // NewModel builds the initial state for the given engine port and viewport.
-// Detection runs once up front so S1's "Detected source" row is populated on
-// first paint; it's cheap and lets the snapshot tests be deterministic.
-func NewModel(port EnginePort, cols int, rows int) Model {
+func NewModel(port engine.EnginePort, cols int, rows int) Model {
     val dir = browseDirs().Get(0)
     return Model(
-        Screens  = NewScreenStack(RouteS1()),
-        Focus    = NewFocusRing(s1Panes()),
-        Port     = port,
-        Cols     = cols,
-        Rows     = rows,
+        Screens = NewScreenStack(RouteS1()),
+        Focus   = NewFocusRing(s1Panes()),
+        Port    = port,
+        Cols    = cols,
+        Rows    = rows,
         SourceDir    = dir,
-        Source       = port.DetectSource(dir),
+        Source       = detectSource(dir),
         TargetIdx    = 0,
         Unsupported  = FlagContinue(),
         Retry        = 3,
         Backend      = MockBackend(),
         AmbiguityIdx = 0,
-        Scanning = false,
-        LastScan = None[ScanOutcome](),
+        Scanning     = false,
+        Workspace = None[engine.WorkspaceModel](),
+        Plan      = None[engine.MigrationPlan](),
+        Run       = None[engine.RunState](),
+        S2Focus    = PaneStart(),
+        S3Focus    = PaneTree(),
+        TreeCursor = 0,
+        LogScroll  = 0,
     )
 }
 
@@ -106,14 +125,3 @@ func (m Model) TargetLang() string =
 // Ambiguity is the currently-selected ambiguity-default label.
 func (m Model) Ambiguity() string =
     AmbiguityOptions().Get(clampIdx(m.AmbiguityIdx, AmbiguityOptions().Length()))
-
-// Config snapshots the interview into the value the engine port consumes.
-func (m Model) Config() MigrationConfig =
-    MigrationConfig(
-        SourceDir    = m.SourceDir,
-        TargetLang   = m.TargetLang(),
-        Unsupported  = m.Unsupported,
-        RetryBudget  = m.Retry,
-        AgentBackend = m.Backend,
-        Ambiguity    = m.Ambiguity(),
-    )

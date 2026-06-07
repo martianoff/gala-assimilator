@@ -2,35 +2,40 @@ package ui
 
 import (
     . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    . "martianoff/gala/time_utils"
 )
 
 // ============================================================================
-// Messages + the pure Update loop.
+// Messages + the pure, non-blocking Update loop.
 //
-// Message names carry an `M` prefix: dot-importing gala_tui brings sealed-type
-// cases like `Up()` / `Down()` / `NoOp()` into scope, and an app case of the
-// same name would collide. The prefix keeps the vocabulary unambiguous.
-//
-// Update never blocks. The one piece of engine work — ScanProject — is issued
-// as an `Async` Cmd (a Future the runtime drains off the loop); Update returns
-// immediately with `Scanning = true` and the result arrives later as
-// `MScanCompleted`.
+// The assimilation flow is: S1 "scan project →" issues an Async engine
+// Scan→Plan → S2 plan summary; S2 "start" issues an Async Run → S3 dashboard,
+// then a self-rescheduling AfterDelay tick calls engine.Advance one step at a
+// time, so the dashboard visibly climbs 0→100% without ever blocking Update.
+// Engine values flow as plain port data; all pattern-matching on engine sealed
+// types is isolated in runview.gala.
 // ============================================================================
 
 sealed type Msg {
-    // Keyboard-driven, focus-relative.
+    // shared, keyboard-driven (routed per active screen)
     case MFocusNext()
     case MFocusPrev()
-    case MActivate()                       // Enter / Space on the focused control
-    case MStepLeft()                       // ArrowLeft  on the focused control
-    case MStepRight()                      // ArrowRight on the focused control
-    case MBack()                           // Esc — pop a screen, or quit at root
+    case MActivate()    // Enter / Space
+    case MStepLeft()    // ArrowLeft  (S1 cyclers)
+    case MStepRight()   // ArrowRight (S1 cyclers)
+    case MNavUp()       // ArrowUp    (S3 tree cursor / log scroll)
+    case MNavDown()     // ArrowDown
+    case MScrollUp()    // wheel up   (S3 log)
+    case MScrollDown()  // wheel down
+    case MBack()        // Esc — pop a screen, or quit at root
     case MQuit()
     case MNoOp()
 
-    // Mouse-driven, control-specific (each also moves focus to that control).
+    // S1 direct (mouse), each also moves focus to that control
     case MBrowse()
     case MCycleTarget()
     case MSetUnsupported(P UnsupportedPolicy)
@@ -39,8 +44,15 @@ sealed type Msg {
     case MCycleAmbiguity()
     case MScanRequested()
 
-    // Engine + runtime.
-    case MScanCompleted(Out ScanOutcome)
+    // S2 / S3 direct (mouse)
+    case MStartRun()
+    case MSelectUnit(Idx int)
+    case MFocusPane(Pane string)
+
+    // engine + runtime
+    case MScanPlanned(Workspace engine.WorkspaceModel, Plan engine.MigrationPlan)
+    case MRunStarted(State engine.RunState)
+    case MRunTick()
     case MResized(W int, H int)
 }
 
@@ -48,12 +60,17 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MQuit()        => (m, QuitCmd[Msg]())
     case MNoOp()        => (m, NoCmd[Msg]())
     case MResized(w, h) => (m.Copy(Cols = w, Rows = h), NoCmd[Msg]())
-    case MFocusNext()   => (m.Copy(Focus = m.Focus.Next()), NoCmd[Msg]())
-    case MFocusPrev()   => (m.Copy(Focus = m.Focus.Prev()), NoCmd[Msg]())
-    case MActivate()    => activate(m)
-    case MStepLeft()    => (step(m, -1), NoCmd[Msg]())
-    case MStepRight()   => (step(m, 1), NoCmd[Msg]())
     case MBack()        => back(m)
+
+    case MFocusNext()  => (focusNext(m), NoCmd[Msg]())
+    case MFocusPrev()  => (focusPrev(m), NoCmd[Msg]())
+    case MActivate()   => activate(m)
+    case MStepLeft()   => (step(m, -1), NoCmd[Msg]())
+    case MStepRight()  => (step(m, 1), NoCmd[Msg]())
+    case MNavUp()      => (nav(m, -1), NoCmd[Msg]())
+    case MNavDown()    => (nav(m, 1), NoCmd[Msg]())
+    case MScrollUp()   => (scrollLog(m, 1), NoCmd[Msg]())
+    case MScrollDown() => (scrollLog(m, -1), NoCmd[Msg]())
 
     case MBrowse()          => (browse(focusOn(m, PaneBrowse())), NoCmd[Msg]())
     case MCycleTarget()     => (cycleTarget(focusOn(m, PaneTarget()), 1), NoCmd[Msg]())
@@ -69,34 +86,92 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MCycleAmbiguity()  => (cycleAmbiguity(focusOn(m, PaneAmbiguity()), 1), NoCmd[Msg]())
     case MScanRequested()   => startScan(focusOn(m, PaneScan()))
 
-    case MScanCompleted(out) => (scanDone(m, out), NoCmd[Msg]())
+    case MStartRun()   => startRun(m)
+    case MSelectUnit(i) => (selectUnit(m, i), NoCmd[Msg]())
+    case MFocusPane(p)  => (focusPane(m, p), NoCmd[Msg]())
+
+    case MScanPlanned(ws, plan) => (scanPlanned(m, ws, plan), NoCmd[Msg]())
+    case MRunStarted(st)        => runStarted(m, st)
+    case MRunTick()             => runTick(m)
 }
 
-// ----- focus-relative dispatch ----------------------------------------------
+// ----- per-screen routing of shared keys ------------------------------------
 
-// activate runs the focused control's primary action. Only "scan" produces a
-// Cmd; the rest are pure model edits wrapped with noCmd.
+func focusNext(m Model) Model {
+    val r = m.Screens.Current()
+    if (r == RouteS1()) { return m.Copy(Focus = m.Focus.Next()) }
+    if (r == RouteS2()) { return m.Copy(S2Focus = otherS2(m.S2Focus)) }
+    if (r == RouteS3()) { return m.Copy(S3Focus = otherS3(m.S3Focus)) }
+    return m
+}
+
+func focusPrev(m Model) Model {
+    val r = m.Screens.Current()
+    if (r == RouteS1()) { return m.Copy(Focus = m.Focus.Prev()) }
+    if (r == RouteS2()) { return m.Copy(S2Focus = otherS2(m.S2Focus)) }
+    if (r == RouteS3()) { return m.Copy(S3Focus = otherS3(m.S3Focus)) }
+    return m
+}
+
+func otherS2(p string) string = if (p == PaneStart()) PaneBack() else PaneStart()
+func otherS3(p string) string = if (p == PaneTree()) PaneLog() else PaneTree()
+
 func activate(m Model) Tuple[Model, Cmd[Msg]] {
-    val pane = m.Focus.Current()
-    if pane == PaneBrowse()      { return noCmd(browse(m)) }
-    if pane == PaneTarget()      { return noCmd(cycleTarget(m, 1)) }
-    if pane == PaneUnsupported() { return noCmd(moveUnsupported(m, 1)) }
-    if pane == PaneRetry()       { return noCmd(stepRetry(m, 1)) }
-    if pane == PaneBackend()     { return noCmd(toggleBackend(m, 1)) }
-    if pane == PaneAmbiguity()   { return noCmd(cycleAmbiguity(m, 1)) }
-    if pane == PaneScan()        { return startScan(m) }
+    val r = m.Screens.Current()
+    if (r == RouteS1()) { return s1Activate(m) }
+    if (r == RouteS2()) {
+        if (m.S2Focus == PaneStart()) { return startRun(m) }
+        return back(m)
+    }
     return noCmd(m)
 }
 
-// step applies an ArrowLeft/Right (dir = -1 / +1) to the focused control.
-// Controls without a horizontal action (browse, scan) leave the model alone.
-func step(m Model, dir int) Model {
+// s1Activate runs the focused S1 control's primary action.
+func s1Activate(m Model) Tuple[Model, Cmd[Msg]] {
     val pane = m.Focus.Current()
-    if pane == PaneTarget()      { return cycleTarget(m, dir) }
-    if pane == PaneUnsupported() { return moveUnsupported(m, dir) }
-    if pane == PaneRetry()       { return stepRetry(m, dir) }
-    if pane == PaneBackend()     { return toggleBackend(m, dir) }
-    if pane == PaneAmbiguity()   { return cycleAmbiguity(m, dir) }
+    if (pane == PaneBrowse())      { return noCmd(browse(m)) }
+    if (pane == PaneTarget())      { return noCmd(cycleTarget(m, 1)) }
+    if (pane == PaneUnsupported()) { return noCmd(moveUnsupported(m, 1)) }
+    if (pane == PaneRetry())       { return noCmd(stepRetry(m, 1)) }
+    if (pane == PaneBackend())     { return noCmd(toggleBackend(m, 1)) }
+    if (pane == PaneAmbiguity())   { return noCmd(cycleAmbiguity(m, 1)) }
+    if (pane == PaneScan())        { return startScan(m) }
+    return noCmd(m)
+}
+
+// step is ArrowLeft/Right — S1 cyclers only.
+func step(m Model, dir int) Model {
+    if (m.Screens.Current() != RouteS1()) { return m }
+    val pane = m.Focus.Current()
+    if (pane == PaneTarget())      { return cycleTarget(m, dir) }
+    if (pane == PaneUnsupported()) { return moveUnsupported(m, dir) }
+    if (pane == PaneRetry())       { return stepRetry(m, dir) }
+    if (pane == PaneBackend())     { return toggleBackend(m, dir) }
+    if (pane == PaneAmbiguity())   { return cycleAmbiguity(m, dir) }
+    return m
+}
+
+// nav is ArrowUp/Down — S3 only: move the tree cursor or scroll the log.
+func nav(m Model, dir int) Model {
+    if (m.Screens.Current() != RouteS3()) { return m }
+    if (m.S3Focus == PaneLog()) { return scrollLog(m, -dir) }
+    val n = unitCount(m)
+    val hi = if (n > 0) n - 1 else 0
+    return m.Copy(TreeCursor = clampInt(m.TreeCursor + dir, 0, hi))
+}
+
+func scrollLog(m Model, amount int) Model =
+    m.Copy(LogScroll = clampInt(m.LogScroll + amount, 0, logLen(m)))
+
+func selectUnit(m Model, i int) Model {
+    val n = unitCount(m)
+    val hi = if (n > 0) n - 1 else 0
+    return m.Copy(S3Focus = PaneTree(), TreeCursor = clampInt(i, 0, hi))
+}
+
+func focusPane(m Model, p string) Model {
+    if (p == PaneStart() || p == PaneBack()) { return m.Copy(S2Focus = p) }
+    if (p == PaneTree() || p == PaneLog())   { return m.Copy(S3Focus = p) }
     return m
 }
 
@@ -104,7 +179,7 @@ func noCmd(m Model) Tuple[Model, Cmd[Msg]] = (m, NoCmd[Msg]())
 
 func focusOn(m Model, pane string) Model = m.Copy(Focus = m.Focus.FocusOn(pane))
 
-// ----- pure control edits ---------------------------------------------------
+// ----- S1 pure control edits ------------------------------------------------
 
 func cycleTarget(m Model, dir int) Model =
     m.Copy(TargetIdx = clampIdx(m.TargetIdx + dir, TargetLangOptions().Length()))
@@ -131,31 +206,88 @@ func browse(m Model) Model {
     val dirs = browseDirs()
     val cur = indexOfDir(dirs, m.SourceDir)
     val nextDir = dirs.Get(clampIdx(cur + 1, dirs.Length()))
-    return m.Copy(SourceDir = nextDir, Source = m.Port.DetectSource(nextDir))
+    return m.Copy(SourceDir = nextDir, Source = detectSource(nextDir))
 }
 
-// ----- engine + navigation --------------------------------------------------
+// ----- engine flow: scan → plan → run → tick --------------------------------
 
-// startScan issues the scan as an off-loop Async Cmd and flips Scanning on.
+// startScan probes the project through the port (Scan→Plan) off the loop.
 func startScan(m Model) Tuple[Model, Cmd[Msg]] {
-    val cfg = m.Config()
     val port = m.Port
-    val cmd = Async[ScanOutcome, Msg](
-        () => port.ScanProject(cfg),
-        (out) => MScanCompleted(Out = out),
+    val root = m.SourceDir
+    val cmd = Async[engine.WorkspaceModel, Msg](
+        () => port.Scan(engine.ScanRequest(Root = root)),
+        (ws) => MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
     )
     return (m.Copy(Scanning = true), cmd)
 }
 
-func scanDone(m Model, out ScanOutcome) Model =
+func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) Model =
     m.Copy(
-        Scanning = false,
-        LastScan = Some(out),
-        Screens  = m.Screens.Push(RouteS2()),
+        Scanning  = false,
+        Workspace = Some(ws),
+        Plan      = Some(plan),
+        S2Focus   = PaneStart(),
+        Screens   = m.Screens.Push(RouteS2()),
     )
 
+// startRun materializes the run and routes to S3, kicking the first tick.
+func startRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
+    case Some(plan) => {
+        val port = m.Port
+        val cmd = Async[engine.RunState, Msg](
+            () => port.Run(plan),
+            (st) => MRunStarted(State = st),
+        )
+        return (m, cmd)
+    }
+    case None() => noCmd(m)
+}
+
+func runStarted(m Model, st engine.RunState) Tuple[Model, Cmd[Msg]] {
+    val m2 = m.Copy(
+        Run        = Some(st),
+        S3Focus    = PaneTree(),
+        TreeCursor = 0,
+        LogScroll  = 0,
+        Screens    = m.Screens.Push(RouteS3()),
+    )
+    return (m2, tickCmd())
+}
+
+// runTick advances one engine step; re-schedules itself while work remains, so
+// the dashboard animates to completion and then quiesces.
+func runTick(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
+    case Some(st) => {
+        if (runview.AnyActionable(st)) {
+            val next = m.Port.Advance(st)
+            val m2 = m.Copy(Run = Some(next))
+            if (runview.AnyActionable(next)) { return (m2, tickCmd()) }
+            return (m2, NoCmd[Msg]())
+        }
+        return (m, NoCmd[Msg]())
+    }
+    case None() => (m, NoCmd[Msg]())
+}
+
+// tickCmd schedules the next tick off the Update loop (a Future the runtime
+// drains). In tests, MRunTick is sent directly instead.
+func tickCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(60)), () => MRunTick())
+
+func unitCount(m Model) int = m.Run match {
+    case Some(rs) => rs.Units.Length()
+    case None()   => 0
+}
+
+func logLen(m Model) int = m.Run match {
+    case Some(rs) => rs.Log.Length()
+    case None()   => 0
+}
+
+// ----- navigation ------------------------------------------------------------
+
 func back(m Model) Tuple[Model, Cmd[Msg]] {
-    if m.Screens.CanGoBack() {
+    if (m.Screens.CanGoBack()) {
         return (m.Copy(Screens = m.Screens.Pop()), NoCmd[Msg]())
     }
     return (m, QuitCmd[Msg]())
@@ -167,7 +299,7 @@ func indexOfDir(dirs Array[string], dir string) int {
     var i = 0
     val n = dirs.Length()
     for i < n {
-        if dirs.Get(i) == dir { return i }
+        if (dirs.Get(i) == dir) { return i }
         i = i + 1
     }
     return 0
@@ -177,7 +309,7 @@ func indexOfUnsupported(opts Array[UnsupportedPolicy], p UnsupportedPolicy) int 
     var i = 0
     val n = opts.Length()
     for i < n {
-        if UnsupportedEq(opts.Get(i), p) { return i }
+        if (UnsupportedEq(opts.Get(i), p)) { return i }
         i = i + 1
     }
     return 0
@@ -187,7 +319,7 @@ func indexOfBackend(opts Array[AgentBackend], b AgentBackend) int {
     var i = 0
     val n = opts.Length()
     for i < n {
-        if BackendEq(opts.Get(i), b) { return i }
+        if (BackendEq(opts.Get(i), b)) { return i }
         i = i + 1
     }
     return 0
@@ -195,29 +327,37 @@ func indexOfBackend(opts Array[AgentBackend], b AgentBackend) int {
 
 // ----- input adapters --------------------------------------------------------
 
-// keyToMsg maps a decoded key to a Msg. Every S1 action is reachable here so
-// keyboard parity with the mouse is complete.
 func keyToMsg(ev KeyEvent) Msg {
-    if KeyMatchesAny(ev, "ctrl+c", "q") { return MQuit() }
-    if KeyMatches(ev, "shift+tab") { return MFocusPrev() }
+    if (KeyMatchesAny(ev, "ctrl+c", "q")) { return MQuit() }
+    if (KeyMatches(ev, "shift+tab")) { return MFocusPrev() }
     return ev.Key match {
         case Tab()        => MFocusNext()
         case Enter()      => MActivate()
         case Space()      => MActivate()
         case ArrowLeft()  => MStepLeft()
         case ArrowRight() => MStepRight()
+        case Up()         => MNavUp()
+        case Down()       => MNavDown()
         case Esc()        => MBack()
         case _            => MNoOp()
     }
 }
 
-// inputToMsg unifies key / mouse / resize. Clicks on interactive widgets are
-// routed by the framework's HitRegistry before this runs, so here mouse events
-// are only scroll/unregistered clicks → no-op. Resize feeds the responsive
-// layout.
+// inputToMsg unifies key / mouse / resize. Widget clicks are routed by the
+// framework's HitRegistry before this runs; here mouse events are wheel scrolls
+// (→ log scroll) or unregistered clicks (→ no-op). Resize feeds the layout.
 func inputToMsg(ev InputEvent) Msg = ev match {
     case KeyInput(k)       => keyToMsg(k)
-    case MouseInput(_)     => MNoOp()
+    case MouseInput(me)    => mouseToMsg(me)
     case ResizeInput(w, h) => MResized(W = w, H = h)
     case UnknownInput()    => MNoOp()
+}
+
+func mouseToMsg(me MouseEvent) Msg = me.Btn match {
+    case MouseScrollUp()   => MScrollUp()
+    case MouseScrollDown() => MScrollDown()
+    case MouseLeft()       => MNoOp()
+    case MouseMiddle()     => MNoOp()
+    case MouseRight()      => MNoOp()
+    case MouseButtonNone() => MNoOp()
 }

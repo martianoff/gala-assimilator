@@ -1,0 +1,26 @@
+package ui
+
+// ============================================================================
+// S1 source detection — a pre-scan UI hint, NOT part of the engine surface.
+//
+// The authoritative scan happens through the engine port on "scan project →"
+// (engine.Scan → engine.Plan). Detection here is a cosmetic readout so the
+// interview shows what kind of project the chosen directory looks like; it
+// reads nothing and is pure. When a real detector lands it stays UI-side.
+// ============================================================================
+
+// SourceInfo is the detected-source readout shown on S1.
+struct SourceInfo(
+    Lang     string,
+    Marker   string,
+    FileCnt  int,
+    Detected bool,
+)
+
+// detectSource produces the S1 hint for a directory (a fixed stand-in).
+func detectSource(dir string) SourceInfo {
+    if dir == "" {
+        return SourceInfo(Lang = "", Marker = "no project", FileCnt = 0, Detected = false)
+    }
+    return SourceInfo(Lang = "Go", Marker = "go.mod found", FileCnt = 50, Detected = true)
+}

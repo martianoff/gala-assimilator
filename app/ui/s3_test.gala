@@ -1,0 +1,105 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-tui/harness"
+    . "martianoff/gala/collection_immutable"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// S3 dashboard — render snapshots at two widths with a mid-run RunState, plus
+// an interaction test that starts a run and asserts the activity log grows and
+// the done-count climbs as ticks advance.
+// ============================================================================
+
+// midRunModel drives scan→plan→run then `nticks` Advances and returns the model
+// sitting on S3 mid-assimilation.
+func midRunModel(cols int, rows int, nticks int) Model {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val program = NewProgram(port, cols, rows)
+    val setup = ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = plan),
+        MRunStarted(State = st),
+    )
+    val (m1, _) = StepAll(program, setup.AppendAll(ticks(nticks)))
+    return m1
+}
+
+func logLenOf(m Model) int = m.Run match {
+    case Some(rs) => rs.Log.Length()
+    case None()   => 0
+}
+
+// ----- render snapshots ------------------------------------------------------
+
+func TestS3WideRendersSplitBoard(t T) T {
+    val m = midRunModel(110, 24, 5)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t,  out.Contains("Assimilation in progress"))
+    val t2 = IsTrue(t1, out.Contains("units ("))       // progress bar readout
+    val t3 = IsTrue(t2, out.Contains("Units"))          // left pane title
+    val t4 = IsTrue(t3, out.Contains("Activity"))       // right pane title
+    val t5 = IsTrue(t4, out.Contains("core/value"))     // a unit row in the tree
+    return IsTrue(t5, out.Contains("done"))             // status count / label
+}
+
+func TestS3NarrowStacksBoard(t T) T {
+    val m = midRunModel(72, 24, 5)
+    val out = str.S(Snapshot(view(m), 72, 24))
+    val t1 = IsTrue(t,  out.Contains("Assimilation in progress"))
+    val t2 = IsTrue(t1, out.Contains("Units"))
+    val t3 = IsTrue(t2, out.Contains("Activity"))
+    return IsTrue(t3, out.Contains("core/"))
+}
+
+// At completion the bar is at 100%.
+func TestS3ReachesFullProgress(t T) T {
+    val m = midRunModel(110, 24, 40)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    return IsTrue(t, out.Contains("(100%)"))
+}
+
+// ----- interaction: start a run, watch it climb -----------------------------
+
+func s3Harness() harness.Harness[Model, Msg] {
+    val program = NewProgram(engine.MockEngine(), 110, 24)
+    return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 24)
+}
+
+func TestRunGrowsLogAndDoneCount(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val s0 = s3Harness().Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = plan))
+        .SendMsg(MRunStarted(State = st))
+    val before = logLenOf(s0.Model)
+    val d0 = doneOf(s0.Model)
+    val s1 = s0
+        .SendMsg(MRunTick()).SendMsg(MRunTick()).SendMsg(MRunTick())
+        .SendMsg(MRunTick()).SendMsg(MRunTick())
+    val after = logLenOf(s1.Model)
+    val d1 = doneOf(s1.Model)
+    val t1 = Eq(t, s1.Model.Screens.Current(), RouteS3())
+    val t2 = IsTrue(t1, after > before)   // activity log grew
+    return IsTrue(t2, d1 > d0)            // done-count increased
+}
+
+// Keyboard parity: Tab toggles the focused pane on S3.
+func TestS3TabTogglesPaneFocus(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val st = port.Run(port.Plan(ws))
+    val s = s3Harness().Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = port.Plan(ws)))
+        .SendMsg(MRunStarted(State = st))
+        .Press(PlainKey(Tab()))
+    return Eq(t, s.Model.S3Focus, PaneLog())
+}
