@@ -1,15 +1,12 @@
 package main
 
-// BOOTSTRAP PLACEHOLDER — not the real application.
-//
-// This entrypoint exists only so the workspace builds end-to-end
-// (`gala build -o gala_assimilator ./cmd/gala_assimilator`) while the engine and
-// its UI are still being assembled. It deliberately pulls in NOTHING — no
-// gala_tui, no app/ui, no engine wiring — so the build gate stays honest about
-// what compiles today, and the engine package is exercised by `gala test`.
-//
-// The real UI wiring (a gala_tui Program consuming the engine's EnginePort) lands
-// in a later milestone and replaces this banner.
+import (
+    . "github.com/martianoff/gala-assimilator/app/ui"
+)
+
+// Entry point: wire the engine port (a stub this milestone) into the TUI and
+// launch it. When the real engine lands, only this line changes — swap the
+// stub for an adapter over the engine's public port.
 func main() {
-    Println("gala-assimilator: bootstrap placeholder — engine foundation landed; UI wiring next milestone")
+    RunApp(NewStubPort())
 }

@@ -1,0 +1,90 @@
+package ui
+
+import (
+    . "martianoff/gala/collection_immutable"
+)
+
+// ============================================================================
+// Navigation primitives — a screen stack + a focus ring.
+//
+// gala_tui ships these in its `state` subpackage, but pulling that in as a
+// second module require makes the build system emit a malformed replace for
+// gala_tui. Keeping the UI's gala.mod to a single gala_tui require (per the
+// milestone constraint) means owning these two tiny value types here. Both are
+// immutable: every operation returns a new value.
+// ============================================================================
+
+// ScreenStack is the route-token navigation stack. The last token is the
+// current screen; Push goes deeper, Pop returns (never below the root).
+struct ScreenStack(Stack Array[string])
+
+func NewScreenStack(root string) ScreenStack =
+    ScreenStack(Stack = ArrayOf[string](root))
+
+func (s ScreenStack) Push(route string) ScreenStack =
+    s.Copy(Stack = s.Stack.Append(route))
+
+// Pop peels the top screen; popping the root is a no-op.
+func (s ScreenStack) Pop() ScreenStack {
+    val n = s.Stack.Length()
+    if n <= 1 { return s }
+    return s.Copy(Stack = s.Stack.Slice(0, n - 1))
+}
+
+func (s ScreenStack) Current() string {
+    val n = s.Stack.Length()
+    if n == 0 { return "" }
+    return s.Stack.Get(n - 1)
+}
+
+func (s ScreenStack) Depth() int = s.Stack.Length()
+
+func (s ScreenStack) CanGoBack() bool = s.Stack.Length() > 1
+
+// ----------------------------------------------------------------------------
+
+// FocusRing tracks which pane owns the keyboard. Tab/Shift-Tab map to
+// Next/Prev; a mouse click maps to FocusOn.
+struct FocusRing(
+    Panes Array[string],
+    Idx   int,
+)
+
+func NewFocusRing(panes Array[string]) FocusRing =
+    FocusRing(Panes = panes, Idx = 0)
+
+func (f FocusRing) Next() FocusRing {
+    val n = f.Panes.Length()
+    if n == 0 { return f }
+    return f.Copy(Idx = (f.Idx + 1) % n)
+}
+
+func (f FocusRing) Prev() FocusRing {
+    val n = f.Panes.Length()
+    if n == 0 { return f }
+    return f.Copy(Idx = (f.Idx - 1 + n) % n)
+}
+
+// FocusOn moves focus to `id` if present; unchanged on a miss.
+func (f FocusRing) FocusOn(id string) FocusRing {
+    val idx = ringIndexOf(f.Panes, id)
+    if idx < 0 { return f }
+    return f.Copy(Idx = idx)
+}
+
+func (f FocusRing) Current() string {
+    if f.Panes.IsEmpty() { return "" }
+    return f.Panes.Get(f.Idx)
+}
+
+func (f FocusRing) IsFocused(id string) bool = f.Current() == id
+
+func ringIndexOf(panes Array[string], id string) int {
+    var i = 0
+    val n = panes.Length()
+    for i < n {
+        if panes.Get(i) == id { return i }
+        i = i + 1
+    }
+    return -1
+}

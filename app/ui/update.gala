@@ -1,0 +1,223 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ============================================================================
+// Messages + the pure Update loop.
+//
+// Message names carry an `M` prefix: dot-importing gala_tui brings sealed-type
+// cases like `Up()` / `Down()` / `NoOp()` into scope, and an app case of the
+// same name would collide. The prefix keeps the vocabulary unambiguous.
+//
+// Update never blocks. The one piece of engine work — ScanProject — is issued
+// as an `Async` Cmd (a Future the runtime drains off the loop); Update returns
+// immediately with `Scanning = true` and the result arrives later as
+// `MScanCompleted`.
+// ============================================================================
+
+sealed type Msg {
+    // Keyboard-driven, focus-relative.
+    case MFocusNext()
+    case MFocusPrev()
+    case MActivate()                       // Enter / Space on the focused control
+    case MStepLeft()                       // ArrowLeft  on the focused control
+    case MStepRight()                      // ArrowRight on the focused control
+    case MBack()                           // Esc — pop a screen, or quit at root
+    case MQuit()
+    case MNoOp()
+
+    // Mouse-driven, control-specific (each also moves focus to that control).
+    case MBrowse()
+    case MCycleTarget()
+    case MSetUnsupported(P UnsupportedPolicy)
+    case MStepRetry(Dir int)
+    case MSetBackend(B AgentBackend)
+    case MCycleAmbiguity()
+    case MScanRequested()
+
+    // Engine + runtime.
+    case MScanCompleted(Out ScanOutcome)
+    case MResized(W int, H int)
+}
+
+func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
+    case MQuit()        => (m, QuitCmd[Msg]())
+    case MNoOp()        => (m, NoCmd[Msg]())
+    case MResized(w, h) => (m.Copy(Cols = w, Rows = h), NoCmd[Msg]())
+    case MFocusNext()   => (m.Copy(Focus = m.Focus.Next()), NoCmd[Msg]())
+    case MFocusPrev()   => (m.Copy(Focus = m.Focus.Prev()), NoCmd[Msg]())
+    case MActivate()    => activate(m)
+    case MStepLeft()    => (step(m, -1), NoCmd[Msg]())
+    case MStepRight()   => (step(m, 1), NoCmd[Msg]())
+    case MBack()        => back(m)
+
+    case MBrowse()          => (browse(focusOn(m, PaneBrowse())), NoCmd[Msg]())
+    case MCycleTarget()     => (cycleTarget(focusOn(m, PaneTarget()), 1), NoCmd[Msg]())
+    case MSetUnsupported(p) => {
+        val mf = focusOn(m, PaneUnsupported())
+        return (mf.Copy(Unsupported = p), NoCmd[Msg]())
+    }
+    case MStepRetry(d)      => (stepRetry(focusOn(m, PaneRetry()), d), NoCmd[Msg]())
+    case MSetBackend(b)     => {
+        val mf = focusOn(m, PaneBackend())
+        return (mf.Copy(Backend = b), NoCmd[Msg]())
+    }
+    case MCycleAmbiguity()  => (cycleAmbiguity(focusOn(m, PaneAmbiguity()), 1), NoCmd[Msg]())
+    case MScanRequested()   => startScan(focusOn(m, PaneScan()))
+
+    case MScanCompleted(out) => (scanDone(m, out), NoCmd[Msg]())
+}
+
+// ----- focus-relative dispatch ----------------------------------------------
+
+// activate runs the focused control's primary action. Only "scan" produces a
+// Cmd; the rest are pure model edits wrapped with noCmd.
+func activate(m Model) Tuple[Model, Cmd[Msg]] {
+    val pane = m.Focus.Current()
+    if pane == PaneBrowse()      { return noCmd(browse(m)) }
+    if pane == PaneTarget()      { return noCmd(cycleTarget(m, 1)) }
+    if pane == PaneUnsupported() { return noCmd(moveUnsupported(m, 1)) }
+    if pane == PaneRetry()       { return noCmd(stepRetry(m, 1)) }
+    if pane == PaneBackend()     { return noCmd(toggleBackend(m, 1)) }
+    if pane == PaneAmbiguity()   { return noCmd(cycleAmbiguity(m, 1)) }
+    if pane == PaneScan()        { return startScan(m) }
+    return noCmd(m)
+}
+
+// step applies an ArrowLeft/Right (dir = -1 / +1) to the focused control.
+// Controls without a horizontal action (browse, scan) leave the model alone.
+func step(m Model, dir int) Model {
+    val pane = m.Focus.Current()
+    if pane == PaneTarget()      { return cycleTarget(m, dir) }
+    if pane == PaneUnsupported() { return moveUnsupported(m, dir) }
+    if pane == PaneRetry()       { return stepRetry(m, dir) }
+    if pane == PaneBackend()     { return toggleBackend(m, dir) }
+    if pane == PaneAmbiguity()   { return cycleAmbiguity(m, dir) }
+    return m
+}
+
+func noCmd(m Model) Tuple[Model, Cmd[Msg]] = (m, NoCmd[Msg]())
+
+func focusOn(m Model, pane string) Model = m.Copy(Focus = m.Focus.FocusOn(pane))
+
+// ----- pure control edits ---------------------------------------------------
+
+func cycleTarget(m Model, dir int) Model =
+    m.Copy(TargetIdx = clampIdx(m.TargetIdx + dir, TargetLangOptions().Length()))
+
+func cycleAmbiguity(m Model, dir int) Model =
+    m.Copy(AmbiguityIdx = clampIdx(m.AmbiguityIdx + dir, AmbiguityOptions().Length()))
+
+func stepRetry(m Model, dir int) Model =
+    m.Copy(Retry = clampInt(m.Retry + dir, RetryMin(), RetryMax()))
+
+func moveUnsupported(m Model, dir int) Model {
+    val opts = UnsupportedOptions()
+    val cur = indexOfUnsupported(opts, m.Unsupported)
+    return m.Copy(Unsupported = opts.Get(clampIdx(cur + dir, opts.Length())))
+}
+
+func toggleBackend(m Model, dir int) Model {
+    val opts = BackendOptions()
+    val cur = indexOfBackend(opts, m.Backend)
+    return m.Copy(Backend = opts.Get(clampIdx(cur + dir, opts.Length())))
+}
+
+func browse(m Model) Model {
+    val dirs = browseDirs()
+    val cur = indexOfDir(dirs, m.SourceDir)
+    val nextDir = dirs.Get(clampIdx(cur + 1, dirs.Length()))
+    return m.Copy(SourceDir = nextDir, Source = m.Port.DetectSource(nextDir))
+}
+
+// ----- engine + navigation --------------------------------------------------
+
+// startScan issues the scan as an off-loop Async Cmd and flips Scanning on.
+func startScan(m Model) Tuple[Model, Cmd[Msg]] {
+    val cfg = m.Config()
+    val port = m.Port
+    val cmd = Async[ScanOutcome, Msg](
+        () => port.ScanProject(cfg),
+        (out) => MScanCompleted(Out = out),
+    )
+    return (m.Copy(Scanning = true), cmd)
+}
+
+func scanDone(m Model, out ScanOutcome) Model =
+    m.Copy(
+        Scanning = false,
+        LastScan = Some(out),
+        Screens  = m.Screens.Push(RouteS2()),
+    )
+
+func back(m Model) Tuple[Model, Cmd[Msg]] {
+    if m.Screens.CanGoBack() {
+        return (m.Copy(Screens = m.Screens.Pop()), NoCmd[Msg]())
+    }
+    return (m, QuitCmd[Msg]())
+}
+
+// ----- index lookups ---------------------------------------------------------
+
+func indexOfDir(dirs Array[string], dir string) int {
+    var i = 0
+    val n = dirs.Length()
+    for i < n {
+        if dirs.Get(i) == dir { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+func indexOfUnsupported(opts Array[UnsupportedPolicy], p UnsupportedPolicy) int {
+    var i = 0
+    val n = opts.Length()
+    for i < n {
+        if UnsupportedEq(opts.Get(i), p) { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+func indexOfBackend(opts Array[AgentBackend], b AgentBackend) int {
+    var i = 0
+    val n = opts.Length()
+    for i < n {
+        if BackendEq(opts.Get(i), b) { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+// ----- input adapters --------------------------------------------------------
+
+// keyToMsg maps a decoded key to a Msg. Every S1 action is reachable here so
+// keyboard parity with the mouse is complete.
+func keyToMsg(ev KeyEvent) Msg {
+    if KeyMatchesAny(ev, "ctrl+c", "q") { return MQuit() }
+    if KeyMatches(ev, "shift+tab") { return MFocusPrev() }
+    return ev.Key match {
+        case Tab()        => MFocusNext()
+        case Enter()      => MActivate()
+        case Space()      => MActivate()
+        case ArrowLeft()  => MStepLeft()
+        case ArrowRight() => MStepRight()
+        case Esc()        => MBack()
+        case _            => MNoOp()
+    }
+}
+
+// inputToMsg unifies key / mouse / resize. Clicks on interactive widgets are
+// routed by the framework's HitRegistry before this runs, so here mouse events
+// are only scroll/unregistered clicks → no-op. Resize feeds the responsive
+// layout.
+func inputToMsg(ev InputEvent) Msg = ev match {
+    case KeyInput(k)       => keyToMsg(k)
+    case MouseInput(_)     => MNoOp()
+    case ResizeInput(w, h) => MResized(W = w, H = h)
+    case UnknownInput()    => MNoOp()
+}
