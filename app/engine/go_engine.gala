@@ -9,7 +9,7 @@ package engine
 // NOTE — translation is still the MOCK. This slice proves the scan -> plan -> run
 // pipeline end-to-end on real Go input; it does NOT yet translate. The real agent
 // backend remains blocked by the gala-acp `uuid` transitive-dependency issue
-// (gala 0.52.0 toolchain; see the run.gala header for the precise failure), so the
+// (the 0.49.2 toolchain; see the run.gala header for the precise failure), so the
 // runner here is still MockTranslator. Swapping in the real translator is a runner
 // substitution behind GoEngineWith — no pipeline change.
 
@@ -18,17 +18,25 @@ import (
     . "martianoff/gala/std"
 )
 
-// GoEngine is the default real-frontend engine, driven by the MockTranslator (the
-// backend is not yet available — see the file header).
+// GoEngine is the default real-frontend engine, driven by the MockTranslator and
+// the deterministic MockVerifier (neither real backend is available yet — see the
+// file header and verify.gala).
 func GoEngine() EnginePort = GoEngineWith(MockTranslator())
 
-// GoEngineWith builds the real-frontend engine over a caller-supplied translator,
-// so a future real backend (or a ScriptedRunner in tests) drops in unchanged.
-func GoEngineWith(runner AgentRunner) EnginePort = EnginePort(
+// GoEngineWith builds the real-frontend engine over a caller-supplied translator
+// (with the default MockVerifier), so a future real backend (or a ScriptedRunner
+// in tests) drops in unchanged.
+func GoEngineWith(runner AgentRunner) EnginePort = GoEngineWithVerifier(runner, MockVerifier())
+
+// GoEngineWithVerifier builds the real-frontend engine over a caller-supplied
+// runner AND verifier — the seam where a real `gala test` verifier replaces the
+// mock once translation emits real GALA, with no change to the scan -> plan -> run
+// -> gate pipeline.
+func GoEngineWithVerifier(runner AgentRunner, verifier Verifier) EnginePort = EnginePort(
     Scan          = (req ScanRequest) => ScanGoWorkspace(req.Root),
     Plan          = (m WorkspaceModel) => goPlanFor(m),
     Run           = (p MigrationPlan) => runFor(p),
-    Advance       = (s RunState) => advance(runner, s),
+    Advance       = (s RunState) => advance(runner, verifier, s),
     Events        = (s RunState) => s.Log,
     ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
     AnswerBlocker = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
@@ -41,17 +49,23 @@ func GoEngineWith(runner AgentRunner) EnginePort = EnginePort(
 // SourceContext the translator will receive. This is the one place the mock and
 // real planners differ: the mock synthesizes "// source: <path>", this carries the
 // file content discovered on disk.
-func goPlanFor(model WorkspaceModel) MigrationPlan {
-    val items = model.Packages.FlatMap((p Package) =>
-        p.Units.Map((u Unit) => PlanItem(
-            Unit   = u.Id,
-            Source = SourceContext(
-                SourceText   = u.Source,
-                Dependencies = unitDependencies(u),
-            ),
-            Target = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
-        )))
-    return MigrationPlan(Items = items)
+func goPlanFor(model WorkspaceModel) MigrationPlan =
+    MigrationPlan(Items = model.Packages.FlatMap((p Package) => goPlanItemsForPackage(p)))
+
+// goPlanItemsForPackage builds one PlanItem per unit carrying its REAL source text,
+// and attaches the package's 1:1 source tests (computed once via sourceTestRefs —
+// AddedTest excluded) as each unit's verify-gate input.
+func goPlanItemsForPackage(p Package) Array[PlanItem] {
+    val tests = sourceTestRefs(p)
+    return p.Units.Map((u Unit) => PlanItem(
+        Unit        = u.Id,
+        Source      = SourceContext(
+            SourceText   = u.Source,
+            Dependencies = unitDependencies(u),
+        ),
+        Target      = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+        SourceTests = tests,
+    ))
 }
 
 // unitDependencies is the best-effort dependency context for a unit: one
