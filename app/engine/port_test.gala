@@ -59,7 +59,7 @@ func TestMockRunStreamsPhaseTransitions(t T) T {
 // ----------------------------------------------------------------------------
 
 func TestClarificationBlocksUnit(t T) T {
-    val eng = MockEngineWith(ScriptedRunner(OutcomeClarification(Value = sampleClarification()), Cancelled()))
+    val eng = MockEngineWith(ScriptedRunner(clarifyOutcome(sampleClarification()), cancelledAck()))
     val finished = RunToCompletion(eng, scanned(eng))
     // a clarifying runner blocks every unit; none reach Done.
     val t1 = Eq(t, CountByDone(finished), 0)
@@ -70,7 +70,7 @@ func TestClarificationBlocksUnit(t T) T {
 }
 
 func TestAbortFailsUnit(t T) T {
-    val eng = MockEngineWith(ScriptedRunner(OutcomeAborted(Reason = "agent crashed"), Cancelled()))
+    val eng = MockEngineWith(ScriptedRunner(abortOutcome("agent crashed"), cancelledAck()))
     val finished = RunToCompletion(eng, scanned(eng))
     return finished.Units.Get(0).Status match {
         case Failed(reason) => Eq(t, reason, "agent crashed")
@@ -84,7 +84,7 @@ func TestAbortFailsUnit(t T) T {
 // ----------------------------------------------------------------------------
 
 func TestAnswerBlockerResolves(t T) T {
-    val eng = MockEngineWith(ScriptedRunner(OutcomeClarification(Value = sampleClarification()), Cancelled()))
+    val eng = MockEngineWith(ScriptedRunner(clarifyOutcome(sampleClarification()), cancelledAck()))
     val blocked = RunToCompletion(eng, scanned(eng))
     val id = firstUnitId(blocked)
     val answered = eng.AnswerBlocker(blocked, id, Answer(Task = TaskId(Value = id.Value), Response = "yes"))
@@ -126,7 +126,7 @@ func TestActAcceptKeepsDone(t T) T {
 }
 
 func TestActRetryThreadsPriorFailure(t T) T {
-    val eng = MockEngineWith(ScriptedRunner(OutcomeAborted(Reason = "boom"), Cancelled()))
+    val eng = MockEngineWith(ScriptedRunner(abortOutcome("boom"), cancelledAck()))
     val failed = RunToCompletion(eng, scanned(eng))
     val id = firstUnitId(failed)
     val retried = eng.ActOnUnit(failed, id, ActRetry())

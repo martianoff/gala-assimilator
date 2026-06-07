@@ -136,7 +136,7 @@ func TestAcceptOnQueuedIsNoOp(t T) T {
 // Accepting a Failed unit leaves it Failed (reason intact) — not an empty Done that
 // silently launders a failure into success.
 func TestAcceptOnFailedIsNoOp(t T) T {
-    val eng    = MockEngineWith(ScriptedRunner(OutcomeAborted(Reason = "boom"), Cancelled()))
+    val eng    = MockEngineWith(ScriptedRunner(abortOutcome("boom"), cancelledAck()))
     val failed = RunToCompletion(eng, scanned(eng))
     val id     = firstUnitId(failed)
     val s      = eng.ActOnUnit(failed, id, ActAccept())

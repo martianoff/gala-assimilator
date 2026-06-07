@@ -1,0 +1,62 @@
+package engine
+
+// acp_bridge — the ONE place the engine destructures gala-acp's sealed run types.
+//
+// GALA pattern matching cannot resolve a package-qualified case constructor
+// (`case acp.OutcomeResult(...)` parses as a variable binding, not a constructor
+// pattern — confirmed against the 0.49.2 transpiler, and documented in
+// gala-acp/delivery.gala), so destructuring needs acp's cases in scope UNQUALIFIED,
+// i.e. a dot-import. That dot-import is only possible because the engine no longer
+// declares a `ProgressEvent` (it was renamed to ProgressUpdate — see messages.gala;
+// Go forbids the same identifier in a file's dot-import scope and the package
+// block). A module-local helper sub-package would avoid the dot-import but does not
+// resolve under the 0.49.2 toolchain (a library package's self-import is not
+// rewritten to the gen workspace), so the destructuring lives here, in-package.
+//
+// Everything below converts an acp value into ENGINE-DOMAIN data (Result /
+// Clarification / string / a small triple) and re-exposes no acp.* type, so the
+// rest of the engine stays acp-free and uses qualified `acp` for types only.
+
+import (
+    . "martianoff/gala/std"
+    . "martianoff/gala/collection_immutable"
+    . "github.com/martianoff/gala-acp"
+)
+
+// outcomeResult / outcomeClarification / outcomeAbort project an acp run terminus
+// onto an Option of its payload. Exactly one is Some for any given outcome; the
+// gate (gateOutcome, port.gala) dispatches result -> clarification -> abort.
+func outcomeResult(o RunOutcome[Result, Clarification]) Option[Result] = o match {
+    case OutcomeResult(r)        => Some[Result](r)
+    case OutcomeClarification(_) => None[Result]()
+    case OutcomeAborted(_)       => None[Result]()
+}
+
+func outcomeClarification(o RunOutcome[Result, Clarification]) Option[Clarification] = o match {
+    case OutcomeClarification(c) => Some[Clarification](c)
+    case OutcomeResult(_)        => None[Clarification]()
+    case OutcomeAborted(_)       => None[Clarification]()
+}
+
+func outcomeAbort(o RunOutcome[Result, Clarification]) Option[string] = o match {
+    case OutcomeAborted(reason)  => Some[string](reason)
+    case OutcomeResult(_)        => None[string]()
+    case OutcomeClarification(_) => None[string]()
+}
+
+// progressNote is the engine-domain projection of one acp ProgressEvent: the same
+// three fields, in a struct the rest of the engine rebuilds into its public
+// sealed-phase ProgressUpdate (finishUnit) without importing acp.
+struct progressNote(
+    Task  string,
+    Phase string,
+    Note  string,
+)
+
+// stepNotes flattens an acp transcript's RunSteps into progressNotes. RunStep is
+// sealed with the single StepProgress case today; the match stays exhaustive so a
+// future step kind breaks the build here rather than silently dropping events.
+func stepNotes(steps Array[RunStep]) Array[progressNote] =
+    steps.Map((s RunStep) => s match {
+        case StepProgress(ev) => progressNote(Task = ev.Task, Phase = ev.Phase, Note = ev.Note)
+    })

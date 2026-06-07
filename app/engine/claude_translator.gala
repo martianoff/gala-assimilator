@@ -1,0 +1,224 @@
+package engine
+
+// ClaudeTranslator — the engine's LIVE translation backend: a gala-acp AgentRunner
+// whose Submit drives a real `claude` CLI subprocess (via the gala-acp/agent
+// transport) to translate one source unit into GALA and returns the emitted text
+// as a Result.
+//
+// This is the engine's IMPURE edge. All IO lives inside Submit, exactly where the
+// acp run contract puts it — "a real backend performs its IO inside the port
+// function and hands back the resulting value." The pure scan / plan / run / gate
+// machinery is untouched; this is just another acp.AgentRunner value plugged in
+// behind the same port. The acp transcript it returns is adapted to the engine's
+// public EngineEvent / UnitStatus at the boundary (finishUnit), so no acp.* or
+// agent.* type crosses EnginePort.
+//
+// Backend selection: ClaudeEngine() runs the real Go frontend over this live
+// backend — it is what the S1 "Claude" option drives. The offline default
+// (GoEngine / MockEngine) and the whole `gala test` suite stay on the
+// deterministic MockTranslator, so NOTHING here runs without `claude` on PATH and
+// valid credentials. A real translation: build ClaudeEngine(), scan a project,
+// then RunToCompletion — each unit's Submit spawns `claude` to emit GALA.
+//
+// Pattern-matching note: agent.AgentEvent is a sealed type in the `agent` package,
+// and GALA cannot match a package-qualified case, so this file dot-imports `agent`
+// to destructure the event stream. acp itself stays a QUALIFIED import here (this
+// file constructs acp transcripts/outcomes but never matches them — that is the
+// bridge's job), which keeps acp.ProgressEvent from colliding with the engine's.
+
+import (
+    . "martianoff/gala/std"
+    . "martianoff/gala/collection_immutable"
+    strings "martianoff/gala/strings"
+    acp "github.com/martianoff/gala-acp"
+    . "github.com/martianoff/gala-acp/agent"
+)
+
+// ClaudeEngine is the real Go frontend driven by the LIVE Claude translator (and
+// the still-deterministic verify gate). The backend the "Claude" option selects.
+func ClaudeEngine() EnginePort = GoEngineWithVerifier(ClaudeTranslator(), MockVerifier())
+
+// SelectBackend maps a backend name to an EnginePort — the composition-root
+// selector the UI's "Claude" / offline options drive:
+//   - "claude" — the LIVE Claude translator over the real Go frontend.
+//   - "go"     — the real Go frontend on the deterministic mock translator.
+//   - anything else — the fully offline stub engine (the safe default: no IO, no
+//     credentials).
+// It lives in the engine (not cmd) on purpose: under the 0.49.2 toolchain a
+// non-entry package's self-import is not rewritten, so `cmd` importing the engine
+// would break the whole-workspace `gala test`. The UI entrypoint calls this once
+// it is the build's entry (where self-imports DO resolve), keeping selection in
+// one tested place meanwhile.
+func SelectBackend(name string) EnginePort {
+    if name == "claude" { return ClaudeEngine() }
+    if name == "go"     { return GoEngine() }
+    return MockEngine()
+}
+
+// ClaudeTranslator builds the live backend over the default local `claude` CLI
+// transport, the CLI's default model, and the current directory as the session
+// workspace.
+func ClaudeTranslator() acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    ClaudeTranslatorWith(NewClaudeProcessTransport(), None[string](), ".")
+
+// ClaudeTranslatorWith builds the live backend over an injectable transport (a
+// fake AgentTransport can drive the pump offline in a test), an optional model to
+// pin (None = the CLI default), and the workspace directory the session runs in.
+func ClaudeTranslatorWith(
+    transport AgentTransport,
+    model Option[string],
+    workspace string,
+) acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => claudeSubmit(transport, model, workspace, a),
+        Cancel = (_ string) => acp.Cancelled(),
+    )
+
+// claudeSubmit opens one `claude` session for the unit and runs a single turn. A
+// transport that fails to open aborts the run (surfaced, not faked) rather than
+// pretending a translation happened.
+func claudeSubmit(
+    transport AgentTransport,
+    model Option[string],
+    workspace string,
+    a TaskAssignment,
+) acp.RunTranscript[Result, Clarification] {
+    val spec = AgentSpec(
+        Model                      = model,
+        Workspace                  = workspace,
+        SessionId                  = NewSessionId(),
+        IsNewSession               = true,
+        DangerouslySkipPermissions = true,
+    )
+    return transport.Open(spec) match {
+        case Failure(e) => abortTranscript("failed to open claude session: " + e.Error())
+        case Success(session) => runClaudeTurn(session, a)
+    }
+}
+
+// runClaudeTurn sends the translation prompt, ends the turn, pumps the agent's
+// event stream to a terminus, and closes the session. Steps are a faithful
+// reading -> emitting prefix; the boundary maps them to the public ProgressPhase.
+func runClaudeTurn(session AgentSession, a TaskAssignment) acp.RunTranscript[Result, Clarification] {
+    session.Send(PromptInput(Text = buildPrompt(a)))
+    session.EndTurn()
+    val outcome = pumpClaude(session, a.Task, "")
+    session.Close()
+    return acp.RunTranscript[Result, Clarification](
+        Steps = claudeSteps(a.Task),
+        Final = outcome,
+    )
+}
+
+func claudeSteps(task TaskId) Array[acp.RunStep] =
+    ArrayOf[acp.RunStep](
+        acp.ProgressStep(task.Value, "reading", "reading source unit"),
+        acp.ProgressStep(task.Value, "emitting", "translating via claude"),
+    )
+
+// pumpClaude drives the session's NextEvent stream until a terminus. It blocks on
+// each event future (Await), accumulating the assistant's visible text; the loop
+// ends on the turn's result event, an AskUserQuestion (-> Clarification), an auth
+// error, a transport failure, or a clean turn end.
+func pumpClaude(session AgentSession, task TaskId, seed string) acp.RunOutcome[Result, Clarification] {
+    var text = seed
+    var pending = true
+    var outcome = pendingOutcome()
+    for pending {
+        val step = classifyEvent(task, text, session.NextEvent().Await())
+        text = step.Text
+        pending = !step.Done
+        outcome = step.Outcome
+    }
+    return outcome
+}
+
+// pumpState is one step of the pump: the accumulated text so far, whether the turn
+// has reached a terminus, and the outcome (only meaningful once Done — while
+// pending it carries a placeholder the loop overwrites).
+struct pumpState(
+    Done    bool,
+    Text    string,
+    Outcome acp.RunOutcome[Result, Clarification],
+)
+
+func classifyEvent(task TaskId, text string, ev Try[AgentEvent]) pumpState = ev match {
+    case Failure(err) => pumpState(Done = true, Text = text, Outcome = abortOutcome("claude read failed: " + err.Error()))
+    case Success(e)   => classifyAgentEvent(task, text, e)
+}
+
+func classifyAgentEvent(task TaskId, text string, e AgentEvent) pumpState = e match {
+    case AgentChunk(line)           => classifyChunk(task, text, line)
+    case AgentDiagnostic(_)         => pumpState(Done = false, Text = text, Outcome = pendingOutcome())
+    case AgentTransportAuthError(t) => pumpState(Done = true, Text = text, Outcome = abortOutcome("claude authentication failed: " + t))
+    case AgentTurnEnded()           => pumpState(Done = true, Text = text, Outcome = finalizeOutcome(task, text))
+    case AgentFailed(err)           => pumpState(Done = true, Text = text, Outcome = abortOutcome("claude failed: " + err.Error()))
+}
+
+// classifyChunk runs one stream-json line through the agent package's classifier
+// and folds it into the pump:
+//   - an AskUserQuestion tool_use ends the run as a Clarification (the engine's
+//     blocker-resolution loop) — never silently dropped;
+//   - the turn's result event (TurnEnded) finalizes: an error aborts, otherwise
+//     the accumulated assistant text (or the result echo, if streaming produced
+//     none) becomes the translation;
+//   - any other visible text is appended and the pump continues.
+func classifyChunk(task TaskId, text string, line string) pumpState {
+    val chunk = FilterClaudeStreamJsonFor("", line)
+    if chunk.AskQuestionId != "" {
+        return pumpState(Done = true, Text = text, Outcome = clarifyOutcome(
+            Clarification(Task = task, Question = questionText(chunk))))
+    }
+    if chunk.TurnEnded {
+        if chunk.ErrorText != "" {
+            return pumpState(Done = true, Text = text, Outcome = abortOutcome("claude error: " + chunk.ErrorText))
+        }
+        val finalText = if (text == "") chunk.Visible else text
+        return pumpState(Done = true, Text = finalText, Outcome = finalizeOutcome(task, finalText))
+    }
+    return pumpState(Done = false, Text = text + chunk.Visible, Outcome = pendingOutcome())
+}
+
+func questionText(chunk ClaudeChunk) string =
+    if (chunk.AskQuestionText == "") "claude requested a clarification" else chunk.AskQuestionText
+
+// finalizeOutcome turns the accumulated text into a terminus: real text becomes a
+// Result; empty output aborts (a translation we can't justify is surfaced, never
+// emitted as an empty success).
+func finalizeOutcome(task TaskId, text string) acp.RunOutcome[Result, Clarification] =
+    if (strings.TrimSpace(text) == "") abortOutcome("claude produced no translation output")
+    else resultOutcome(Result(
+        Task       = task,
+        TargetText = text,
+        Rationale  = "translated by claude",
+        Flags      = EmptyArray[UnsupportedFlag](),
+    ))
+
+// pendingOutcome is the placeholder an in-progress pump carries; the loop only
+// returns an outcome after Done is set, so this value is always overwritten.
+func pendingOutcome() acp.RunOutcome[Result, Clarification] =
+    abortOutcome("claude turn did not reach a terminus")
+
+func abortTranscript(reason string) acp.RunTranscript[Result, Clarification] =
+    acp.RunTranscript[Result, Clarification](
+        Steps = EmptyArray[acp.RunStep](),
+        Final = abortOutcome(reason),
+    )
+
+// buildPrompt renders the translation instruction for one unit: emit ONLY GALA
+// source, with the unit's real source text and its imported-dependency context,
+// plus the prior rejection summary on a retry.
+func buildPrompt(a TaskAssignment) string {
+    val deps = a.Source.Dependencies.Map((d DependencySnippet) => "- " + d.Name).MkString("\n")
+    val depsBlock = if (deps == "") "(none)" else deps
+    val priorBlock = a.PriorFailure match {
+        case Some(pf) => "\n=== PREVIOUS ATTEMPT REJECTED ===\n" + pf.Summary + "\n"
+        case None()   => ""
+    }
+    return "You are migrating one source unit to GALA. Output ONLY the translated GALA source code — no prose, no explanation, no markdown fences.\n\n" +
+        "Unit: " + a.Unit.Value + "\n" +
+        "Target language: " + a.Target.Language + "\n" +
+        priorBlock +
+        "\n=== SOURCE ===\n" + a.Source.SourceText + "\n" +
+        "\n=== IMPORTED DEPENDENCIES (context only) ===\n" + depsBlock + "\n"
+}

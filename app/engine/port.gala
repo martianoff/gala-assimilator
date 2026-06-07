@@ -1,23 +1,27 @@
 package engine
 
-// The engine's PUBLIC PORT — the only surface the UI is allowed to call. Like
-// the AgentRunner, it is a struct of function values (a GALA-idiomatic port): the
+// The engine's PUBLIC PORT — the only surface the UI is allowed to call. Like the
+// acp AgentRunner, it is a struct of function values (a GALA-idiomatic port): the
 // UI holds an EnginePort value, never reaches into engine internals, and a future
 // real engine swaps in behind the same struct.
 //
 // Operations (the brief's surface): scan -> plan -> run, stream events (Advance +
 // Events), act on a unit (retry / skip / accept), answer a blocker, and
-// checkpoint / resume. Everything is PURE DATA: no gala_tui, no app/ui, no IO.
-// The UI wraps Advance/Events ticks in its own Cmd[T]; the engine never blocks.
+// checkpoint / resume. The port's types are PURE DATA: no gala_tui, no app/ui,
+// and no acp.* — the gala-acp generics the runner machinery is built on are
+// adapted to the engine's own EngineEvent / UnitStatus at the boundary
+// (finishUnit), never leaked through EnginePort. The UI wraps Advance/Events ticks
+// in its own Cmd[T]; the engine never blocks.
 //
 // MockEngine is the deterministic offline implementation: a few units march
 // Queued -> Translating -> Verifying -> Done, streaming progress events sourced
-// from a real RunTranscript and terminating via the run's RunOutcome. It exists
-// so the UI can integrate against something real before the production engine.
+// from a real acp transcript and terminating via the run's outcome. It exists so
+// the UI can integrate against something real before a live backend is selected.
 
 import (
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    acp "github.com/martianoff/gala-acp"
 )
 
 // ----------------------------------------------------------------------------
@@ -70,7 +74,7 @@ struct UnitRun(
 // from the run transcript) or a status transition. Sealed so the UI handles every
 // kind it can render.
 sealed type EngineEvent {
-    case EvProgress(Unit UnitId, Event ProgressEvent)
+    case EvProgress(Unit UnitId, Event ProgressUpdate)
     case EvStatus(Unit UnitId, Status UnitStatus)
 }
 
@@ -134,12 +138,12 @@ func MockEngine() EnginePort = MockEngineWith(MockTranslator())
 // the default MockVerifier), so tests can inject a ScriptedRunner that yields a
 // Clarification or an Abort and drive a unit to Blocked / Failed — every terminus
 // exercised THROUGH the real run machinery, not hand-built.
-func MockEngineWith(runner AgentRunner) EnginePort = MockEngineWithVerifier(runner, MockVerifier())
+func MockEngineWith(runner acp.AgentRunner[TaskAssignment, Result, Clarification]) EnginePort = MockEngineWithVerifier(runner, MockVerifier())
 
 // MockEngineWithVerifier builds the engine over a caller-supplied runner AND
 // verifier, so tests can inject a ScriptedVerifier (pass / fail / unsupported) and
 // drive the verify gate's every terminus THROUGH the run machinery.
-func MockEngineWithVerifier(runner AgentRunner, verifier Verifier) EnginePort = EnginePort(
+func MockEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier) EnginePort = EnginePort(
     Scan          = (_ ScanRequest) => ScanGoWorkspaceStub(),
     Plan          = (m WorkspaceModel) => planFor(m),
     Run           = (p MigrationPlan) => runFor(p),
@@ -214,7 +218,7 @@ func sameUnit(u UnitRun, id UnitId) bool = u.Unit.Value == id.Value
 
 // advance drives the first actionable unit one step forward, appending the events
 // that transition produced. A run with nothing actionable is a fixpoint.
-func advance(runner AgentRunner, verifier Verifier, state RunState) RunState =
+func advance(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, state RunState) RunState =
     state.Units.Find((u UnitRun) => isActionable(u.Status)) match {
         case Some(u) => replaceAndLog(state, u.Unit, advanceUnit(runner, verifier, u))
         case None()  => state
@@ -224,7 +228,7 @@ func advance(runner AgentRunner, verifier Verifier, state RunState) RunState =
 // assignment to the runner, replays the transcript's progress steps as EvProgress
 // events, and runs the VERIFY GATE over the produced output before settling a
 // terminus (gateOutcome) — so the Verifying phase actually verifies.
-func advanceUnit(runner AgentRunner, verifier Verifier, u UnitRun) StepResult = u.Status match {
+func advanceUnit(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, u UnitRun) StepResult = u.Status match {
     case Queued() => StepResult(
         Unit   = u.Copy(Status = Translating()),
         Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Translating())),
@@ -240,11 +244,14 @@ func advanceUnit(runner AgentRunner, verifier Verifier, u UnitRun) StepResult = 
     case Failed(_)     => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
 }
 
-func finishUnit(runner AgentRunner, verifier Verifier, u UnitRun) StepResult {
+func finishUnit(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, u UnitRun) StepResult {
     val transcript = runner.Submit(u.Assignment)
-    val progress = transcript.Steps.Map((step RunStep) => step match {
-        case StepProgress(ev) => EvProgress(Unit = u.Unit, Event = ev)
-    })
+    val progress = stepNotes(transcript.Steps).Map((n progressNote) =>
+        EvProgress(Unit = u.Unit, Event = ProgressUpdate(
+            Task  = TaskId(Value = n.Task),
+            Phase = phaseFromTag(n.Phase),
+            Note  = n.Note,
+        )))
     val status = gateOutcome(verifier, u, transcript.Final)
     return StepResult(
         Unit   = u.Copy(Status = status),
@@ -257,11 +264,14 @@ func finishUnit(runner AgentRunner, verifier Verifier, u UnitRun) StepResult {
 // only if the package's 1:1 source tests pass against it (verifyGate). A
 // clarification still Blocks and an abort still Fails — neither produced output to
 // verify.
-func gateOutcome(verifier Verifier, u UnitRun, o RunOutcome) UnitStatus = o match {
-    case OutcomeResult(r)        => verifyGate(verifier, u, r)
-    case OutcomeClarification(c) => Blocked(Question = c)
-    case OutcomeAborted(reason)  => Failed(Reason = reason)
-}
+func gateOutcome(verifier Verifier, u UnitRun, o acp.RunOutcome[Result, Clarification]) UnitStatus =
+    outcomeResult(o) match {
+        case Some(r) => verifyGate(verifier, u, r)
+        case None()  => outcomeClarification(o) match {
+            case Some(c) => Blocked(Question = c)
+            case None()  => Failed(Reason = outcomeAbort(o).GetOrElse("aborted"))
+        }
+    }
 
 // verifyGate runs the verifier over the unit's 1:1-replicated source tests (only;
 // AddedTest units were excluded when the plan was built) and turns the verdict

@@ -77,16 +77,27 @@ sealed type VerdictOutcome {
 }
 
 // ----------------------------------------------------------------------------
-// ProgressEvent phases
+// ProgressUpdate phases
 // ----------------------------------------------------------------------------
 
-// ProgressPhase is the coarse stage a ProgressEvent reports — enough to drive a
+// ProgressPhase is the coarse stage a ProgressUpdate reports — enough to drive a
 // live UI ticker without parsing free-form notes. (Cases are `Phase*`-prefixed so
 // they don't collide with the engine's UnitStatus lifecycle in this one package.)
 sealed type ProgressPhase {
     case PhaseReading()   // ingesting source + dependency context
     case PhaseEmitting()  // producing target text
     case PhaseVerifying() // self-checking the emitted output
+}
+
+// phaseFromTag maps acp's opaque progress-phase string back onto the engine's
+// sealed ProgressPhase at the run boundary (finishUnit). The engine's own runners
+// emit the canonical "reading" / "emitting" / "verifying" tags; any other tag a
+// backend might stream defaults to PhaseReading so an unknown phase still renders
+// as live activity rather than crashing the exhaustive match.
+func phaseFromTag(tag string) ProgressPhase {
+    if tag == "emitting"  { return PhaseEmitting() }
+    if tag == "verifying" { return PhaseVerifying() }
+    return PhaseReading()
 }
 
 // ----------------------------------------------------------------------------
@@ -141,9 +152,19 @@ struct Verdict(
     Reasons Array[string],
 )
 
-// ProgressEvent (agent -> engine): a streamed status note that drives the live
+// ProgressUpdate (agent -> engine): a streamed status note that drives the live
 // UI ticker. Non-terminal: many per task.
-struct ProgressEvent(
+//
+// NAMING — this is the engine's own progress type, renamed from `ProgressEvent`.
+// gala-acp also exports a `ProgressEvent` (its string-keyed, transport-neutral
+// progress note), and GALA/Go forbid the same identifier in both a file's
+// dot-import scope and the package block. Because the engine MUST dot-import acp to
+// destructure its sealed run outcomes (qualified case patterns don't work, and a
+// module-local helper sub-package doesn't resolve under the 0.49.2 toolchain), the
+// engine cannot also declare a `ProgressEvent`. The fields (Task / Phase / Note)
+// are unchanged, so a consumer that destructures EngineEvent.EvProgress and reads
+// them is unaffected; only the type's name changed.
+struct ProgressUpdate(
     Task  TaskId,
     Phase ProgressPhase,
     Note  string,
@@ -157,7 +178,7 @@ struct ProgressEvent(
 // either direction. Sealed so every consumer handles all six cases.
 sealed type Message {
     case MsgTaskAssignment(Payload TaskAssignment) // engine   -> agent
-    case MsgProgressEvent(Payload ProgressEvent)   // agent    -> engine
+    case MsgProgressEvent(Payload ProgressUpdate)  // agent    -> engine
     case MsgResult(Payload Result)                 // agent    -> engine
     case MsgClarification(Payload Clarification)   // agent    -> engine
     case MsgAnswer(Payload Answer)                 // engine   -> agent
