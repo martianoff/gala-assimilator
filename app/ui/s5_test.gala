@@ -1,0 +1,83 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+    "github.com/martianoff/gala-tui/harness"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// S5 — blocker / clarification. A blocker is driven by a ScriptedRunner whose
+// terminus is OutcomeClarification, so the first unit reaches Blocked through
+// the real run machinery. The interaction test answers it and asserts the unit
+// leaves Blocked.
+// ============================================================================
+
+// blockingEngine yields a clarification for every unit it translates.
+func blockingEngine() engine.EnginePort {
+    val clar = engine.OutcomeClarification(Value = engine.Clarification(
+        Task = engine.TaskId(Value = "t"), Question = "Is x nullable?"))
+    return engine.MockEngineWith(engine.ScriptedRunner(clar, engine.Cancelled()))
+}
+
+func blockedAt(m Model, idx int) bool = m.Run match {
+    case Some(rs) => runview.IsBlockedAt(rs, idx)
+    case None()   => false
+}
+
+func anyActionableOf(m Model) bool = m.Run match {
+    case Some(rs) => runview.AnyActionable(rs)
+    case None()   => false
+}
+
+// Mouse+keyboard interaction: open the blocker badge, type an answer, submit;
+// the unit must leave Blocked (re-queued via the Answers carrier).
+func TestAnswerBlockerLeavesBlocked(t T) T {
+    val port = blockingEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val program = NewProgram(port, 100, 20)
+    val h = harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 100, 20)
+
+    // Run the first unit to Blocked (Queued→Translating→Verifying→clarification).
+    val s = h.Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = plan))
+        .SendMsg(MRunStarted(State = st))
+        .SendMsg(MRunTick()).SendMsg(MRunTick()).SendMsg(MRunTick())
+    val t1 = IsTrue(t, blockedAt(s.Model, 0))            // unit 0 is blocked
+
+    // Open the blocker (badge), type "yes" (keyboard), submit (Enter).
+    val s2 = s
+        .SendMsg(MOpenBlocker())
+        .Press(PlainKey(Char('y')))
+        .Press(PlainKey(Char('e')))
+        .Press(PlainKey(Char('s')))
+        .Press(PlainKey(Enter()))
+
+    val t2 = IsFalse(t1, blockedAt(s2.Model, 0))         // no longer blocked
+    val t3 = Eq(t2, s2.Model.Screens.Current(), RouteS3())  // returned to S3
+    return IsTrue(t3, anyActionableOf(s2.Model))         // re-queued → run continues
+}
+
+// The S3 blocker badge routes into S5 (mouse path), showing the question.
+func TestBlockerBadgeOpensS5(t T) T {
+    val port = blockingEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val st = port.Run(port.Plan(ws))
+    val s = NewHarnessOnRun(port, ws, st)
+        .SendMsg(MRunTick()).SendMsg(MRunTick()).SendMsg(MRunTick())
+        .SendMsg(MOpenBlocker())
+    val t1 = Eq(t, s.Model.Screens.Current(), RouteS5())
+    return IsTrue(t1, s.Contains("Is x nullable?"))
+}
+
+func NewHarnessOnRun(port engine.EnginePort, ws engine.WorkspaceModel, st engine.RunState) harness.Session[Model, Msg] {
+    val h = harness.NewHarnessFull[Model, Msg](NewProgram(port, 100, 20), (e) => inputToMsg(e), 100, 20)
+    return h.Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = port.Plan(ws)))
+        .SendMsg(MRunStarted(State = st))
+}

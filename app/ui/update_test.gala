@@ -16,6 +16,15 @@ import (
 
 func prog() Program[Model, Msg] = NewProgram(engine.MockEngine(), 110, 30)
 
+// StepAll2 continues a message sequence from an existing model (StepAll only
+// starts from a Program's Initial).
+func StepAll2(m Model, msgs Array[Msg]) Tuple[Model, Array[Cmd[Msg]]] =
+    StepAll(Program[Model, Msg](
+        Initial = m,
+        Update  = (mm, msg) => update(mm, msg),
+        View    = (mm) => view(mm),
+    ), msgs)
+
 // ticks builds n MRunTick messages (each StepAll-applied tick = one Advance,
 // since the self-rescheduling AfterDelay future doesn't fire under StepAll).
 func ticks(n int) Array[Msg] = ArrayTabulate[Msg](n, (i int) => MRunTick())
