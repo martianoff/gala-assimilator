@@ -2,6 +2,7 @@ package ui
 
 import (
     . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
 )
@@ -10,25 +11,28 @@ import (
 // View — pure Model → Widget.
 //
 // Responsive: below MinCols×MinRows the whole view collapses to a resize
-// notice instead of a clipped layout. Above WideCols the retry-budget and
-// agent-backend controls share a row; below it they stack.
-//
-// Every control is built with a click contract (`.OnClick`) AND reflects the
-// keyboard focus ring, so mouse and keyboard reach the same actions.
+// notice. S3's split board sits side-by-side when wide and stacks when narrow.
+// Every control carries a click contract AND reflects the keyboard focus state,
+// so mouse and keyboard reach the same actions. The view renders only plain VM
+// structs (from runview.gala); it never touches engine sealed types.
 // ============================================================================
 
 func view(m Model) Widget {
-    if m.Cols < MinCols() || m.Rows < MinRows() {
+    if (m.Cols < MinCols() || m.Rows < MinRows()) {
         return resizeNotice(m)
     }
     val route = m.Screens.Current()
-    if route == RouteS1() {
-        return s1View(m)
-    }
-    return placeholderView(m, route)
+    if (route == RouteS1()) { return s1View(m) }
+    if (route == RouteS2()) { return s2View(m) }
+    if (route == RouteS3()) { return s3View(m) }
+    return resizeNotice(m)
 }
 
-// ----- S1: Setup / Interview ------------------------------------------------
+func maxI(a int, b int) int = if (a > b) a else b
+
+// ============================================================================
+// S1 — Setup / Interview
+// ============================================================================
 
 func s1View(m Model) Widget {
     val combined = m.Cols >= WideCols()
@@ -40,7 +44,7 @@ func s1View(m Model) Widget {
             Fixed(1, backendRow(m)),
         )
     val top = ArrayOf[LayoutChild](
-        Fixed(1, headerRow(m)),
+        Fixed(1, headerRow("Gala Assimilator — new migration")),
         Fixed(1, Text("")),
         Fixed(1, sourceRow(m)),
         Fixed(1, detectedRow(m)),
@@ -56,11 +60,10 @@ func s1View(m Model) Widget {
     return Border(Column(children))
 }
 
-func headerRow(m Model) Widget =
+func headerRow(title string) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Flex(1, TextStyled("Gala Assimilator — new migration",
-            DefaultStyle().WithBold().WithFg(BrightCyan()))),
+        Flex(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan()))),
         Fixed(8, TextStyled("q quit ", DefaultStyle().WithDim())),
     ))
 
@@ -139,7 +142,6 @@ func retryControl(m Model) Widget =
         Fixed(10, TextStyled(" per unit", DefaultStyle().WithDim())),
     ))
 
-// Combined (wide) row: retry on the left, backend on the right.
 func retryBackendRow(m Model) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
@@ -150,7 +152,6 @@ func retryBackendRow(m Model) Widget =
         Fixed(22, backendGroup(m)),
     ))
 
-// Stacked (narrow) rows.
 func retryRow(m Model) Widget = fieldRow("Retry budget", retryControl(m))
 func backendRow(m Model) Widget = fieldRow("Agent backend", backendGroup(m))
 
@@ -164,9 +165,180 @@ func scanRow(m Model) Widget {
     ))
 }
 
-// ----- control primitives ---------------------------------------------------
+// ============================================================================
+// S2 — Plan summary
+// ============================================================================
 
-// btnWidget renders a `[ label ]` clickable button. Reverse when focused.
+func s2View(m Model) Widget = m.Plan match {
+    case Some(plan) => m.Workspace match {
+        case Some(ws) => s2Board(m, runview.ProjectPlan(ws, plan))
+        case None()   => s2Empty(m)
+    }
+    case None() => s2Empty(m)
+}
+
+func s2Empty(m Model) Widget =
+    Border(TextStyled("  (no plan — scan a project first)", DefaultStyle().WithDim()))
+
+func s2Board(m Model, pv runview.PlanVM) Widget {
+    val itemRows = pv.Items.Map((id) =>
+        Fixed(1, TextStyled("   • " + id, DefaultStyle())))
+    val head = ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Migration plan")),
+        Fixed(1, Text("")),
+        Fixed(1, kvRow("Source", m.SourceDir)),
+        Fixed(1, kvRow("Packages", s"${pv.Packages}     Units ${pv.Units}")),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("  Units to migrate:", DefaultStyle().WithDim())),
+    )
+    val foot = ArrayOf[LayoutChild](
+        Fixed(1, Text("")),
+        Fixed(1, s2Buttons(m)),
+    )
+    val children = head.AppendAll(itemRows).AppendAll(foot)
+    return Border(Column(children))
+}
+
+func kvRow(label string, value string) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(12, TextStyled(label, DefaultStyle().WithDim())),
+        Flex(1, TextStyled(value, DefaultStyle())),
+    ))
+
+func s2Buttons(m Model) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(14, btnWidget("← back", m.S2Focus == PaneBack(), MBack())),
+        Flex(1, Text("")),
+        Fixed(26, btnWidget("start assimilation →", m.S2Focus == PaneStart(), MStartRun())),
+        Fixed(2, Text("")),
+    ))
+
+// ============================================================================
+// S3 — Assimilation dashboard (Variant A, split board)
+// ============================================================================
+
+func s3View(m Model) Widget = m.Run match {
+    case Some(rs) => s3Board(m, runview.ProjectRun(rs))
+    case None()   => Border(TextStyled("  (no run)", DefaultStyle().WithDim()))
+}
+
+func s3Board(m Model, rv runview.RunVM) Widget {
+    val board = if (m.Cols >= WideCols()) splitBoard(m, rv) else stackedBoard(m, rv)
+    return Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Assimilation in progress")),
+        Fixed(1, progressBar(rv)),
+        Fixed(1, countsRow(rv.Counts)),
+        Fixed(1, Text("")),
+        Flex(1, board),
+        Fixed(1, s3Footer()),
+    )))
+}
+
+func progressBar(rv runview.RunVM) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Flex(1, Progress(rv.Pct)),
+        Fixed(18, TextStyled(s"  ${rv.Done}/${rv.Total} units (${rv.Pct}%)",
+            DefaultStyle().WithBold().WithFg(BrightGreen()))),
+    ))
+
+func countsRow(c runview.StatusCounts) Widget =
+    TextStyled(
+        s"  queued ${c.Queued} · active ${c.Active} · done ${c.Done} · blocked ${c.Blocked} · skipped ${c.Skipped} · failed ${c.Failed}",
+        DefaultStyle().WithDim())
+
+func splitBoard(m Model, rv runview.RunVM) Widget =
+    Row(ArrayOf[LayoutChild](
+        Flex(1, treePane(m, rv)),
+        Flex(1, logPane(m, rv)),
+    ))
+
+func stackedBoard(m Model, rv runview.RunVM) Widget =
+    Column(ArrayOf[LayoutChild](
+        Flex(1, treePane(m, rv)),
+        Flex(1, logPane(m, rv)),
+    ))
+
+func s3Footer() Widget =
+    TextStyled("  tab switch pane · ↑↓ navigate · esc back · q quit",
+        DefaultStyle().WithDim())
+
+// ----- left: unit tree by package -------------------------------------------
+
+func treePane(m Model, rv runview.RunVM) Widget {
+    val focused = m.S3Focus == PaneTree()
+    val title = paneTitle("Units", focused, PaneTree())
+    val body = Column(treeChildren(m, rv))
+    return Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, title),
+        Flex(1, body),
+    )))
+}
+
+func treeChildren(m Model, rv runview.RunVM) Array[LayoutChild] {
+    var children = EmptyArray[LayoutChild]()
+    var prevPkg = ""
+    var i = 0
+    val n = rv.Rows.Length()
+    for i < n {
+        val r = rv.Rows.Get(i)
+        if (r.Pkg != prevPkg) {
+            children = children.Append(Fixed(1,
+                TextStyled(" " + r.Pkg + "/", DefaultStyle().WithDim().WithBold())))
+            prevPkg = r.Pkg
+        }
+        children = children.Append(Fixed(1, unitRowWidget(m, r, i)))
+        i = i + 1
+    }
+    return children
+}
+
+func unitRowWidget(m Model, r runview.UnitRowVM, idx int) Widget {
+    val selected = m.S3Focus == PaneTree() && m.TreeCursor == idx
+    val style = if (selected)
+        DefaultStyle().WithReverse().WithBold()
+    else
+        DefaultStyle()
+    return TextStyled("  " + r.Glyph + " " + r.Id, style).OnClick(MSelectUnit(Idx = idx))
+}
+
+// ----- right: live activity log ---------------------------------------------
+
+func logPane(m Model, rv runview.RunVM) Widget {
+    val focused = m.S3Focus == PaneLog()
+    val title = paneTitle("Activity", focused, PaneLog())
+    return Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, title),
+        Flex(1, logColumn(m, rv.Log)),
+    )))
+}
+
+// logColumn renders a tail window of the log, shifted up by LogScroll.
+func logColumn(m Model, lines Array[string]) Widget {
+    val avail = maxI(1, m.Rows - 10)
+    val total = lines.Length()
+    val end = maxI(0, total - m.LogScroll)
+    val start = maxI(0, end - avail)
+    val window = lines.Slice(start, end)
+    return Column(window.Map((ln) => Fixed(1, Text(" " + ln))))
+}
+
+// paneTitle is a clickable pane header (mouse focuses the pane; ▸ marks focus).
+func paneTitle(label string, focused bool, pane string) Widget {
+    val mark = if (focused) "▸ " else "  "
+    val style = if (focused)
+        DefaultStyle().WithBold().WithFg(BrightCyan())
+    else
+        DefaultStyle().WithBold()
+    return TextStyled(mark + label, style).OnClick(MFocusPane(Pane = pane))
+}
+
+// ============================================================================
+// Shared control primitives
+// ============================================================================
+
 func btnWidget(label string, focused bool, msg Msg) Widget {
     val txt = "[ " + label + " ]"
     val style = if (focused)
@@ -176,7 +348,6 @@ func btnWidget(label string, focused bool, msg Msg) Widget {
     return TextStyled(txt, style).OnClick(msg)
 }
 
-// cyclerWidget renders a `‹ value ▾ ›` selector. A click cycles forward.
 func cyclerWidget(value string, focused bool, msg Msg) Widget {
     val txt = "‹ " + value + " ▾ ›"
     val style = if (focused)
@@ -186,7 +357,6 @@ func cyclerWidget(value string, focused bool, msg Msg) Widget {
     return TextStyled(txt, style).OnClick(msg)
 }
 
-// stepperWidget renders `‹ N ›` with clickable arrows.
 func stepperWidget(value int, focused bool) Widget {
     val arrow = DefaultStyle().WithBold().WithFg(BrightCyan())
     val valStyle = if (focused)
@@ -200,7 +370,6 @@ func stepperWidget(value int, focused bool) Widget {
     ))
 }
 
-// radioCell renders one `(•) label` / `( ) label` option as a clickable cell.
 func radioCell(selected bool, groupFocused bool, label string, msg Msg) LayoutChild {
     val mark = if (selected) "(•) " else "( ) "
     val base = DefaultStyle()
@@ -214,8 +383,6 @@ func radioCell(selected bool, groupFocused bool, label string, msg Msg) LayoutCh
     return Fixed(w, TextStyled(mark + label, style).OnClick(msg))
 }
 
-// ----- resize notice + placeholders -----------------------------------------
-
 func resizeNotice(m Model) Widget {
     val msg = s"Resize to ≥ ${MinCols()}×${MinRows()}"
     val body = Column(ArrayOf[LayoutChild](
@@ -223,28 +390,4 @@ func resizeNotice(m Model) Widget {
         Fixed(1, TextStyled("(terminal too small)", DefaultStyle().WithDim())),
     ))
     return body.Centered(m.Cols, m.Rows)
-}
-
-func routeTitle(route string) string {
-    if route == RouteS2() { return "Scan" }
-    if route == RouteS3() { return "Plan" }
-    if route == RouteS6() { return "Report" }
-    return route
-}
-
-func placeholderView(m Model, route string) Widget {
-    val title = routeTitle(route)
-    val summary = m.LastScan match {
-        case Some(out) => out.Summary
-        case None()    => "(no scan yet)"
-    }
-    val body = Column(ArrayOf[LayoutChild](
-        Fixed(1, TextStyled(s"${title} — coming soon",
-            DefaultStyle().WithBold().WithFg(BrightCyan()))),
-        Fixed(1, Text("")),
-        Fixed(1, TextStyled(summary, DefaultStyle())),
-        Fixed(1, Text("")),
-        Fixed(1, TextStyled("esc back · q quit", DefaultStyle().WithDim())),
-    ))
-    return Border(body.Centered(m.Cols - 2, m.Rows - 2))
 }

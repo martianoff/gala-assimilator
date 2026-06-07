@@ -2,6 +2,7 @@ package ui
 
 import (
     . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
     str "martianoff/gala/strings"
     . "martianoff/gala/test"
 )
@@ -13,7 +14,7 @@ import (
 // ============================================================================
 
 func TestS1WideRendersEveryControl(t T) T {
-    val m = NewModel(NewStubPort(), 110, 20)
+    val m = NewModel(engine.MockEngine(), 110, 20)
     val out = str.S(Snapshot(view(m), 110, 20))
     val t1 = IsTrue(t,  out.Contains("Gala Assimilator — new migration"))
     val t2 = IsTrue(t1, out.Contains("Source project"))
@@ -29,7 +30,7 @@ func TestS1WideRendersEveryControl(t T) T {
 }
 
 func TestS1NarrowRendersEveryControl(t T) T {
-    val m = NewModel(NewStubPort(), 72, 20)
+    val m = NewModel(engine.MockEngine(), 72, 20)
     val out = str.S(Snapshot(view(m), 72, 20))
     val t1 = IsTrue(t,  out.Contains("Gala Assimilator — new migration"))
     val t2 = IsTrue(t1, out.Contains("Target language"))
@@ -41,7 +42,7 @@ func TestS1NarrowRendersEveryControl(t T) T {
 
 // Wide: retry + backend share one row.
 func TestS1WideCombinesRetryAndBackend(t T) T {
-    val m = NewModel(NewStubPort(), 110, 20)
+    val m = NewModel(engine.MockEngine(), 110, 20)
     val lines = str.S(Snapshot(view(m), 110, 20)).Lines()
     val combined = lines.Exists((ln) => ln.Contains("Retry budget") && ln.Contains("Agent backend"))
     return IsTrue(t, combined)
@@ -49,7 +50,7 @@ func TestS1WideCombinesRetryAndBackend(t T) T {
 
 // Narrow: retry + backend are on separate rows (the layout reflowed).
 func TestS1NarrowStacksRetryAndBackend(t T) T {
-    val m = NewModel(NewStubPort(), 72, 20)
+    val m = NewModel(engine.MockEngine(), 72, 20)
     val lines = str.S(Snapshot(view(m), 72, 20)).Lines()
     val combined = lines.Exists((ln) => ln.Contains("Retry budget") && ln.Contains("Agent backend"))
     val hasRetry = lines.Exists((ln) => ln.Contains("Retry budget"))
@@ -61,7 +62,7 @@ func TestS1NarrowStacksRetryAndBackend(t T) T {
 
 // Below the declared minimum the layout collapses to a resize notice.
 func TestBelowMinimumShowsResizeNotice(t T) T {
-    val m = NewModel(NewStubPort(), 40, 8)
+    val m = NewModel(engine.MockEngine(), 40, 8)
     val out = str.S(Snapshot(view(m), 40, 8))
     val t1 = IsTrue(t, out.Contains("Resize to"))
     return IsFalse(t1, out.Contains("Target language"))
