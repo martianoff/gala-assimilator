@@ -1,0 +1,297 @@
+package acp
+
+// Internal tests for the ACP contract (package acp, per CLAUDE.md).
+//
+// They prove the contract is usable as data: each of the six messages can be
+// constructed, the sealed set is exhaustively matchable, and the MockRunner
+// seam produces a ProgressEvent-then-Result transcript.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+)
+
+// ----------------------------------------------------------------------------
+// Fixtures
+// ----------------------------------------------------------------------------
+
+func sampleAssignment() TaskAssignment =
+    TaskAssignment(
+        Task = TaskId(Value = "task-1"),
+        Unit = UnitId(Value = "unit-1"),
+        Source = SourceContext(
+            SourceText   = "func id(x int) int = x",
+            Dependencies = ArrayOf[DependencySnippet](
+                DependencySnippet(Name = "int", Text = "builtin"),
+            ),
+        ),
+        Target = TargetConventions(
+            Language = "go",
+            Notes    = ArrayOf[string]("gofmt", "no naked returns"),
+        ),
+        PriorFailure = None[PriorFailure](),
+        Answers      = EmptyArray[Answer](),
+    )
+
+// sampleFlag is the "surface, don't guess" signal reused across fixtures.
+func sampleFlag() UnsupportedFlag =
+    UnsupportedFlag(
+        Construct = "go-style defer",
+        Reason    = "no faithful target construct",
+    )
+
+// retryAssignment is an assignment as re-sent on a RETRY: PriorFailure populated
+// with the reviewer's rejection summary and the flags the last attempt raised.
+func retryAssignment() TaskAssignment {
+    val base = sampleAssignment()
+    return base.Copy(
+        PriorFailure = Some[PriorFailure](PriorFailure(
+            Summary = "previous attempt changed evaluation order",
+            Flags   = ArrayOf[UnsupportedFlag](sampleFlag()),
+        )),
+    )
+}
+
+// answeredAssignment is an assignment as re-sent after a clarification: the
+// resolved Answer threaded onto Answers, same stateless pattern as a retry.
+func answeredAssignment() TaskAssignment {
+    val base = sampleAssignment()
+    return base.Copy(
+        Answers = ArrayOf[Answer](
+            Answer(Task = TaskId(Value = "task-1"), Response = "no, x is non-null"),
+        ),
+    )
+}
+
+// ----------------------------------------------------------------------------
+// Constructing each of the six messages
+// ----------------------------------------------------------------------------
+
+// allSixMessages builds one Message of every case in the sealed set, in the
+// declared order. If a case is added/removed, this list stops matching the
+// MessageKind exhaustive match and the suite breaks — by design.
+func allSixMessages() Array[Message] {
+    val task = TaskId(Value = "task-1")
+    return ArrayOf[Message](
+        MsgTaskAssignment(Payload = sampleAssignment()),
+        MsgProgressEvent(Payload = ProgressEvent(
+            Task = task, Phase = Reading(), Note = "reading",
+        )),
+        MsgResult(Payload = Result(
+            Task       = task,
+            TargetText = "x",
+            Rationale  = "identity",
+            Flags      = EmptyArray[UnsupportedFlag](),
+        )),
+        MsgClarification(Payload = Clarification(
+            Task = task, Question = "is x nullable?",
+        )),
+        MsgAnswer(Payload = Answer(Task = task, Response = "no")),
+        MsgVerdict(Payload = Verdict(
+            Task    = task,
+            Outcome = Accept(),
+            Reasons = ArrayOf[string]("semantics preserved"),
+        )),
+    )
+}
+
+func TestConstructAllSixMessages(t T) T =
+    Eq(t, allSixMessages().Length(), 6)
+
+// TestMessageKindExhaustive walks every constructed message through the
+// exhaustive MessageKind match and checks the expected tags, demonstrating
+// pattern-matching over the whole sealed set.
+func TestMessageKindExhaustive(t T) T {
+    val msgs = allSixMessages()
+    val expected = ArrayOf[string](
+        "task_assignment",
+        "progress_event",
+        "result",
+        "clarification",
+        "answer",
+        "verdict",
+    )
+    var i = 0
+    var t2 = t
+    for i < msgs.Length() {
+        t2 = Eq(t2, MessageKind(msgs.Get(i)), expected.Get(i))
+        i = i + 1
+    }
+    return t2
+}
+
+// TestMatchDirectionTags shows a second exhaustive match over Message — here
+// classifying each message by who sends it — to confirm the sealed set drives
+// real branching logic, not just a tag string.
+func TestMatchDirectionTags(t T) T {
+    val direction = (m Message) => m match {
+        case MsgTaskAssignment(_) => "engine->agent"
+        case MsgAnswer(_)         => "engine->agent"
+        case MsgProgressEvent(_)  => "agent->engine"
+        case MsgResult(_)         => "agent->engine"
+        case MsgClarification(_)  => "agent->engine"
+        case MsgVerdict(_)        => "reviewer->engine"
+    }
+    val t1 = Eq(t, direction(MsgTaskAssignment(Payload = sampleAssignment())), "engine->agent")
+    return Eq(t1, direction(MsgVerdict(Payload = Verdict(
+        Task = TaskId(Value = "task-1"), Outcome = Reject(),
+        Reasons = ArrayOf[string]("drift"),
+    ))), "reviewer->engine")
+}
+
+// ----------------------------------------------------------------------------
+// VerdictOutcome is sealed & exhaustively matchable
+// ----------------------------------------------------------------------------
+
+func outcomeTag(o VerdictOutcome) string =
+    o match {
+        case Accept() => "accept"
+        case Reject() => "reject"
+    }
+
+func TestVerdictOutcomeExhaustive(t T) T {
+    val t1 = Eq(t, outcomeTag(Accept()), "accept")
+    return Eq(t1, outcomeTag(Reject()), "reject")
+}
+
+// ----------------------------------------------------------------------------
+// MockRunner round-trip — the extraction seam
+// ----------------------------------------------------------------------------
+
+// outcomeTagFn is a single exhaustive match over the sealed RunOutcome, reused
+// by the terminus tests. If a fourth terminus is added it breaks here.
+func outcomeTagFn(o RunOutcome) string =
+    o match {
+        case OutcomeResult(_)        => "result"
+        case OutcomeClarification(_) => "clarification"
+        case OutcomeAborted(_)       => "aborted"
+    }
+
+func TestRunOutcomeExhaustive(t T) T {
+    val r = Result(
+        Task = TaskId(Value = "task-1"), TargetText = "x",
+        Rationale = "id", Flags = EmptyArray[UnsupportedFlag](),
+    )
+    val c = Clarification(Task = TaskId(Value = "task-1"), Question = "nullable?")
+    val t1 = Eq(t, outcomeTagFn(OutcomeResult(Value = r)), "result")
+    val t2 = Eq(t1, outcomeTagFn(OutcomeClarification(Value = c)), "clarification")
+    return Eq(t2, outcomeTagFn(OutcomeAborted(Reason = "boom")), "aborted")
+}
+
+// TestMockRunnerRoundTrip drives a TaskAssignment through the MockRunner and
+// asserts the transcript: at least one ProgressEvent step, the first step IS a
+// ProgressEvent in the Reading phase, the terminus is an OutcomeResult, and the
+// join TaskId survives.
+func TestMockRunnerRoundTrip(t T) T {
+    val runner = MockRunner()
+    val transcript = runner.Submit(sampleAssignment())
+
+    // at least one streamed step before the terminus
+    val t1 = GreaterOrEq(t, transcript.Steps.Length(), 1)
+
+    // the first step is a ProgressEvent in the Reading phase
+    val t2 = transcript.Steps.Get(0) match {
+        case StepProgress(ev) => ev.Phase match {
+            case Reading()   => IsTrue(t1, true)
+            case Emitting()  => Fail(t1, "first step should be Reading, got Emitting")
+            case Verifying() => Fail(t1, "first step should be Reading, got Verifying")
+        }
+    }
+
+    // the terminus is an OutcomeResult carrying the assignment's TaskId
+    return transcript.Final match {
+        case OutcomeResult(r) => {
+            val t3 = Eq(t2, r.Task.Value, "task-1")
+            return Eq(t3, r.TargetText, "// mock translation")
+        }
+        case OutcomeClarification(_) => Fail(t2, "mock should terminate in OutcomeResult")
+        case OutcomeAborted(_)       => Fail(t2, "mock should terminate in OutcomeResult")
+    }
+}
+
+// TestScriptedRunnerTermini drives the port through each RunOutcome case — the
+// architect's requirement that every terminus be produced BY THE PORT, not just
+// hand-built. The ScriptedRunner pins the terminus while keeping the real
+// Reading->Emitting progress prefix.
+func TestScriptedRunnerTermini(t T) T {
+    val clar = Clarification(Task = TaskId(Value = "task-1"), Question = "is x nullable?")
+
+    // OutcomeClarification: the run ENDS asking a question (resolution loop).
+    val clarRunner = ScriptedRunner(OutcomeClarification(Value = clar), Cancelled())
+    val clarTx = clarRunner.Submit(sampleAssignment())
+    val t1 = clarTx.Final match {
+        case OutcomeClarification(c) => Eq(t, c.Question, "is x nullable?")
+        case OutcomeResult(_)        => Fail(t, "expected OutcomeClarification")
+        case OutcomeAborted(_)       => Fail(t, "expected OutcomeClarification")
+    }
+
+    // OutcomeAborted: wholesale failure / nothing produced.
+    val abortRunner = ScriptedRunner(OutcomeAborted(Reason = "agent crashed"), Cancelled())
+    val abortTx = abortRunner.Submit(sampleAssignment())
+    val t2 = abortTx.Final match {
+        case OutcomeAborted(reason)  => Eq(t1, reason, "agent crashed")
+        case OutcomeResult(_)        => Fail(t1, "expected OutcomeAborted")
+        case OutcomeClarification(_) => Fail(t1, "expected OutcomeAborted")
+    }
+
+    // steps prefix is still present on a non-result terminus
+    return GreaterOrEq(t2, clarTx.Steps.Length(), 1)
+}
+
+// TestMockRunnerCancel confirms Cancel returns a pure, matchable CancelOutcome,
+// and that BOTH cases are reachable through the port (NotRunning via the
+// ScriptedRunner).
+func TestMockRunnerCancel(t T) T {
+    val runner = MockRunner()
+    val t1 = runner.Cancel(TaskId(Value = "task-1")) match {
+        case Cancelled()  => IsTrue(t, true)
+        case NotRunning() => Fail(t, "mock cancel should report Cancelled")
+    }
+    val notRunning = ScriptedRunner(OutcomeAborted(Reason = "n/a"), NotRunning())
+    return notRunning.Cancel(TaskId(Value = "task-1")) match {
+        case NotRunning() => IsTrue(t1, true)
+        case Cancelled()  => Fail(t1, "scripted cancel should report NotRunning")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Fixture-per-construct coverage (CLAUDE.md): every contract member built &
+// asserted — the re-submission carriers, the Verifying phase, and the
+// "surface, don't guess" Flags path.
+// ----------------------------------------------------------------------------
+
+func TestPriorFailureCarrier(t T) T =
+    retryAssignment().PriorFailure match {
+        case Some(pf) => Eq(t, pf.Flags.Length(), 1)
+        case None()   => Fail(t, "retry assignment must carry a PriorFailure")
+    }
+
+func TestAnswersCarrier(t T) T {
+    val a = answeredAssignment()
+    val t1 = Eq(t, a.Answers.Length(), 1)
+    return Eq(t1, a.Answers.Get(0).Response, "no, x is non-null")
+}
+
+func TestVerifyingProgressEvent(t T) T {
+    val ev = ProgressEvent(
+        Task = TaskId(Value = "task-1"), Phase = Verifying(),
+        Note = "self-checking output",
+    )
+    return ev.Phase match {
+        case Verifying() => IsTrue(t, true)
+        case Reading()   => Fail(t, "expected Verifying")
+        case Emitting()  => Fail(t, "expected Verifying")
+    }
+}
+
+func TestResultWithFlags(t T) T {
+    val r = Result(
+        Task       = TaskId(Value = "task-1"),
+        TargetText = "",
+        Rationale  = "construct has no faithful target",
+        Flags      = ArrayOf[UnsupportedFlag](sampleFlag()),
+    )
+    val t1 = Eq(t, r.Flags.Length(), 1)
+    return Eq(t1, r.Flags.Get(0).Construct, "go-style defer")
+}
