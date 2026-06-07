@@ -1,0 +1,10 @@
+package app
+
+// The `app` layer is the runnable application: the gala_tui UI (`app/ui`) and,
+// in a later milestone, the migration engine (`app/engine`) behind its public
+// port. This file declares the `app` package so the directory is a real
+// package — the cmd entrypoint imports `app/ui` through it, and the toolchain's
+// test workspace resolves the nested package path correctly.
+
+// LayerName identifies this layer in diagnostics.
+func LayerName() string = "app"

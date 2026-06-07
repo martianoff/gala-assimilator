@@ -1,0 +1,12 @@
+package main
+
+import (
+    . "github.com/martianoff/gala-assimilator/app/ui"
+)
+
+// Entry point: wire the engine port (a stub this milestone) into the TUI and
+// launch it. When the real engine lands, only this line changes — swap the
+// stub for an adapter over the engine's public port.
+func main() {
+    RunApp(NewStubPort())
+}

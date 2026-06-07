@@ -1,0 +1,89 @@
+package ui
+
+import (
+    . "martianoff/gala/collection_immutable"
+)
+
+// ============================================================================
+// Interview domain enums + their selectable option lists.
+//
+// These are pure value types shared by the model, the view, and the engine
+// port. The cyclers (target language, ambiguity default) are driven by an
+// index into a fixed option list so a click or an arrow key is a single
+// "advance the index" operation.
+// ============================================================================
+
+// UnsupportedPolicy is what the migration does when it meets a construct it
+// can't faithfully translate.
+sealed type UnsupportedPolicy {
+    case FlagContinue()    // emit a flagged TODO and keep going (default)
+    case SkipUnit()        // drop the offending unit
+    case StopAll()         // abort the whole migration
+}
+
+func UnsupportedLabel(p UnsupportedPolicy) string = p match {
+    case FlagContinue() => "flag & continue"
+    case SkipUnit()     => "skip"
+    case StopAll()      => "stop"
+}
+
+func UnsupportedOptions() Array[UnsupportedPolicy] =
+    ArrayOf[UnsupportedPolicy](FlagContinue(), SkipUnit(), StopAll())
+
+func UnsupportedEq(a UnsupportedPolicy, b UnsupportedPolicy) bool = a match {
+    case FlagContinue() => b match { case FlagContinue() => true case _ => false }
+    case SkipUnit()     => b match { case SkipUnit()     => true case _ => false }
+    case StopAll()      => b match { case StopAll()      => true case _ => false }
+}
+
+// AgentBackend selects which agent drives the per-unit translation.
+sealed type AgentBackend {
+    case MockBackend()
+    case ClaudeBackend()
+}
+
+func BackendLabel(b AgentBackend) string = b match {
+    case MockBackend()   => "Mock"
+    case ClaudeBackend() => "Claude"
+}
+
+func BackendOptions() Array[AgentBackend] =
+    ArrayOf[AgentBackend](MockBackend(), ClaudeBackend())
+
+func BackendEq(a AgentBackend, b AgentBackend) bool = a match {
+    case MockBackend()   => b match { case MockBackend()   => true case _ => false }
+    case ClaudeBackend() => b match { case ClaudeBackend() => true case _ => false }
+}
+
+// Target-language options (the cycler). GALA is the first supported target.
+func TargetLangOptions() Array[string] =
+    ArrayOf[string]("GALA", "TypeScript", "Rust")
+
+// Ambiguity-default options (the cycler) — how the engine resolves a source
+// construct that maps to more than one faithful target form.
+func AmbiguityOptions() Array[string] =
+    ArrayOf[string](
+        "prefer immutable + Copy",
+        "prefer mutable",
+        "ask each time",
+    )
+
+// Retry-budget bounds for the stepper.
+func RetryMin() int = 0
+func RetryMax() int = 9
+
+// clampIdx wraps an index into [0, n) so a cycler advances/retreats with
+// wraparound. n must be > 0.
+func clampIdx(i int, n int) int {
+    if n <= 0 { return 0 }
+    val m = i % n
+    if m < 0 { return m + n }
+    return m
+}
+
+// clampInt pins v into [lo, hi].
+func clampInt(v int, lo int, hi int) int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}

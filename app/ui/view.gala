@@ -1,0 +1,250 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ============================================================================
+// View — pure Model → Widget.
+//
+// Responsive: below MinCols×MinRows the whole view collapses to a resize
+// notice instead of a clipped layout. Above WideCols the retry-budget and
+// agent-backend controls share a row; below it they stack.
+//
+// Every control is built with a click contract (`.OnClick`) AND reflects the
+// keyboard focus ring, so mouse and keyboard reach the same actions.
+// ============================================================================
+
+func view(m Model) Widget {
+    if m.Cols < MinCols() || m.Rows < MinRows() {
+        return resizeNotice(m)
+    }
+    val route = m.Screens.Current()
+    if route == RouteS1() {
+        return s1View(m)
+    }
+    return placeholderView(m, route)
+}
+
+// ----- S1: Setup / Interview ------------------------------------------------
+
+func s1View(m Model) Widget {
+    val combined = m.Cols >= WideCols()
+    val mid = if (combined)
+        ArrayOf[LayoutChild](Fixed(1, retryBackendRow(m)))
+    else
+        ArrayOf[LayoutChild](
+            Fixed(1, retryRow(m)),
+            Fixed(1, backendRow(m)),
+        )
+    val top = ArrayOf[LayoutChild](
+        Fixed(1, headerRow(m)),
+        Fixed(1, Text("")),
+        Fixed(1, sourceRow(m)),
+        Fixed(1, detectedRow(m)),
+        Fixed(1, targetRow(m)),
+        Fixed(1, unsupportedRow(m)),
+    )
+    val tail = ArrayOf[LayoutChild](
+        Fixed(1, ambiguityRow(m)),
+        Fixed(1, Text("")),
+        Fixed(1, scanRow(m)),
+    )
+    val children = top.AppendAll(mid).AppendAll(tail)
+    return Border(Column(children))
+}
+
+func headerRow(m Model) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Flex(1, TextStyled("Gala Assimilator — new migration",
+            DefaultStyle().WithBold().WithFg(BrightCyan()))),
+        Fixed(8, TextStyled("q quit ", DefaultStyle().WithDim())),
+    ))
+
+func labelW() int = 17
+
+func fieldRow(label string, control Widget) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(labelW(), TextStyled(label, DefaultStyle().WithDim())),
+        Flex(1, control),
+    ))
+
+func sourceRow(m Model) Widget {
+    val focused = m.Focus.IsFocused(PaneBrowse())
+    return Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(labelW(), TextStyled("Source project", DefaultStyle().WithDim())),
+        Flex(1, TextStyled(m.SourceDir, DefaultStyle())),
+        Fixed(12, btnWidget("browse", focused, MBrowse())),
+    ))
+}
+
+func detectedRow(m Model) Widget {
+    val info = m.Source
+    val text = if (info.Detected)
+        s"${info.Lang}  (${info.Marker}, ${info.FileCnt} files)"
+    else
+        "—  (no recognised project)"
+    val mark = if (info.Detected) " ✓" else " ✗"
+    val markStyle = if (info.Detected)
+        DefaultStyle().WithFg(BrightGreen())
+    else
+        DefaultStyle().WithFg(BrightYellow())
+    return Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(labelW(), TextStyled("Detected source", DefaultStyle().WithDim())),
+        Flex(1, TextStyled(text, DefaultStyle())),
+        Fixed(3, TextStyled(mark, markStyle)),
+    ))
+}
+
+func targetRow(m Model) Widget =
+    fieldRow("Target language",
+        cyclerWidget(m.TargetLang(), m.Focus.IsFocused(PaneTarget()), MCycleTarget()))
+
+func ambiguityRow(m Model) Widget =
+    fieldRow("Ambiguity",
+        cyclerWidget(m.Ambiguity(), m.Focus.IsFocused(PaneAmbiguity()), MCycleAmbiguity()))
+
+func unsupportedRow(m Model) Widget {
+    val f = m.Focus.IsFocused(PaneUnsupported())
+    val isFlag = UnsupportedEq(m.Unsupported, FlagContinue())
+    val isSkip = UnsupportedEq(m.Unsupported, SkipUnit())
+    val isStop = UnsupportedEq(m.Unsupported, StopAll())
+    val group = Row(ArrayOf[LayoutChild](
+        radioCell(isFlag, f, "flag & continue", MSetUnsupported(P = FlagContinue())),
+        radioCell(isSkip, f, "skip",            MSetUnsupported(P = SkipUnit())),
+        radioCell(isStop, f, "stop",            MSetUnsupported(P = StopAll())),
+    ))
+    return fieldRow("Unsupported", group)
+}
+
+func backendGroup(m Model) Widget {
+    val f = m.Focus.IsFocused(PaneBackend())
+    val isMock   = BackendEq(m.Backend, MockBackend())
+    val isClaude = BackendEq(m.Backend, ClaudeBackend())
+    return Row(ArrayOf[LayoutChild](
+        radioCell(isMock,   f, "Mock",   MSetBackend(B = MockBackend())),
+        radioCell(isClaude, f, "Claude", MSetBackend(B = ClaudeBackend())),
+    ))
+}
+
+func retryControl(m Model) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(7, stepperWidget(m.Retry, m.Focus.IsFocused(PaneRetry()))),
+        Fixed(10, TextStyled(" per unit", DefaultStyle().WithDim())),
+    ))
+
+// Combined (wide) row: retry on the left, backend on the right.
+func retryBackendRow(m Model) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(labelW(), TextStyled("Retry budget", DefaultStyle().WithDim())),
+        Fixed(18, retryControl(m)),
+        Flex(1, Text("")),
+        Fixed(15, TextStyled("Agent backend", DefaultStyle().WithDim())),
+        Fixed(22, backendGroup(m)),
+    ))
+
+// Stacked (narrow) rows.
+func retryRow(m Model) Widget = fieldRow("Retry budget", retryControl(m))
+func backendRow(m Model) Widget = fieldRow("Agent backend", backendGroup(m))
+
+func scanRow(m Model) Widget {
+    val focused = m.Focus.IsFocused(PaneScan())
+    val label = if (m.Scanning) "scanning…" else "scan project →"
+    return Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Flex(1, Text("")),
+        Fixed(20, btnWidget(label, focused, MScanRequested())),
+    ))
+}
+
+// ----- control primitives ---------------------------------------------------
+
+// btnWidget renders a `[ label ]` clickable button. Reverse when focused.
+func btnWidget(label string, focused bool, msg Msg) Widget {
+    val txt = "[ " + label + " ]"
+    val style = if (focused)
+        DefaultStyle().WithReverse().WithBold()
+    else
+        DefaultStyle().WithBold().WithFg(BrightGreen())
+    return TextStyled(txt, style).OnClick(msg)
+}
+
+// cyclerWidget renders a `‹ value ▾ ›` selector. A click cycles forward.
+func cyclerWidget(value string, focused bool, msg Msg) Widget {
+    val txt = "‹ " + value + " ▾ ›"
+    val style = if (focused)
+        DefaultStyle().WithReverse().WithBold()
+    else
+        DefaultStyle().WithFg(BrightCyan())
+    return TextStyled(txt, style).OnClick(msg)
+}
+
+// stepperWidget renders `‹ N ›` with clickable arrows.
+func stepperWidget(value int, focused bool) Widget {
+    val arrow = DefaultStyle().WithBold().WithFg(BrightCyan())
+    val valStyle = if (focused)
+        DefaultStyle().WithReverse().WithBold()
+    else
+        DefaultStyle().WithBold()
+    return Row(ArrayOf[LayoutChild](
+        Fixed(2, TextStyled("‹ ", arrow).OnClick(MStepRetry(Dir = -1))),
+        Fixed(3, TextStyled(s" ${value} ", valStyle)),
+        Fixed(2, TextStyled(" ›", arrow).OnClick(MStepRetry(Dir = 1))),
+    ))
+}
+
+// radioCell renders one `(•) label` / `( ) label` option as a clickable cell.
+func radioCell(selected bool, groupFocused bool, label string, msg Msg) LayoutChild {
+    val mark = if (selected) "(•) " else "( ) "
+    val base = DefaultStyle()
+    val style = if (groupFocused && selected)
+        base.WithReverse().WithBold()
+    else if (selected)
+        base.WithBold().WithFg(BrightCyan())
+    else
+        base.WithDim()
+    val w = RuneCount(mark + label) + 2
+    return Fixed(w, TextStyled(mark + label, style).OnClick(msg))
+}
+
+// ----- resize notice + placeholders -----------------------------------------
+
+func resizeNotice(m Model) Widget {
+    val msg = s"Resize to ≥ ${MinCols()}×${MinRows()}"
+    val body = Column(ArrayOf[LayoutChild](
+        Fixed(1, TextStyled(msg, DefaultStyle().WithBold().WithFg(BrightYellow()))),
+        Fixed(1, TextStyled("(terminal too small)", DefaultStyle().WithDim())),
+    ))
+    return body.Centered(m.Cols, m.Rows)
+}
+
+func routeTitle(route string) string {
+    if route == RouteS2() { return "Scan" }
+    if route == RouteS3() { return "Plan" }
+    if route == RouteS6() { return "Report" }
+    return route
+}
+
+func placeholderView(m Model, route string) Widget {
+    val title = routeTitle(route)
+    val summary = m.LastScan match {
+        case Some(out) => out.Summary
+        case None()    => "(no scan yet)"
+    }
+    val body = Column(ArrayOf[LayoutChild](
+        Fixed(1, TextStyled(s"${title} — coming soon",
+            DefaultStyle().WithBold().WithFg(BrightCyan()))),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled(summary, DefaultStyle())),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("esc back · q quit", DefaultStyle().WithDim())),
+    ))
+    return Border(body.Centered(m.Cols - 2, m.Rows - 2))
+}
