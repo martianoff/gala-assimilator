@@ -1,0 +1,191 @@
+package acp
+
+// Package acp defines the Agent Communication Protocol (ACP) — the interface
+// contract between the gala-assimilator migration engine (the Orchestrator) and
+// the autonomous agents it dispatches translation/review work to.
+//
+// THIS FILE IS A PORT/CONTRACT, NOT AN IMPLEMENTATION.
+// It declares clean, immutable value types and a sealed message set. The real
+// behavior (GALA-TEAM's extracted agent runner) plugs in behind the
+// `AgentRunner` port in runner.gala — see the EXTENSION SEAM there.
+//
+// Hard invariants (CLAUDE.md / architecture.md):
+//   - Transport-neutral: NO gala_tui imports, NO app/ui imports. Pure data only.
+//   - Side effects (streaming over a socket, spawning a subprocess, ticking the
+//     live UI) live at the edges as Cmd[T]; the ACP itself never performs IO.
+//   - Sealed types + exhaustive matching; immutable; no hidden mutation.
+//
+// The Orchestrator is the engine itself, not an addressable agent — it is the
+// party that constructs TaskAssignments and consumes Results/Verdicts. It is
+// therefore deliberately NOT modeled as a Role below.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ----------------------------------------------------------------------------
+// Roles
+// ----------------------------------------------------------------------------
+
+// Role is an agent the engine can address. The Orchestrator (the engine) is the
+// caller, not a Role — see the package doc.
+sealed type Role {
+    case Translator() // turns one source unit into target-language text
+    case Reviewer()   // judges a translation and returns a Verdict
+}
+
+// ----------------------------------------------------------------------------
+// Identifiers & value types
+// ----------------------------------------------------------------------------
+
+// TaskId identifies a single dispatched unit of work for its whole lifecycle —
+// the join key between a TaskAssignment and every message that answers it.
+struct TaskId(Value string)
+
+// UnitId identifies the source artifact being migrated (a file, decl, or other
+// translation unit), independent of how many times it is (re)assigned.
+struct UnitId(Value string)
+
+// DependencySnippet is one piece of surrounding context a translator may need:
+// the signature/text of a symbol the unit depends on, named for reference.
+struct DependencySnippet(Name string, Text string)
+
+// SourceContext is the source text plus the dependency context handed to a
+// translator. It is everything the agent is allowed to read for one unit — the
+// engine curates it so the agent need not (and cannot) reach back into the IR.
+struct SourceContext(
+    SourceText   string,
+    Dependencies Array[DependencySnippet],
+)
+
+// TargetConventions tells the agent what "good output" looks like for the
+// target language: the language name plus free-form convention notes (naming,
+// idioms, formatting) the engine wants honored.
+struct TargetConventions(
+    Language string,
+    Notes    Array[string],
+)
+
+// UnsupportedFlag is the "surface, don't guess" signal. When a source construct
+// has no faithful target, the agent flags it here rather than emitting a
+// translation it cannot justify as semantics-preserving.
+struct UnsupportedFlag(
+    Construct string, // the source construct with no faithful mapping
+    Reason    string, // why it cannot be faithfully translated
+)
+
+// PriorFailure is the feedback attached to a retry: a summary of why the
+// previous attempt was rejected plus the flags it raised, so the agent can do
+// better the second time.
+struct PriorFailure(
+    Summary string,
+    Flags   Array[UnsupportedFlag],
+)
+
+// VerdictOutcome is a reviewer's binary call. Reasons are carried on the
+// Verdict message, not here, so the outcome stays a clean two-case enum.
+sealed type VerdictOutcome {
+    case Accept()
+    case Reject()
+}
+
+// ----------------------------------------------------------------------------
+// ProgressEvent phases
+// ----------------------------------------------------------------------------
+
+// ProgressPhase is the coarse stage a ProgressEvent reports — enough for the
+// engine to drive a live UI ticker without parsing free-form notes.
+sealed type ProgressPhase {
+    case Reading()   // ingesting source + dependency context
+    case Emitting()  // producing target text
+    case Verifying() // self-checking the emitted output
+}
+
+// ----------------------------------------------------------------------------
+// Message payloads
+//
+// Each payload is a standalone immutable struct so it can be referenced
+// directly by the AgentRunner port (e.g. Submit takes a TaskAssignment). The
+// sealed `Message` type below wraps them into one exhaustively-matchable set.
+// ----------------------------------------------------------------------------
+
+// TaskAssignment: engine -> agent. The unit to translate, the curated source
+// context, the target conventions, and — populated only on a retry — the prior
+// failure to learn from.
+struct TaskAssignment(
+    Task         TaskId,
+    Unit         UnitId,
+    Source       SourceContext,
+    Target       TargetConventions,
+    PriorFailure Option[PriorFailure],
+)
+
+// ProgressEvent: agent -> engine. A streamed status note (reading / emitting /
+// verifying) that drives the live UI ticker. Non-terminal: many per task.
+struct ProgressEvent(
+    Task  TaskId,
+    Phase ProgressPhase,
+    Note  string,
+)
+
+// Result: agent -> engine. The terminal output of a translation task: the
+// emitted target text, the agent's rationale, and any UnsupportedFlags raised.
+struct Result(
+    Task       TaskId,
+    TargetText string,
+    Rationale  string,
+    Flags      Array[UnsupportedFlag],
+)
+
+// Clarification: agent -> engine. A question the agent needs answered to
+// proceed. The engine replies with an Answer carrying the same TaskId.
+struct Clarification(
+    Task     TaskId,
+    Question string,
+)
+
+// Answer: engine -> agent. The response to a Clarification, joined by TaskId.
+struct Answer(
+    Task     TaskId,
+    Response string,
+)
+
+// Verdict: reviewer -> engine. The outcome of a review plus its reasons. On a
+// Reject, the reasons become the next attempt's PriorFailure summary.
+struct Verdict(
+    Task    TaskId,
+    Outcome VerdictOutcome,
+    Reasons Array[string],
+)
+
+// ----------------------------------------------------------------------------
+// The sealed message set — the heart of the contract
+// ----------------------------------------------------------------------------
+
+// Message is the closed set of everything that crosses the ACP boundary in
+// either direction. It is sealed so every consumer must handle all six cases:
+// adding a seventh message is a compile-time break at every match site, which
+// is exactly the safety net a protocol contract should provide.
+sealed type Message {
+    case MsgTaskAssignment(Payload TaskAssignment) // engine   -> agent
+    case MsgProgressEvent(Payload ProgressEvent)   // agent    -> engine
+    case MsgResult(Payload Result)                 // agent    -> engine
+    case MsgClarification(Payload Clarification)   // agent    -> engine
+    case MsgAnswer(Payload Answer)                 // engine   -> agent
+    case MsgVerdict(Payload Verdict)               // reviewer -> engine
+}
+
+// MessageKind is a stable, human-readable tag for a Message. It exists mainly
+// to demonstrate (and pin) exhaustive matching over the sealed set — a single
+// place that breaks to compile if the message set ever grows.
+func MessageKind(m Message) string {
+    return m match {
+        case MsgTaskAssignment(_) => "task_assignment"
+        case MsgProgressEvent(_)  => "progress_event"
+        case MsgResult(_)         => "result"
+        case MsgClarification(_)  => "clarification"
+        case MsgAnswer(_)         => "answer"
+        case MsgVerdict(_)        => "verdict"
+    }
+}

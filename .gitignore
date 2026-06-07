@@ -1,6 +1,9 @@
 # GALA transpiler output
 *.gen.go
 
+# GALA local build cache
+/.gala/
+
 # Build output
 /gala_assimilator
 /gala_assimilator.exe
