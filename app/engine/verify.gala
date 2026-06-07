@@ -1,0 +1,102 @@
+package engine
+
+// The VERIFY GATE contract — the engine's M3 correctness check, behind a port.
+//
+// Per MVP §3.1 + §0 decision 11: the ONLY correctness signal for a migration is
+// the SOURCE's own tests, replicated 1:1 (UnitKind SourceTest). Agent-added tests
+// (AddedTest) NEVER gate a unit — they are excluded when the plan's per-unit
+// SourceTests are built (sourceTestRefs), so they can't even reach the Verifier.
+// This file is the pluggable seam for that single source-test signal.
+//
+// DEFERRED — the real `gala build` / `gala test` invocation. Exactly like the mock
+// translator (run.gala header), the real verifier is NOT wired yet: translation is
+// still the MockTranslator, so a unit's emitted TargetText is "// mock translation"
+// rather than real GALA the toolchain could compile and run. A real Verifier will,
+// per unit, materialize the emitted target plus its 1:1-replicated source tests
+// into a scratch module, run `gala test`, and map green/red onto VerifyResult.
+// Until translation emits real GALA there is nothing real to compile, so
+// MockVerifier (deterministic pass) stands in. Swapping in the real verifier is a
+// port substitution behind *EngineWithVerifier — the gate itself does not change.
+//
+// Transport-neutral (CLAUDE.md / architecture.md): NO gala_tui, NO app/ui, no IO.
+
+import (
+    . "martianoff/gala/collection_immutable"
+)
+
+// ----------------------------------------------------------------------------
+// Gate value types
+// ----------------------------------------------------------------------------
+
+// SourceTestRef is one 1:1-replicated source test the gate runs against a unit's
+// emitted translation: its unit id, source-relative path, and real test source.
+// Only SourceTest units ever become a SourceTestRef (see sourceTestRefs); an
+// AddedTest can never appear here, so it can never gate a translation.
+struct SourceTestRef(
+    Unit   UnitId,
+    Path   string,
+    Source string,
+)
+
+// VerifyRequest is one gate evaluation: the unit under test, the translation just
+// emitted for it, and the package's 1:1 source tests to run against that output.
+struct VerifyRequest(
+    Unit        UnitId,
+    TargetText  string,
+    SourceTests Array[SourceTestRef],
+)
+
+// VerifyResult is the sealed verdict of the gate. Sealed so every consumer handles
+// all three ways verification can end — and so a source test that cannot be
+// faithfully verified is a FIRST-CLASS terminus (VerifyUnsupported), never a
+// silent pass or a silent drop.
+sealed type VerifyResult {
+    case VerifyPass()                                     // every 1:1 source test passed
+    case VerifyFail(Failing Array[UnitId], Reason string) // named source tests rejected the output
+    case VerifyUnsupported(Reason string)                 // a source test can't be faithfully verified -> needs review
+}
+
+// ----------------------------------------------------------------------------
+// The Verifier port
+// ----------------------------------------------------------------------------
+
+// Verifier is the verify-gate port: a struct of function values (the GALA-idiomatic
+// port, like AgentRunner). Verify: VerifyRequest -> VerifyResult. A real backend
+// performs its IO (materialize + `gala test`) inside Verify and returns the value;
+// the contract's view of it stays pure.
+struct Verifier(
+    Verify func(VerifyRequest) VerifyResult,
+)
+
+// MockVerifier is the default verifier this gate ships: deterministic PASS. It does
+// NOT inspect the emitted text (translation is still mock — see the file header);
+// it stands in for the real toolchain run so the gate is exercised end-to-end. A
+// unit whose package has no 1:1 source tests passes vacuously: with no replicated
+// test to contradict the translation, the single correctness signal is silent. The
+// real extracted verifier replaces this constructor.
+func MockVerifier() Verifier =
+    Verifier(Verify = (_ VerifyRequest) => VerifyPass())
+
+// ScriptedVerifier pins the VerifyResult every Verify returns, so each gate
+// terminus (pass / fail / unsupported) can be exercised THROUGH the port — the
+// verify analogue of ScriptedRunner.
+func ScriptedVerifier(result VerifyResult) Verifier =
+    Verifier(Verify = (_ VerifyRequest) => result)
+
+// ----------------------------------------------------------------------------
+// Per-package source-test selection (the AddedTest exclusion happens HERE)
+// ----------------------------------------------------------------------------
+
+// sourceTestRefs is the package's gate input: its SourceTest units ONLY, as
+// SourceTestRefs. AddedTest units are dropped here — the one place the "added
+// tests never count" rule is enforced — so they never flow into a VerifyRequest.
+func sourceTestRefs(p Package) Array[SourceTestRef] =
+    p.Units
+        .Filter((u Unit) => isSourceTest(u.Kind))
+        .Map((u Unit) => SourceTestRef(Unit = u.Id, Path = u.Path, Source = u.Source))
+
+func isSourceTest(k UnitKind) bool = k match {
+    case SourceTest() => true
+    case SourceUnit() => false
+    case AddedTest()  => false
+}
