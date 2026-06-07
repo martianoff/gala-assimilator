@@ -28,11 +28,14 @@ import (
 struct ScanRequest(Root string)
 
 // PlanItem is one unit scheduled for migration, with the curated source context
-// and target conventions the translator will receive.
+// and target conventions the translator will receive, plus the package's 1:1
+// source tests (SourceTest only — AddedTest excluded by sourceTestRefs) that the
+// verify gate runs against this unit's emitted translation.
 struct PlanItem(
-    Unit   UnitId,
-    Source SourceContext,
-    Target TargetConventions,
+    Unit        UnitId,
+    Source      SourceContext,
+    Target      TargetConventions,
+    SourceTests Array[SourceTestRef],
 )
 
 // MigrationPlan is the ordered set of units to migrate.
@@ -53,12 +56,14 @@ sealed type UnitStatus {
 }
 
 // UnitRun is the engine's per-unit state: the unit id, the assignment prepared
-// for it (which carries the re-submission Answers / PriorFailure), and its
-// current status.
+// for it (which carries the re-submission Answers / PriorFailure), its current
+// status, and the 1:1 source tests the verify gate runs against this unit (carried
+// from the plan so the gate needs no rescan; round-trips through Checkpoint).
 struct UnitRun(
-    Unit       UnitId,
-    Assignment TaskAssignment,
-    Status     UnitStatus,
+    Unit        UnitId,
+    Assignment  TaskAssignment,
+    Status      UnitStatus,
+    SourceTests Array[SourceTestRef],
 )
 
 // EngineEvent is one thing the run streams to the UI: a progress note (sourced
@@ -121,18 +126,24 @@ struct EnginePort(
 // MockEngine — the deterministic offline implementation
 // ----------------------------------------------------------------------------
 
-// MockEngine is the default offline engine, driven by the MockTranslator.
+// MockEngine is the default offline engine, driven by the MockTranslator and the
+// deterministic (always-pass) MockVerifier.
 func MockEngine() EnginePort = MockEngineWith(MockTranslator())
 
-// MockEngineWith builds the engine over a caller-supplied translator runner, so
-// tests can inject a ScriptedRunner that yields a Clarification or an Abort and
-// drive a unit to Blocked / Failed — every terminus exercised THROUGH the real
-// run machinery, not hand-built.
-func MockEngineWith(runner AgentRunner) EnginePort = EnginePort(
+// MockEngineWith builds the engine over a caller-supplied translator runner (with
+// the default MockVerifier), so tests can inject a ScriptedRunner that yields a
+// Clarification or an Abort and drive a unit to Blocked / Failed — every terminus
+// exercised THROUGH the real run machinery, not hand-built.
+func MockEngineWith(runner AgentRunner) EnginePort = MockEngineWithVerifier(runner, MockVerifier())
+
+// MockEngineWithVerifier builds the engine over a caller-supplied runner AND
+// verifier, so tests can inject a ScriptedVerifier (pass / fail / unsupported) and
+// drive the verify gate's every terminus THROUGH the run machinery.
+func MockEngineWithVerifier(runner AgentRunner, verifier Verifier) EnginePort = EnginePort(
     Scan          = (_ ScanRequest) => ScanGoWorkspaceStub(),
     Plan          = (m WorkspaceModel) => planFor(m),
     Run           = (p MigrationPlan) => runFor(p),
-    Advance       = (s RunState) => advance(runner, s),
+    Advance       = (s RunState) => advance(runner, verifier, s),
     Events        = (s RunState) => s.Log,
     ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
     AnswerBlocker = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
@@ -144,31 +155,29 @@ func MockEngineWith(runner AgentRunner) EnginePort = EnginePort(
 // scan / plan / run
 // ----------------------------------------------------------------------------
 
-func planFor(model WorkspaceModel) MigrationPlan {
-    val items = model.Packages.FoldLeft[Array[PlanItem]](
-        EmptyArray[PlanItem](),
-        (acc Array[PlanItem], p Package) => acc.AppendAll(
-            p.Units.Map((u Unit) => PlanItem(
-                Unit   = u.Id,
-                Source = SourceContext(
-                    SourceText   = "// source: " + u.Path,
-                    Dependencies = EmptyArray[DependencySnippet](),
-                ),
-                Target = TargetConventions(
-                    Language = "go",
-                    Notes    = EmptyArray[string](),
-                ),
-            )),
+func planFor(model WorkspaceModel) MigrationPlan =
+    MigrationPlan(Items = model.Packages.FlatMap((p Package) => planItemsForPackage(p)))
+
+// planItemsForPackage builds one PlanItem per unit, attaching the package's 1:1
+// source tests (computed once) so each unit carries its own verify-gate input.
+func planItemsForPackage(p Package) Array[PlanItem] {
+    val tests = sourceTestRefs(p)
+    return p.Units.Map((u Unit) => PlanItem(
+        Unit        = u.Id,
+        Source      = SourceContext(
+            SourceText   = "// source: " + u.Path,
+            Dependencies = EmptyArray[DependencySnippet](),
         ),
-    )
-    return MigrationPlan(Items = items)
+        Target      = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+        SourceTests = tests,
+    ))
 }
 
 func runFor(plan MigrationPlan) RunState =
     RunState(
         Units = plan.Items.Map((it PlanItem) => UnitRun(
-            Unit       = it.Unit,
-            Assignment = TaskAssignment(
+            Unit        = it.Unit,
+            Assignment  = TaskAssignment(
                 Task         = TaskId(Value = it.Unit.Value),
                 Unit         = it.Unit,
                 Source       = it.Source,
@@ -176,7 +185,8 @@ func runFor(plan MigrationPlan) RunState =
                 PriorFailure = None[PriorFailure](),
                 Answers      = EmptyArray[Answer](),
             ),
-            Status = Queued(),
+            Status      = Queued(),
+            SourceTests = it.SourceTests,
         )),
         Log = EmptyArray[EngineEvent](),
     )
@@ -204,16 +214,17 @@ func sameUnit(u UnitRun, id UnitId) bool = u.Unit.Value == id.Value
 
 // advance drives the first actionable unit one step forward, appending the events
 // that transition produced. A run with nothing actionable is a fixpoint.
-func advance(runner AgentRunner, state RunState) RunState =
+func advance(runner AgentRunner, verifier Verifier, state RunState) RunState =
     state.Units.Find((u UnitRun) => isActionable(u.Status)) match {
-        case Some(u) => replaceAndLog(state, u.Unit, advanceUnit(runner, u))
+        case Some(u) => replaceAndLog(state, u.Unit, advanceUnit(runner, verifier, u))
         case None()  => state
     }
 
-// advanceUnit moves ONE unit by one phase. The terminal step submits the unit's
+// advanceUnit moves ONE unit by one phase. The Verifying step submits the unit's
 // assignment to the runner, replays the transcript's progress steps as EvProgress
-// events, and maps the RunOutcome terminus to a UnitStatus.
-func advanceUnit(runner AgentRunner, u UnitRun) StepResult = u.Status match {
+// events, and runs the VERIFY GATE over the produced output before settling a
+// terminus (gateOutcome) — so the Verifying phase actually verifies.
+func advanceUnit(runner AgentRunner, verifier Verifier, u UnitRun) StepResult = u.Status match {
     case Queued() => StepResult(
         Unit   = u.Copy(Status = Translating()),
         Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Translating())),
@@ -222,32 +233,69 @@ func advanceUnit(runner AgentRunner, u UnitRun) StepResult = u.Status match {
         Unit   = u.Copy(Status = Verifying()),
         Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Verifying())),
     )
-    case Verifying()   => finishUnit(runner, u)
+    case Verifying()   => finishUnit(runner, verifier, u)
     case Done(_)       => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
     case Blocked(_)    => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
     case Skipped()     => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
     case Failed(_)     => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
 }
 
-func finishUnit(runner AgentRunner, u UnitRun) StepResult {
+func finishUnit(runner AgentRunner, verifier Verifier, u UnitRun) StepResult {
     val transcript = runner.Submit(u.Assignment)
     val progress = transcript.Steps.Map((step RunStep) => step match {
         case StepProgress(ev) => EvProgress(Unit = u.Unit, Event = ev)
     })
-    val status = outcomeToStatus(transcript.Final)
+    val status = gateOutcome(verifier, u, transcript.Final)
     return StepResult(
         Unit   = u.Copy(Status = status),
         Events = progress.Append(EvStatus(Unit = u.Unit, Status = status)),
     )
 }
 
-// outcomeToStatus maps the run's RunOutcome terminus onto our UnitStatus — the
-// one place a translation run's end becomes a unit's end.
-func outcomeToStatus(o RunOutcome) UnitStatus = o match {
-    case OutcomeResult(r)        => Done(Output = r)
+// gateOutcome maps a translation terminus onto a UnitStatus. The ONLY terminus
+// that must clear the verify gate is a produced Result: a translation reaches Done
+// only if the package's 1:1 source tests pass against it (verifyGate). A
+// clarification still Blocks and an abort still Fails — neither produced output to
+// verify.
+func gateOutcome(verifier Verifier, u UnitRun, o RunOutcome) UnitStatus = o match {
+    case OutcomeResult(r)        => verifyGate(verifier, u, r)
     case OutcomeClarification(c) => Blocked(Question = c)
     case OutcomeAborted(reason)  => Failed(Reason = reason)
 }
+
+// verifyGate runs the verifier over the unit's 1:1-replicated source tests (only;
+// AddedTest units were excluded when the plan was built) and turns the verdict
+// into a terminus. A pass admits the translation to Done. A fail, or a source test
+// that can't be faithfully verified, surfaces as Failed with a reason that NAMES
+// the problem — never a silent pass, never a silent drop.
+func verifyGate(verifier Verifier, u UnitRun, r Result) UnitStatus {
+    val verdict = verifier.Verify(VerifyRequest(
+        Unit        = u.Unit,
+        TargetText  = r.TargetText,
+        SourceTests = u.SourceTests,
+    ))
+    return verdict match {
+        case VerifyPass()             => Done(Output = r)
+        case VerifyFail(failing, why) => Failed(Reason = verifyFailReason(failing, why))
+        case VerifyUnsupported(why)   => Failed(Reason = "needs review: untranslatable source test: " + why)
+    }
+}
+
+// verifyFailReason names the failing source test(s) so the operator sees exactly
+// which 1:1 tests rejected the translation.
+func verifyFailReason(failing Array[UnitId], why string) string {
+    val names = joinComma(failing.Map((id UnitId) => id.Value))
+    return "verify failed: source test(s) [" + names + "] did not pass: " + why
+}
+
+func joinComma(xs Array[string]) string =
+    xs.FoldLeft[string](
+        "",
+        (acc string, s string) => (acc == "") match {
+            case true  => s
+            case false => acc + ", " + s
+        },
+    )
 
 // ----------------------------------------------------------------------------
 // act on unit / answer blocker
@@ -289,28 +337,29 @@ func retryAssignment(u UnitRun) TaskAssignment {
     }
 }
 
-func acceptUnit(u UnitRun) StepResult {
-    val status = u.Status match {
-        case Done(r)       => Done(Output = r)
-        case Queued()      => acceptedFresh(u)
-        case Translating() => acceptedFresh(u)
-        case Verifying()   => acceptedFresh(u)
-        case Blocked(_)    => acceptedFresh(u)
-        case Skipped()     => acceptedFresh(u)
-        case Failed(_)     => acceptedFresh(u)
-    }
-    return StepResult(
-        Unit   = u.Copy(Status = status),
-        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = status)),
-    )
+// acceptUnit applies an operator ACCEPT. Accept is meaningful ONLY on a Done unit
+// (the translation already cleared the verify gate), where it is idempotent. On
+// ANY non-Done status it is a NO-OP: the unit keeps its real status and no event
+// is logged.
+//
+// It must NEVER fabricate a Done with empty output. Accepting a Queued / Failed /
+// Blocked unit into a clean, empty-TargetText "Done" is a silent operator-accepted
+// empty success: it brushes aside the no-silent-drift invariant that the whole
+// verify gate exists to protect. There is no produced output to accept on a
+// non-Done unit, so accept does nothing.
+func acceptUnit(u UnitRun) StepResult = u.Status match {
+    case Done(_)       => noOp(u)
+    case Queued()      => noOp(u)
+    case Translating() => noOp(u)
+    case Verifying()   => noOp(u)
+    case Blocked(_)    => noOp(u)
+    case Skipped()     => noOp(u)
+    case Failed(_)     => noOp(u)
 }
 
-func acceptedFresh(u UnitRun) UnitStatus = Done(Output = Result(
-    Task       = u.Assignment.Task,
-    TargetText = "",
-    Rationale  = "accepted by operator",
-    Flags      = EmptyArray[UnsupportedFlag](),
-))
+// noOp leaves the unit and the log untouched — an operator action that has no
+// faithful effect on this status.
+func noOp(u UnitRun) StepResult = StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
 
 // answerBlocker resolves a clarification: it threads the Answer onto the unit's
 // assignment and re-queues it — the clarification-resolution loop, executed as a

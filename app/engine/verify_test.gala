@@ -1,0 +1,160 @@
+package engine
+
+// Tests for the M3 VERIFY GATE and the accept-on-non-Done fix.
+//
+// The gate's product rule (MVP §3.1 + §0 decision 11): a translation reaches Done
+// ONLY if the package's 1:1-replicated source tests (UnitKind SourceTest) pass
+// against it; AddedTest units never gate. These tests drive the gate's every
+// terminus THROUGH the run machinery (ScriptedVerifier), prove added tests are
+// excluded from the gate input, and prove accept no longer fabricates an empty
+// "Done". Shared helpers (scanned / firstUnitId) live in port_test.gala.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    strings "martianoff/gala/strings"
+)
+
+// echoVerifier reflects the request back as the verdict: it PASSES when the gate
+// handed it no source tests, and FAILS (naming them) when it did. It lets a test
+// observe EXACTLY which source tests the gate fed the verifier for each unit.
+func echoVerifier() Verifier =
+    Verifier(Verify = (req VerifyRequest) => (req.SourceTests.Length() == 0) match {
+        case true  => VerifyPass()
+        case false => VerifyFail(
+            Failing = req.SourceTests.Map((r SourceTestRef) => r.Unit),
+            Reason  = "echo",
+        )
+    })
+
+// ----------------------------------------------------------------------------
+// The gate's three termini, driven through the run machinery.
+// ----------------------------------------------------------------------------
+
+// Pass: a passing verifier admits every translated unit to Done (source-test-gated
+// Done). The stub workspace's 4 units all clear MockVerifier.
+func TestVerifyPassGatesToDone(t T) T {
+    val eng = MockEngineWithVerifier(MockTranslator(), MockVerifier())
+    val finished = RunToCompletion(eng, scanned(eng))
+    return Eq(t, CountByDone(finished), 4)
+}
+
+// Fail: a failing verifier blocks Done and the unit becomes Failed with a reason
+// that NAMES the failing source test(s) — no silent pass.
+func TestVerifyFailGatesToFailed(t T) T {
+    val eng = MockEngineWithVerifier(
+        MockTranslator(),
+        ScriptedVerifier(VerifyFail(
+            Failing = ArrayOf[UnitId](UnitId(Value = "core/value_test")),
+            Reason  = "assertion mismatch",
+        )),
+    )
+    val finished = RunToCompletion(eng, scanned(eng))
+    val t1 = Eq(t, CountByDone(finished), 0)
+    return finished.Units.Get(0).Status match {
+        case Failed(reason) => Eq(t1, strings.Contains(reason, "core/value_test"), true)
+        case _              => Fail(t1, "a verify fail must gate the unit to Failed")
+    }
+}
+
+// Unsupported: a source test that can't be faithfully verified surfaces as Failed
+// with a clear needs-review reason — never silently dropped or downgraded.
+func TestVerifyUnsupportedNeedsReview(t T) T {
+    val eng = MockEngineWithVerifier(
+        MockTranslator(),
+        ScriptedVerifier(VerifyUnsupported(Reason = "source test uses reflection")),
+    )
+    val finished = RunToCompletion(eng, scanned(eng))
+    return finished.Units.Get(0).Status match {
+        case Failed(reason) => Eq(t, strings.Contains(reason, "needs review: untranslatable source test"), true)
+        case _              => Fail(t, "an unverifiable source test must surface as Failed needs-review")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Added tests are excluded from the gate; source tests are included.
+// ----------------------------------------------------------------------------
+
+// The plan carries each unit's gate input: the core package (a SourceTest) yields
+// one source test; the app package (only an AddedTest) yields NONE.
+func TestAddedTestExcludedFromPlanGate(t T) T {
+    val eng  = MockEngine()
+    val plan = eng.Plan(eng.Scan(ScanRequest(Root = ".")))
+    val t1 = plan.Items.Find((it PlanItem) => it.Unit.Value == "core/value") match {
+        case Some(it) => {
+            val a = Eq(t, it.SourceTests.Length(), 1)
+            return Eq(a, it.SourceTests.Get(0).Unit.Value, "core/value_test")
+        }
+        case None() => Fail(t, "expected a plan item for core/value")
+    }
+    return plan.Items.Find((it PlanItem) => it.Unit.Value == "app/main") match {
+        case Some(it) => Eq(t1, it.SourceTests.Length(), 0) // AddedTest app/main_test excluded
+        case None()   => Fail(t1, "expected a plan item for app/main")
+    }
+}
+
+// The gate feeds the verifier the package's SourceTests at run time: core units are
+// failed by echoVerifier (it received core/value_test); app units pass (the gate
+// fed it nothing, because the package's only test is an AddedTest).
+func TestGateFeedsPackageSourceTests(t T) T {
+    val eng = MockEngineWithVerifier(MockTranslator(), echoVerifier())
+    val finished = RunToCompletion(eng, scanned(eng))
+    val t1 = finished.Units.Find((u UnitRun) => u.Unit.Value == "core/value") match {
+        case Some(u) => u.Status match {
+            case Failed(reason) => Eq(t, strings.Contains(reason, "core/value_test"), true)
+            case _              => Fail(t, "core/value must be gated by its 1:1 source test")
+        }
+        case None() => Fail(t, "core/value must exist")
+    }
+    return finished.Units.Find((u UnitRun) => u.Unit.Value == "app/main") match {
+        case Some(u) => u.Status match {
+            case Done(_) => IsTrue(t1, true) // no SourceTest fed -> AddedTest excluded -> passes
+            case _       => Fail(t1, "app/main has no source test (AddedTest excluded) -> should pass")
+        }
+        case None() => Fail(t1, "app/main must exist")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// accept-on-non-Done: no fabricated empty "Done".
+// ----------------------------------------------------------------------------
+
+// Accepting a still-Queued unit is a no-op — it stays Queued, NOT a clean empty Done.
+func TestAcceptOnQueuedIsNoOp(t T) T {
+    val eng = MockEngine()
+    val s0  = scanned(eng)
+    val id  = firstUnitId(s0)
+    val s   = eng.ActOnUnit(s0, id, ActAccept())
+    return s.Units.Get(0).Status match {
+        case Queued() => IsTrue(t, true)
+        case Done(_)  => Fail(t, "accept on a non-Done unit must NOT fabricate a Done")
+        case _        => Fail(t, "accept on a Queued unit is a no-op -> stays Queued")
+    }
+}
+
+// Accepting a Failed unit leaves it Failed (reason intact) — not an empty Done that
+// silently launders a failure into success.
+func TestAcceptOnFailedIsNoOp(t T) T {
+    val eng    = MockEngineWith(ScriptedRunner(OutcomeAborted(Reason = "boom"), Cancelled()))
+    val failed = RunToCompletion(eng, scanned(eng))
+    val id     = firstUnitId(failed)
+    val s      = eng.ActOnUnit(failed, id, ActAccept())
+    return s.Units.Get(0).Status match {
+        case Failed(reason) => Eq(t, reason, "boom")
+        case Done(_)        => Fail(t, "accept on a Failed unit must NOT fabricate an empty Done")
+        case _              => Fail(t, "accept on a Failed unit is a no-op -> stays Failed")
+    }
+}
+
+// Accepting a Done unit keeps it Done (accept is idempotent on the gated terminus).
+func TestAcceptOnDoneStaysDone(t T) T {
+    val eng      = MockEngine()
+    val finished = RunToCompletion(eng, scanned(eng))
+    val id       = firstUnitId(finished)
+    val s        = eng.ActOnUnit(finished, id, ActAccept())
+    return s.Units.Get(0).Status match {
+        case Done(_) => IsTrue(t, true)
+        case _       => Fail(t, "accepting a Done unit keeps it Done")
+    }
+}
