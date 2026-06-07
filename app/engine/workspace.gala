@@ -3,10 +3,10 @@ package engine
 // The language/workspace model — the engine's structural view of the project
 // being migrated, independent of any source or target language.
 //
-// STUB slice: the shapes (WorkspaceModel / Package / Unit + dependency edges) are
-// real and exercised by tests, but discovery is a fixed fixture. Real
-// `go/parser`-based scanning is the next slice and plugs in behind
-// `ScanGoWorkspaceStub` without changing these types.
+// These shapes (WorkspaceModel / Package / Unit + dependency edges) are produced
+// two ways behind the same types: `ScanGoWorkspaceStub` returns a fixed fixture
+// (kept for the offline UI tests), and `ScanGoWorkspace` (goscan.gala) discovers a
+// real Go project from disk. Neither path leaks engine internals to the UI.
 
 import (
     . "martianoff/gala/collection_immutable"
@@ -39,11 +39,14 @@ sealed type UnitKind {
 }
 
 // Unit is one per-file translation unit: a stable id, its source-relative path,
-// and what kind of unit it is.
+// what kind of unit it is, and the unit's real source text. Source is "" for the
+// fixture stub (it carries no real file content); the real `ScanGoWorkspace`
+// frontend populates it from disk so it can flow into the plan.
 struct Unit(
-    Id   UnitId,
-    Path string,
-    Kind UnitKind,
+    Id     UnitId,
+    Path   string,
+    Kind   UnitKind,
+    Source string,
 )
 
 // DepEdge is a directed dependency between two nodes, keyed by their id Value
@@ -111,8 +114,8 @@ func ScanGoWorkspaceStub() WorkspaceModel {
         Id         = PackageId(Value = "core"),
         ModulePath = "example.com/proj/core",
         Units      = ArrayOf[Unit](
-            Unit(Id = UnitId(Value = "core/value"),      Path = "core/value.go",      Kind = SourceUnit()),
-            Unit(Id = UnitId(Value = "core/value_test"), Path = "core/value_test.go", Kind = SourceTest()),
+            Unit(Id = UnitId(Value = "core/value"),      Path = "core/value.go",      Kind = SourceUnit(), Source = ""),
+            Unit(Id = UnitId(Value = "core/value_test"), Path = "core/value_test.go", Kind = SourceTest(), Source = ""),
         ),
         Edges = ArrayOf[DepEdge](
             DepEdge(From = "core/value_test", To = "core/value"),
@@ -122,8 +125,8 @@ func ScanGoWorkspaceStub() WorkspaceModel {
         Id         = PackageId(Value = "app"),
         ModulePath = "example.com/proj/app",
         Units      = ArrayOf[Unit](
-            Unit(Id = UnitId(Value = "app/main"),      Path = "app/main.go",      Kind = SourceUnit()),
-            Unit(Id = UnitId(Value = "app/main_test"), Path = "app/main_test.go", Kind = AddedTest()),
+            Unit(Id = UnitId(Value = "app/main"),      Path = "app/main.go",      Kind = SourceUnit(), Source = ""),
+            Unit(Id = UnitId(Value = "app/main_test"), Path = "app/main_test.go", Kind = AddedTest(), Source = ""),
         ),
         Edges = EmptyArray[DepEdge](),
     )

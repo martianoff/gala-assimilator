@@ -1,0 +1,262 @@
+package engine
+
+// ScanGoWorkspace — the engine's first REAL language frontend. It performs
+// filesystem IO to read an actual Go project and produces the same transport-
+// neutral WorkspaceModel the stub does (workspace.gala), so everything downstream
+// (plan / run) is unchanged.
+//
+// What it extracts from disk:
+//   - Packages: every directory that contains `.go` files. The package import
+//     path honors the root `go.mod` module path where present; the PackageId is
+//     the short, repo-relative directory ("." for the module root).
+//   - Units: each `.go` file. `*_test.go` is classified SourceTest (a test
+//     replicated 1:1 from source — counts toward parity); everything else is a
+//     SourceUnit. Each Unit carries its REAL file content in `Source`.
+//   - Intra-package edges: each test unit depends on its package's non-test units.
+//   - Cross-package edges (CrossEdges): parsed from each file's `import`
+//     statements, matched to discovered packages by module path.
+//
+// GALA file-IO limitation (reported): GALA's std `fs` exposes `ReadDir` (one
+// directory level) but no recursive `Walk`, so the directory walk is hand-rolled
+// here (walkGoFiles). Likewise `go/parser` is not available from GALA, so imports
+// are recovered with a small line-based scan of the `import` section rather than a
+// real AST. Both are faithful for ordinary Go layout; neither fakes data.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// ----------------------------------------------------------------------------
+// Entry point
+// ----------------------------------------------------------------------------
+
+// ScanGoWorkspace reads the Go project rooted at `root` and returns its
+// WorkspaceModel. Missing / unreadable paths degrade to an empty model rather
+// than crashing the engine — the same "surface, don't fake" discipline.
+func ScanGoWorkspace(root string) WorkspaceModel {
+    val module     = readModulePath(root)
+    val files      = walkGoFiles(root, "")
+    val dirs       = files.Map((f goFile) => f.Rel).Distinct()
+    val packages   = dirs.Map((d string) => buildPackage(module, d, files))
+    val crossEdges = buildCrossEdges(packages, files, module)
+    return NewWorkspaceModel(packages, crossEdges)
+}
+
+// goFile is a discovered `.go` file: its package-directory (slash-relative to the
+// root, "" for the root), its file name, and its real content.
+struct goFile(
+    Rel     string,
+    Name    string,
+    Content string,
+)
+
+// ----------------------------------------------------------------------------
+// Directory walk (hand-rolled — fs has no recursive Walk)
+// ----------------------------------------------------------------------------
+
+// walkGoFiles recurses `dir` (a real path) tracking `rel` (the slash path from the
+// root) and returns every `.go` file under it, content included.
+func walkGoFiles(dir string, rel string) Array[goFile] {
+    val entries = fs.ReadDir(dir).GetOrElse(EmptyArray[fs.FileInfo]())
+    return entries.FlatMap((fi fs.FileInfo) => entryFiles(dir, rel, fi))
+}
+
+func entryFiles(dir string, rel string, fi fs.FileInfo) Array[goFile] = fi.IsDir match {
+    case true  => skipDir(fi.Name) match {
+        case true  => EmptyArray[goFile]()
+        case false => walkGoFiles(path.Join(dir, fi.Name), childRel(rel, fi.Name))
+    }
+    case false => strings.HasSuffix(fi.Name, ".go") match {
+        case true  => ArrayOf[goFile](readGoFile(dir, rel, fi.Name))
+        case false => EmptyArray[goFile]()
+    }
+}
+
+// skipDir prunes directories that never hold first-class project source: hidden
+// dirs (.git, .gala_team, …) and vendored copies.
+func skipDir(name string) bool = strings.HasPrefix(name, ".") || name == "vendor"
+
+func readGoFile(dir string, rel string, name string) goFile =
+    goFile(
+        Rel     = rel,
+        Name    = name,
+        Content = fs.ReadFileString(path.Join(dir, name)).GetOrElse(""),
+    )
+
+// childRel appends one path segment to a slash-relative path.
+func childRel(rel string, name string) string {
+    if rel == "" { return name }
+    return rel + "/" + name
+}
+
+// ----------------------------------------------------------------------------
+// go.mod module path
+// ----------------------------------------------------------------------------
+
+func readModulePath(root string) string =
+    moduleFromGoMod(fs.ReadFileString(path.Join(root, "go.mod")).GetOrElse(""))
+
+// moduleFromGoMod returns the first `module <path>` declaration, or "" when there
+// is no go.mod (packages then key off their relative directory).
+func moduleFromGoMod(content string) string =
+    strings.Split(content, "\n").FoldLeft[string](
+        "",
+        (acc string, raw string) => moduleLine(acc, strings.TrimSpace(raw)),
+    )
+
+func moduleLine(acc string, line string) string {
+    if acc != "" { return acc }
+    if strings.HasPrefix(line, "module ") {
+        return strings.TrimSpace(strings.TrimPrefix(line, "module "))
+    }
+    return acc
+}
+
+// ----------------------------------------------------------------------------
+// Package assembly
+// ----------------------------------------------------------------------------
+
+func buildPackage(module string, rel string, files Array[goFile]) Package {
+    val pkgFiles = files.Filter((f goFile) => f.Rel == rel)
+    val units    = pkgFiles.Map((f goFile) => fileToUnit(rel, f))
+    return Package(
+        Id         = PackageId(Value = pkgShortId(rel)),
+        ModulePath = pkgImportPath(module, rel),
+        Units      = units,
+        Edges      = intraEdges(units),
+    )
+}
+
+func fileToUnit(rel string, f goFile) Unit {
+    val relPath = childRel(rel, f.Name)
+    return Unit(
+        Id     = UnitId(Value = strings.TrimSuffix(relPath, ".go")),
+        Path   = relPath,
+        Kind   = classify(f.Name),
+        Source = f.Content,
+    )
+}
+
+func classify(name string) UnitKind {
+    if strings.HasSuffix(name, "_test.go") { return SourceTest() }
+    return SourceUnit()
+}
+
+// pkgShortId is the workspace-local package id: "." for the module root, else the
+// slash-relative directory.
+func pkgShortId(rel string) string {
+    if rel == "" { return "." }
+    return rel
+}
+
+// pkgImportPath is the import path other packages reference this one by: the
+// module path joined with the relative directory (or the bare relative directory
+// when the project has no go.mod).
+func pkgImportPath(module string, rel string) string {
+    if module == "" { return pkgShortId(rel) }
+    if rel == ""     { return module }
+    return module + "/" + rel
+}
+
+// intraEdges links each test unit to every non-test unit in the same package — a
+// test depends on the source it covers.
+func intraEdges(units Array[Unit]) Array[DepEdge] {
+    val sources = units.Filter((u Unit) => isNonTest(u.Kind))
+    val tests   = units.Filter((u Unit) => isTest(u.Kind))
+    return tests.FlatMap((tu Unit) =>
+        sources.Map((su Unit) => DepEdge(From = tu.Id.Value, To = su.Id.Value)))
+}
+
+func isNonTest(k UnitKind) bool = k match {
+    case SourceUnit() => true
+    case SourceTest() => false
+    case AddedTest()  => false
+}
+
+func isTest(k UnitKind) bool = k match {
+    case SourceUnit() => false
+    case SourceTest() => true
+    case AddedTest()  => true
+}
+
+// ----------------------------------------------------------------------------
+// Cross-package edges (import scan)
+// ----------------------------------------------------------------------------
+
+func buildCrossEdges(packages Array[Package], files Array[goFile], module string) Array[DepEdge] {
+    val byImport = packages.FoldLeft[HashMap[string, string]](
+        EmptyHashMap[string, string](),
+        (acc HashMap[string, string], p Package) => acc.Put(p.ModulePath, p.Id.Value),
+    )
+    val edges = files.FlatMap((f goFile) => fileCrossEdges(f, byImport))
+    return dedupEdges(edges)
+}
+
+func fileCrossEdges(f goFile, byImport HashMap[string, string]) Array[DepEdge] {
+    val fromId = pkgShortId(f.Rel)
+    return parseImports(f.Content).FlatMap((imp string) => byImport.Get(imp) match {
+        case Some(toId) => (toId == fromId) match {
+            case true  => EmptyArray[DepEdge]()
+            case false => ArrayOf[DepEdge](DepEdge(From = fromId, To = toId))
+        }
+        case None() => EmptyArray[DepEdge]()
+    })
+}
+
+func dedupEdges(edges Array[DepEdge]) Array[DepEdge] =
+    edges.FoldLeft[Array[DepEdge]](
+        EmptyArray[DepEdge](),
+        (acc Array[DepEdge], e DepEdge) =>
+            acc.Exists((x DepEdge) => x.From == e.From && x.To == e.To) match {
+                case true  => acc
+                case false => acc.Append(e)
+            },
+    )
+
+// ----------------------------------------------------------------------------
+// Import scanner (line-based — go/parser is not reachable from GALA)
+// ----------------------------------------------------------------------------
+
+// importScan is the fold state while walking a file's lines: whether we are inside
+// an `import ( … )` block, and the import paths collected so far.
+struct importScan(
+    InBlock bool,
+    Imports Array[string],
+)
+
+// parseImports recovers the imported paths from Go source. It only reads the
+// `import` section (a single `import "x"` line or an `import ( … )` block), so a
+// quoted string elsewhere in the file is never mistaken for an import.
+func parseImports(content string) Array[string] {
+    val end = strings.Split(content, "\n").FoldLeft[importScan](
+        importScan(InBlock = false, Imports = EmptyArray[string]()),
+        (st importScan, raw string) => stepImport(st, strings.TrimSpace(raw)),
+    )
+    return end.Imports.Distinct()
+}
+
+func stepImport(st importScan, line string) importScan = st.InBlock match {
+    case true  => (line == ")") match {
+        case true  => st.Copy(InBlock = false)
+        case false => appendQuoted(st, line)
+    }
+    case false => strings.HasPrefix(line, "import") match {
+        case true  => strings.Contains(line, "(") match {
+            case true  => st.Copy(InBlock = true)
+            case false => appendQuoted(st, line)
+        }
+        case false => st
+    }
+}
+
+// appendQuoted pulls the path out of a quoted import line. Splitting on the quote
+// yields [prefix, path, …] for `"path"`, `_ "path"`, and `alias "path"` alike.
+func appendQuoted(st importScan, line string) importScan {
+    val parts = strings.Split(line, "\"")
+    if parts.Length() < 2 { return st }
+    return st.Copy(Imports = st.Imports.Append(parts.Get(1)))
+}
