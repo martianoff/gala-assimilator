@@ -1,0 +1,76 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+    . "martianoff/gala/collection_immutable"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// S4 — unit/diff review. Snapshots for a Done unit (diff + rationale + verify)
+// at two widths, plus reducer tests for the accept/skip actions through the port.
+// ============================================================================
+
+// onS4Done drives a real Mock run until the first unit (core/value) is Done,
+// then opens it → S4.
+func onS4Done(cols int, rows int) Model {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/workdir/myproject"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val setup = ArrayOf[Msg](MScanPlanned(Workspace = ws, Plan = plan), MRunStarted(State = st))
+    val msgs = setup.AppendAll(ticks(3)).Append(MOpenUnit())
+    val (m1, _) = StepAll(NewProgram(port, cols, rows), msgs)
+    return m1
+}
+
+func skippedCount(m Model) int = m.Run match {
+    case Some(rs) => runview.ProjectRun(rs).Counts.Skipped
+    case None()   => 0
+}
+
+func TestS4WideRendersDiffRationaleVerify(t T) T {
+    val m = onS4Done(100, 20)
+    val t0 = Eq(t, m.Screens.Current(), RouteS4())
+    val out = str.S(Snapshot(view(m), 100, 20))
+    val t1 = IsTrue(t0, out.Contains("Review — core/value"))
+    val t2 = IsTrue(t1, out.Contains("Source"))
+    val t3 = IsTrue(t2, out.Contains("Target"))
+    val t4 = IsTrue(t3, out.Contains("// source: core/value.go"))   // source side
+    val t5 = IsTrue(t4, out.Contains("// mock translation"))        // emitted target
+    val t6 = IsTrue(t5, out.Contains("deterministic mock output"))  // rationale
+    val t7 = IsTrue(t6, out.Contains("Verify"))
+    val t8 = IsTrue(t7, out.Contains("done"))
+    return IsTrue(t8, out.Contains("a accept"))                     // action bar
+}
+
+func TestS4NarrowRendersStacked(t T) T {
+    val m = onS4Done(70, 22)
+    val out = str.S(Snapshot(view(m), 70, 22))
+    val t1 = IsTrue(t, out.Contains("Review — core/value"))
+    val t2 = IsTrue(t1, out.Contains("Source"))
+    val t3 = IsTrue(t2, out.Contains("Target"))
+    val t4 = IsTrue(t3, out.Contains("// mock translation"))
+    return IsTrue(t4, out.Contains("done"))
+}
+
+// Accept (key 'a') runs through ActOnUnit and returns to S3; the unit stays Done.
+func TestS4AcceptReturnsToS3(t T) T {
+    val m0 = onS4Done(100, 20)
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MReviewAccept()))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS3())
+    return IsTrue(t1, doneOf(m1) >= 1)
+}
+
+// Skip (key 's') on a not-yet-done unit marks it Skipped via the port.
+func TestS4SkipMarksSkipped(t T) T {
+    val m0 = onS4Done(100, 20)
+    // back to S3, move cursor to a queued unit, open it, skip it.
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](
+        MBack(), MSelectUnit(Idx = 2), MOpenUnit(), MReviewSkip()))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS3())
+    return IsTrue(t1, skippedCount(m1) >= 1)
+}

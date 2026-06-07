@@ -3,6 +3,7 @@ package runview
 import (
     . "github.com/martianoff/gala-assimilator/app/engine"
     . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
     str "martianoff/gala/strings"
 )
 
@@ -182,3 +183,83 @@ func logLine(e EngineEvent) string = e match {
 
 // pkgOf is the package prefix of a unit id ("core/value" → "core").
 func pkgOf(id string) string = str.S(id).Split("/").Get(0).ToString()
+
+// ============================================================================
+// S4 / S5 — per-unit detail projection (review diff + blocker clarification)
+// ============================================================================
+
+// UnitDetailVM is the focused unit projected for S4 (review) and S5 (blocker).
+struct UnitDetailVM(
+    Id          string,
+    Status      string,
+    SourceLines Array[string],   // source unit text, split into lines
+    TargetLines Array[string],   // emitted target text (empty until Done)
+    Rationale   string,
+    Flags       Array[string],   // "Construct — Reason"
+    HasResult   bool,            // true when the unit reached Done (has output)
+    Blocked     bool,            // true when awaiting a clarification answer
+    Question    string,          // the clarification question (when Blocked)
+)
+
+func lines(s string) Array[string] = str.S(s).Lines().Map((ln Str) => ln.ToString())
+
+// projectUnit turns one UnitRun into its review/blocker detail.
+func projectUnit(u UnitRun) UnitDetailVM {
+    val src = lines(u.Assignment.Source.SourceText)
+    return u.Status match {
+        case Done(r) => UnitDetailVM(
+            Id = u.Unit.Value, Status = "done",
+            SourceLines = src, TargetLines = lines(r.TargetText),
+            Rationale = r.Rationale, Flags = flagLines(r.Flags),
+            HasResult = true, Blocked = false, Question = "",
+        )
+        case Blocked(c) => UnitDetailVM(
+            Id = u.Unit.Value, Status = "blocked",
+            SourceLines = src, TargetLines = EmptyArray[string](),
+            Rationale = "", Flags = EmptyArray[string](),
+            HasResult = false, Blocked = true, Question = c.Question,
+        )
+        case Failed(reason) => detailNoOutput(u, src, "failed: " + reason)
+        case Queued()      => detailNoOutput(u, src, "queued")
+        case Translating() => detailNoOutput(u, src, "translating")
+        case Verifying()   => detailNoOutput(u, src, "verifying")
+        case Skipped()     => detailNoOutput(u, src, "skipped")
+    }
+}
+
+func detailNoOutput(u UnitRun, src Array[string], status string) UnitDetailVM =
+    UnitDetailVM(
+        Id = u.Unit.Value, Status = status,
+        SourceLines = src, TargetLines = EmptyArray[string](),
+        Rationale = "", Flags = EmptyArray[string](),
+        HasResult = false, Blocked = false, Question = "",
+    )
+
+func flagLines(flags Array[UnsupportedFlag]) Array[string] =
+    flags.Map((f UnsupportedFlag) => f.Construct + " — " + f.Reason)
+
+// UnitAt projects the unit at index idx, or None if out of range.
+func UnitAt(rs RunState, idx int) Option[UnitDetailVM] {
+    if (idx < 0 || idx >= rs.Units.Length()) { return None[UnitDetailVM]() }
+    return Some(projectUnit(rs.Units.Get(idx)))
+}
+
+// IsBlockedAt reports whether the unit at idx is awaiting a clarification.
+func IsBlockedAt(rs RunState, idx int) bool {
+    if (idx < 0 || idx >= rs.Units.Length()) { return false }
+    return isBlocked(rs.Units.Get(idx).Status)
+}
+
+// FirstBlocked is the index of the first blocked unit, if any.
+func FirstBlocked(rs RunState) Option[int] {
+    var i = 0
+    val n = rs.Units.Length()
+    for i < n {
+        if (isBlocked(rs.Units.Get(i).Status)) { return Some(i) }
+        i = i + 1
+    }
+    return None[int]()
+}
+
+// BlockedCount is how many units await a clarification answer.
+func BlockedCount(rs RunState) int = countWhere(rs, isBlocked)

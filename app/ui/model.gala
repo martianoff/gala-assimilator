@@ -22,6 +22,8 @@ import (
 func RouteS1() string = "S1"   // Setup / Interview
 func RouteS2() string = "S2"   // Plan summary
 func RouteS3() string = "S3"   // Assimilation dashboard
+func RouteS4() string = "S4"   // Unit / diff review
+func RouteS5() string = "S5"   // Blocker / clarification
 
 // S1 focus pane ids — order defines the Tab ring.
 func PaneBrowse() string      = "browse"
@@ -81,6 +83,8 @@ struct Model(
     S3Focus    string,
     TreeCursor int,
     LogScroll  int,   // lines scrolled up from the tail (0 = following latest)
+    // S5 clarification answer buffer (the unit under review/answer is TreeCursor)
+    AnswerText string,
 )
 
 // browseDirs is the small set of sample project paths the Browse control cycles.
@@ -115,6 +119,7 @@ func NewModel(port engine.EnginePort, cols int, rows int) Model {
         S3Focus    = PaneTree(),
         TreeCursor = 0,
         LogScroll  = 0,
+        AnswerText = "",
     )
 }
 
