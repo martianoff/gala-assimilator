@@ -1,0 +1,372 @@
+package engine
+
+// The engine's PUBLIC PORT — the only surface the UI is allowed to call. Like
+// the AgentRunner, it is a struct of function values (a GALA-idiomatic port): the
+// UI holds an EnginePort value, never reaches into engine internals, and a future
+// real engine swaps in behind the same struct.
+//
+// Operations (the brief's surface): scan -> plan -> run, stream events (Advance +
+// Events), act on a unit (retry / skip / accept), answer a blocker, and
+// checkpoint / resume. Everything is PURE DATA: no gala_tui, no app/ui, no IO.
+// The UI wraps Advance/Events ticks in its own Cmd[T]; the engine never blocks.
+//
+// MockEngine is the deterministic offline implementation: a few units march
+// Queued -> Translating -> Verifying -> Done, streaming progress events sourced
+// from a real RunTranscript and terminating via the run's RunOutcome. It exists
+// so the UI can integrate against something real before the production engine.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ----------------------------------------------------------------------------
+// Port-facing value types
+// ----------------------------------------------------------------------------
+
+// ScanRequest is the input to a scan: the project root to discover units under.
+struct ScanRequest(Root string)
+
+// PlanItem is one unit scheduled for migration, with the curated source context
+// and target conventions the translator will receive.
+struct PlanItem(
+    Unit   UnitId,
+    Source SourceContext,
+    Target TargetConventions,
+)
+
+// MigrationPlan is the ordered set of units to migrate.
+struct MigrationPlan(Items Array[PlanItem])
+
+// UnitStatus is where a unit sits in its lifecycle. The happy path is
+// Queued -> Translating -> Verifying -> Done; Blocked (awaiting a clarification
+// answer), Skipped, and Failed are the off-ramps. Done/Blocked/Failed carry the
+// payload the UI needs to render the terminus.
+sealed type UnitStatus {
+    case Queued()
+    case Translating()
+    case Verifying()
+    case Done(Output Result)
+    case Blocked(Question Clarification)
+    case Skipped()
+    case Failed(Reason string)
+}
+
+// UnitRun is the engine's per-unit state: the unit id, the assignment prepared
+// for it (which carries the re-submission Answers / PriorFailure), and its
+// current status.
+struct UnitRun(
+    Unit       UnitId,
+    Assignment TaskAssignment,
+    Status     UnitStatus,
+)
+
+// EngineEvent is one thing the run streams to the UI: a progress note (sourced
+// from the run transcript) or a status transition. Sealed so the UI handles every
+// kind it can render.
+sealed type EngineEvent {
+    case EvProgress(Unit UnitId, Event ProgressEvent)
+    case EvStatus(Unit UnitId, Status UnitStatus)
+}
+
+// RunState is the whole live run as pure data: per-unit state plus the ordered
+// event log (the stream-as-data the UI replays). No handles, no channels.
+struct RunState(
+    Units Array[UnitRun],
+    Log   Array[EngineEvent],
+)
+
+// UnitAction is an operator decision on a single unit. (Cases are `Act*`-prefixed
+// so they don't collide with VerdictOutcome.Accept in this one package.)
+sealed type UnitAction {
+    case ActRetry()  // re-queue (threading a PriorFailure if it had failed)
+    case ActSkip()   // abandon this unit
+    case ActAccept() // accept the current output as final
+}
+
+// Checkpoint is the persistable snapshot of a run — pure data that round-trips
+// through Resume with no loss. It is exactly the run's units and event log; no
+// live state to reconstruct.
+struct Checkpoint(
+    Units Array[UnitRun],
+    Log   Array[EngineEvent],
+)
+
+// StepResult is an internal helper: a unit's next state plus the events that
+// transition produced. (A struct, not a tuple — GALA tuples want explicit type
+// params and mis-emit for 3-arity; a named struct is clearer here.)
+struct StepResult(
+    Unit   UnitRun,
+    Events Array[EngineEvent],
+)
+
+// ----------------------------------------------------------------------------
+// The port
+// ----------------------------------------------------------------------------
+
+// EnginePort is the engine's whole public surface. The UI depends only on this.
+struct EnginePort(
+    Scan          func(ScanRequest) WorkspaceModel,
+    Plan          func(WorkspaceModel) MigrationPlan,
+    Run           func(MigrationPlan) RunState,
+    Advance       func(RunState) RunState,
+    Events        func(RunState) Array[EngineEvent],
+    ActOnUnit     func(RunState, UnitId, UnitAction) RunState,
+    AnswerBlocker func(RunState, UnitId, Answer) RunState,
+    Checkpoint    func(RunState) Checkpoint,
+    Resume        func(Checkpoint) RunState,
+)
+
+// ----------------------------------------------------------------------------
+// MockEngine — the deterministic offline implementation
+// ----------------------------------------------------------------------------
+
+// MockEngine is the default offline engine, driven by the MockTranslator.
+func MockEngine() EnginePort = MockEngineWith(MockTranslator())
+
+// MockEngineWith builds the engine over a caller-supplied translator runner, so
+// tests can inject a ScriptedRunner that yields a Clarification or an Abort and
+// drive a unit to Blocked / Failed — every terminus exercised THROUGH the real
+// run machinery, not hand-built.
+func MockEngineWith(runner AgentRunner) EnginePort = EnginePort(
+    Scan          = (_ ScanRequest) => ScanGoWorkspaceStub(),
+    Plan          = (m WorkspaceModel) => planFor(m),
+    Run           = (p MigrationPlan) => runFor(p),
+    Advance       = (s RunState) => advance(runner, s),
+    Events        = (s RunState) => s.Log,
+    ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
+    AnswerBlocker = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
+    Checkpoint    = (s RunState) => Checkpoint(Units = s.Units, Log = s.Log),
+    Resume        = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
+)
+
+// ----------------------------------------------------------------------------
+// scan / plan / run
+// ----------------------------------------------------------------------------
+
+func planFor(model WorkspaceModel) MigrationPlan {
+    val items = model.Packages.FoldLeft[Array[PlanItem]](
+        EmptyArray[PlanItem](),
+        (acc Array[PlanItem], p Package) => acc.AppendAll(
+            p.Units.Map((u Unit) => PlanItem(
+                Unit   = u.Id,
+                Source = SourceContext(
+                    SourceText   = "// source: " + u.Path,
+                    Dependencies = EmptyArray[DependencySnippet](),
+                ),
+                Target = TargetConventions(
+                    Language = "go",
+                    Notes    = EmptyArray[string](),
+                ),
+            )),
+        ),
+    )
+    return MigrationPlan(Items = items)
+}
+
+func runFor(plan MigrationPlan) RunState =
+    RunState(
+        Units = plan.Items.Map((it PlanItem) => UnitRun(
+            Unit       = it.Unit,
+            Assignment = TaskAssignment(
+                Task         = TaskId(Value = it.Unit.Value),
+                Unit         = it.Unit,
+                Source       = it.Source,
+                Target       = it.Target,
+                PriorFailure = None[PriorFailure](),
+                Answers      = EmptyArray[Answer](),
+            ),
+            Status = Queued(),
+        )),
+        Log = EmptyArray[EngineEvent](),
+    )
+
+// ----------------------------------------------------------------------------
+// Advance — one tick of the assimilation
+// ----------------------------------------------------------------------------
+
+// isActionable is true for the transient phases the engine can still drive.
+func isActionable(s UnitStatus) bool = s match {
+    case Queued()      => true
+    case Translating() => true
+    case Verifying()   => true
+    case Done(_)       => false
+    case Blocked(_)    => false
+    case Skipped()     => false
+    case Failed(_)     => false
+}
+
+// hasActionable reports whether any unit is still drivable.
+func hasActionable(s RunState) bool =
+    s.Units.Exists((u UnitRun) => isActionable(u.Status))
+
+func sameUnit(u UnitRun, id UnitId) bool = u.Unit.Value == id.Value
+
+// advance drives the first actionable unit one step forward, appending the events
+// that transition produced. A run with nothing actionable is a fixpoint.
+func advance(runner AgentRunner, state RunState) RunState =
+    state.Units.Find((u UnitRun) => isActionable(u.Status)) match {
+        case Some(u) => replaceAndLog(state, u.Unit, advanceUnit(runner, u))
+        case None()  => state
+    }
+
+// advanceUnit moves ONE unit by one phase. The terminal step submits the unit's
+// assignment to the runner, replays the transcript's progress steps as EvProgress
+// events, and maps the RunOutcome terminus to a UnitStatus.
+func advanceUnit(runner AgentRunner, u UnitRun) StepResult = u.Status match {
+    case Queued() => StepResult(
+        Unit   = u.Copy(Status = Translating()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Translating())),
+    )
+    case Translating() => StepResult(
+        Unit   = u.Copy(Status = Verifying()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Verifying())),
+    )
+    case Verifying()   => finishUnit(runner, u)
+    case Done(_)       => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+    case Blocked(_)    => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+    case Skipped()     => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+    case Failed(_)     => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+}
+
+func finishUnit(runner AgentRunner, u UnitRun) StepResult {
+    val transcript = runner.Submit(u.Assignment)
+    val progress = transcript.Steps.Map((step RunStep) => step match {
+        case StepProgress(ev) => EvProgress(Unit = u.Unit, Event = ev)
+    })
+    val status = outcomeToStatus(transcript.Final)
+    return StepResult(
+        Unit   = u.Copy(Status = status),
+        Events = progress.Append(EvStatus(Unit = u.Unit, Status = status)),
+    )
+}
+
+// outcomeToStatus maps the run's RunOutcome terminus onto our UnitStatus — the
+// one place a translation run's end becomes a unit's end.
+func outcomeToStatus(o RunOutcome) UnitStatus = o match {
+    case OutcomeResult(r)        => Done(Output = r)
+    case OutcomeClarification(c) => Blocked(Question = c)
+    case OutcomeAborted(reason)  => Failed(Reason = reason)
+}
+
+// ----------------------------------------------------------------------------
+// act on unit / answer blocker
+// ----------------------------------------------------------------------------
+
+func actOnUnit(state RunState, id UnitId, action UnitAction) RunState =
+    state.Units.Find((u UnitRun) => sameUnit(u, id)) match {
+        case Some(u) => replaceAndLog(state, id, applyAction(u, action))
+        case None()  => state
+    }
+
+func applyAction(u UnitRun, action UnitAction) StepResult = action match {
+    case ActRetry() => StepResult(
+        Unit   = u.Copy(Assignment = retryAssignment(u), Status = Queued()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Queued())),
+    )
+    case ActSkip() => StepResult(
+        Unit   = u.Copy(Status = Skipped()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Skipped())),
+    )
+    case ActAccept() => acceptUnit(u)
+}
+
+// retryAssignment threads a PriorFailure onto the assignment when the unit had
+// FAILED, mirroring the clarification loop's Answers threading — same stateless
+// re-submission shape.
+func retryAssignment(u UnitRun) TaskAssignment {
+    val asn = u.Assignment
+    return u.Status match {
+        case Failed(reason) => asn.Copy(PriorFailure = Some[PriorFailure](
+            PriorFailure(Summary = reason, Flags = EmptyArray[UnsupportedFlag]()),
+        ))
+        case Queued()      => asn
+        case Translating() => asn
+        case Verifying()   => asn
+        case Done(_)       => asn
+        case Blocked(_)    => asn
+        case Skipped()     => asn
+    }
+}
+
+func acceptUnit(u UnitRun) StepResult {
+    val status = u.Status match {
+        case Done(r)       => Done(Output = r)
+        case Queued()      => acceptedFresh(u)
+        case Translating() => acceptedFresh(u)
+        case Verifying()   => acceptedFresh(u)
+        case Blocked(_)    => acceptedFresh(u)
+        case Skipped()     => acceptedFresh(u)
+        case Failed(_)     => acceptedFresh(u)
+    }
+    return StepResult(
+        Unit   = u.Copy(Status = status),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = status)),
+    )
+}
+
+func acceptedFresh(u UnitRun) UnitStatus = Done(Output = Result(
+    Task       = u.Assignment.Task,
+    TargetText = "",
+    Rationale  = "accepted by operator",
+    Flags      = EmptyArray[UnsupportedFlag](),
+))
+
+// answerBlocker resolves a clarification: it threads the Answer onto the unit's
+// assignment and re-queues it — the clarification-resolution loop, executed as a
+// pure state transition.
+func answerBlocker(state RunState, id UnitId, ans Answer) RunState =
+    state.Units.Find((u UnitRun) => sameUnit(u, id)) match {
+        case Some(u) => replaceAndLog(state, id, applyAnswer(u, ans))
+        case None()  => state
+    }
+
+func applyAnswer(u UnitRun, ans Answer) StepResult {
+    val asn = u.Assignment
+    val answered = asn.Copy(Answers = asn.Answers.Append(ans))
+    return StepResult(
+        Unit   = u.Copy(Assignment = answered, Status = Queued()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Queued())),
+    )
+}
+
+// ----------------------------------------------------------------------------
+// shared state update + a convenience driver
+// ----------------------------------------------------------------------------
+
+// replaceAndLog swaps the targeted unit for its stepped version and appends the
+// step's events — the single place RunState is rebuilt.
+func replaceAndLog(state RunState, id UnitId, step StepResult) RunState =
+    RunState(
+        Units = state.Units.Map((x UnitRun) => sameUnit(x, id) match {
+            case true  => step.Unit
+            case false => x
+        }),
+        Log = state.Log.AppendAll(step.Events),
+    )
+
+// RunToCompletion advances a state until no unit is actionable (all Done /
+// Blocked / Skipped / Failed). Terminates because every Advance moves one unit
+// strictly toward a terminal status. A convenience for the UI's "run all" and for
+// tests — not part of the port surface.
+func RunToCompletion(port EnginePort, state RunState) RunState {
+    var s = state
+    var more = hasActionable(s)
+    for more {
+        s = port.Advance(s)
+        more = hasActionable(s)
+    }
+    return s
+}
+
+// CountByDone is a small projection helper: how many units reached Done.
+func CountByDone(state RunState) int =
+    state.Units.Count((u UnitRun) => u.Status match {
+        case Done(_)       => true
+        case Queued()      => false
+        case Translating() => false
+        case Verifying()   => false
+        case Blocked(_)    => false
+        case Skipped()     => false
+        case Failed(_)     => false
+    })

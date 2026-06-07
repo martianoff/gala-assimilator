@@ -1,0 +1,86 @@
+package engine
+
+// Tests for the agent-run contract: exhaustive RunOutcome match, the
+// MockTranslator round-trip, and every terminus / CancelOutcome exercised THROUGH
+// the AgentRunner port via ScriptedRunner.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+)
+
+func runTask() TaskId = TaskId(Value = "task-1")
+
+func sampleResult() Result =
+    Result(Task = runTask(), TargetText = "x", Rationale = "id", Flags = EmptyArray[UnsupportedFlag]())
+
+func sampleClarification() Clarification =
+    Clarification(Task = runTask(), Question = "is x nullable?")
+
+// outcomeTagFn is a single exhaustive match over RunOutcome; a fourth terminus
+// breaks it here.
+func outcomeTagFn(o RunOutcome) string = o match {
+    case OutcomeResult(_)        => "result"
+    case OutcomeClarification(_) => "clarification"
+    case OutcomeAborted(_)       => "aborted"
+}
+
+func TestRunOutcomeExhaustive(t T) T {
+    val t1 = Eq(t, outcomeTagFn(OutcomeResult(Value = sampleResult())), "result")
+    val t2 = Eq(t1, outcomeTagFn(OutcomeClarification(Value = sampleClarification())), "clarification")
+    val t3 = Eq(t2, outcomeTagFn(OutcomeAborted(Reason = "boom")), "aborted")
+    // and the library-style tag helper agrees
+    return Eq(t3, RunOutcomeTag(OutcomeResult(Value = sampleResult())), "result")
+}
+
+// The MockTranslator streams Reading->Emitting->Verifying then terminates in
+// OutcomeResult carrying the assignment's TaskId.
+func TestMockTranslatorRoundTrip(t T) T {
+    val runner = MockTranslator()
+    val tx = runner.Submit(sampleAssignment())
+    val t1 = Eq(t, tx.Steps.Length(), 3)
+    val t2 = tx.Steps.Get(0) match {
+        case StepProgress(ev) => ev.Phase match {
+            case PhaseReading()   => IsTrue(t1, true)
+            case PhaseEmitting()  => Fail(t1, "first step should be Reading")
+            case PhaseVerifying() => Fail(t1, "first step should be Reading")
+        }
+    }
+    return tx.Final match {
+        case OutcomeResult(r)        => Eq(t2, r.Task.Value, "task-1")
+        case OutcomeClarification(_) => Fail(t2, "mock should terminate in OutcomeResult")
+        case OutcomeAborted(_)       => Fail(t2, "mock should terminate in OutcomeResult")
+    }
+}
+
+// Every terminus produced THROUGH the port via ScriptedRunner.
+func TestScriptedRunnerTermini(t T) T {
+    val clarRunner = ScriptedRunner(OutcomeClarification(Value = sampleClarification()), Cancelled())
+    val t1 = clarRunner.Submit(sampleAssignment()).Final match {
+        case OutcomeClarification(c) => Eq(t, c.Question, "is x nullable?")
+        case OutcomeResult(_)        => Fail(t, "expected OutcomeClarification")
+        case OutcomeAborted(_)       => Fail(t, "expected OutcomeClarification")
+    }
+    val abortRunner = ScriptedRunner(OutcomeAborted(Reason = "agent crashed"), Cancelled())
+    val t2 = abortRunner.Submit(sampleAssignment()).Final match {
+        case OutcomeAborted(reason)  => Eq(t1, reason, "agent crashed")
+        case OutcomeResult(_)        => Fail(t1, "expected OutcomeAborted")
+        case OutcomeClarification(_) => Fail(t1, "expected OutcomeAborted")
+    }
+    // progress prefix still present on a non-result terminus
+    return GreaterOrEq(t2, abortRunner.Submit(sampleAssignment()).Steps.Length(), 1)
+}
+
+// Both CancelOutcome cases reachable through the port.
+func TestRunnerCancelBothCases(t T) T {
+    val t1 = MockTranslator().Cancel(runTask()) match {
+        case Cancelled()  => IsTrue(t, true)
+        case NotRunning() => Fail(t, "mock cancel should report Cancelled")
+    }
+    val notRunning = ScriptedRunner(OutcomeAborted(Reason = "n/a"), NotRunning())
+    return notRunning.Cancel(runTask()) match {
+        case NotRunning() => IsTrue(t1, true)
+        case Cancelled()  => Fail(t1, "scripted cancel should report NotRunning")
+    }
+}
