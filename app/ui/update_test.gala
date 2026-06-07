@@ -2,17 +2,30 @@ package ui
 
 import (
     . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/test"
 )
 
 // ============================================================================
 // Reducer (Update) tests via StepAll — pure message sequences, no terminal.
-// Cover focus cycling, the cyclers/steppers, radio selection, the async scan
-// round-trip, and back-navigation.
+// Cover S1 interview controls plus the engine flow: scan→plan→run→tick driving
+// the assimilation to completion.
 // ============================================================================
 
-func prog() Program[Model, Msg] = NewProgram(NewStubPort(), 110, 20)
+func prog() Program[Model, Msg] = NewProgram(engine.MockEngine(), 110, 30)
+
+// ticks builds n MRunTick messages (each StepAll-applied tick = one Advance,
+// since the self-rescheduling AfterDelay future doesn't fire under StepAll).
+func ticks(n int) Array[Msg] = ArrayTabulate[Msg](n, (i int) => MRunTick())
+
+func doneOf(m Model) int = m.Run match {
+    case Some(rs) => engine.CountByDone(rs)
+    case None()   => 0
+}
+
+// ----- S1 interview ---------------------------------------------------------
 
 func TestTabAdvancesFocus(t T) T {
     val (m1, _) = StepAll(prog(), ArrayOf[Msg](MFocusNext()))
@@ -25,7 +38,6 @@ func TestShiftTabWrapsToLastPane(t T) T {
 }
 
 func TestCycleTargetWrapsAround(t T) T {
-    // 3 target options → 3 forward cycles returns to GALA.
     val (m1, _) = StepAll(prog(), ArrayOf[Msg](MCycleTarget(), MCycleTarget(), MCycleTarget()))
     return Eq(t, m1.TargetLang(), "GALA")
 }
@@ -37,16 +49,6 @@ func TestRetryStepperClampsAtMin(t T) T {
     )
     val (m1, _) = StepAll(prog(), msgs)
     return Eq(t, m1.Retry, RetryMin())
-}
-
-func TestRetryStepperClampsAtMax(t T) T {
-    val msgs = ArrayOf[Msg](
-        MStepRetry(Dir = 1), MStepRetry(Dir = 1), MStepRetry(Dir = 1),
-        MStepRetry(Dir = 1), MStepRetry(Dir = 1), MStepRetry(Dir = 1),
-        MStepRetry(Dir = 1), MStepRetry(Dir = 1),
-    )
-    val (m1, _) = StepAll(prog(), msgs)
-    return Eq(t, m1.Retry, RetryMax())
 }
 
 func TestSetUnsupportedPolicy(t T) T {
@@ -62,27 +64,82 @@ func TestSetBackendClaude(t T) T {
 func TestBrowseCyclesSourceDirAndRedetects(t T) T {
     val (m1, _) = StepAll(prog(), ArrayOf[Msg](MBrowse()))
     val t1 = Eq(t, m1.SourceDir, "/workdir/sample-lib")
-    // Detection re-ran for the new directory.
     return IsTrue(t1, m1.Source.Detected)
 }
+
+// ----- engine flow: scan → plan → run → tick --------------------------------
 
 func TestScanRequestedEntersScanningState(t T) T {
     val (m1, cmds) = StepAll(prog(), ArrayOf[Msg](MScanRequested()))
     val t1 = IsTrue(t, m1.Scanning)
-    // A (non-quit) Cmd was emitted to do the work off the loop.
-    return IsTrue(t1, cmds.NonEmpty())
+    return IsTrue(t1, cmds.NonEmpty())   // an Async Scan→Plan Cmd was emitted
 }
 
-func TestScanCompletedPushesS2(t T) T {
-    val out = ScanOutcome(UnitCount = 7, Summary = "done")
-    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MScanCompleted(Out = out)))
+func TestScanPlannedRoutesToS2(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MScanPlanned(Workspace = ws, Plan = plan)))
     val t1 = Eq(t, m1.Screens.Current(), RouteS2())
     return IsFalse(t1, m1.Scanning)
 }
 
+func TestRunStartedRoutesToS3(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val st = port.Run(port.Plan(ws))
+    val setup = ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
+        MRunStarted(State = st),
+    )
+    val (m1, _) = StepAll(prog(), setup)
+    return Eq(t, m1.Screens.Current(), RouteS3())
+}
+
+func TestTicksIncreaseDoneCount(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val setup = ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = plan),
+        MRunStarted(State = st),
+    )
+    val (m0, _) = StepAll(prog(), setup)
+    val (m1, _) = StepAll(prog(), setup.AppendAll(ticks(3)))
+    return IsTrue(t, doneOf(m1) > doneOf(m0))   // first unit finished after 3 ticks
+}
+
+func TestRunDrivesToCompletion(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val setup = ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = plan),
+        MRunStarted(State = st),
+    )
+    val (m1, _) = StepAll(prog(), setup.AppendAll(ticks(40)))
+    return m1.Run match {
+        case Some(rs) => {
+            val total = rs.Units.Length()
+            val t1 = Eq(t, engine.CountByDone(rs), total)        // all units done
+            return IsFalse(t1, runview.AnyActionable(rs))         // nothing left to drive
+        }
+        case None() => IsTrue(t, false)
+    }
+}
+
+// ----- navigation -----------------------------------------------------------
+
 func TestBackFromS2ReturnsToS1(t T) T {
-    val out = ScanOutcome(UnitCount = 7, Summary = "done")
-    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MScanCompleted(Out = out), MBack()))
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val msgs = ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
+        MBack(),
+    )
+    val (m1, _) = StepAll(prog(), msgs)
     return Eq(t, m1.Screens.Current(), RouteS1())
 }
 

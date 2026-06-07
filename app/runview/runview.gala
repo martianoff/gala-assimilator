@@ -1,0 +1,184 @@
+package runview
+
+import (
+    . "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/collection_immutable"
+    str "martianoff/gala/strings"
+)
+
+// ============================================================================
+// Engine → UI projection.
+//
+// This package dot-imports the engine so it can pattern-match the engine's
+// sealed types (UnitStatus, EngineEvent, ProgressPhase) — GALA only matches
+// sealed cases under a dot-import. It deliberately does NOT import gala_tui:
+// the UI package's gala_tui dependency transitively pulls in `state`, whose
+// `Done` shadows the engine's `Done` case during analysis. Isolating this
+// projection in its own gala_tui-free package keeps `Done` unambiguous.
+//
+// The UI consumes only the plain VM structs and functions below; it never
+// pattern-matches engine internals itself.
+// ============================================================================
+
+// PlanVM is S2's plan summary.
+struct PlanVM(
+    Packages int,
+    Units    int,
+    Items    Array[string],
+)
+
+// UnitRowVM is one row of S3's unit tree.
+struct UnitRowVM(
+    Pkg    string,
+    Id     string,
+    Glyph  string,
+    Status string,
+)
+
+// StatusCounts is the per-status tally shown beside S3's progress bar.
+struct StatusCounts(
+    Queued  int,
+    Active  int,   // Translating + Verifying
+    Done    int,
+    Blocked int,
+    Skipped int,
+    Failed  int,
+)
+
+// RunVM is S3's whole render model: progress + tree rows + activity log lines.
+struct RunVM(
+    Total  int,
+    Done   int,
+    Pct    int,
+    Counts StatusCounts,
+    Rows   Array[UnitRowVM],
+    Log    Array[string],
+)
+
+// ----- plan projection ------------------------------------------------------
+
+func ProjectPlan(ws WorkspaceModel, plan MigrationPlan) PlanVM =
+    PlanVM(
+        Packages = ws.Packages.Length(),
+        Units    = plan.Items.Length(),
+        Items    = plan.Items.Map((it PlanItem) => it.Unit.Value),
+    )
+
+// ----- run projection -------------------------------------------------------
+
+func ProjectRun(rs RunState) RunVM {
+    val total = rs.Units.Length()
+    val done = countWhere(rs, isDone)
+    val pct = if (total == 0) 0 else (done * 100) / total
+    return RunVM(
+        Total  = total,
+        Done   = done,
+        Pct    = pct,
+        Counts = statusCounts(rs),
+        Rows   = rs.Units.Map((u UnitRun) => unitRow(u)),
+        Log    = rs.Log.Map((e EngineEvent) => logLine(e)),
+    )
+}
+
+// AnyActionable reports whether the run still has a drivable unit (the tick
+// loop uses it to decide whether to keep ticking).
+func AnyActionable(rs RunState) bool =
+    rs.Units.Exists((u UnitRun) => isActionable(u.Status))
+
+func statusCounts(rs RunState) StatusCounts =
+    StatusCounts(
+        Queued  = countWhere(rs, isQueued),
+        Active  = countWhere(rs, isActive),
+        Done    = countWhere(rs, isDone),
+        Blocked = countWhere(rs, isBlocked),
+        Skipped = countWhere(rs, isSkipped),
+        Failed  = countWhere(rs, isFailed),
+    )
+
+func countWhere(rs RunState, pred func(UnitStatus) bool) int =
+    rs.Units.Count((u UnitRun) => pred(u.Status))
+
+func unitRow(u UnitRun) UnitRowVM =
+    UnitRowVM(
+        Pkg    = pkgOf(u.Unit.Value),
+        Id     = u.Unit.Value,
+        Glyph  = glyph(u.Status),
+        Status = statusLabel(u.Status),
+    )
+
+// ----- status predicates + labels (the engine pattern-match surface) --------
+
+func isActionable(s UnitStatus) bool = s match {
+    case Queued()      => true
+    case Translating() => true
+    case Verifying()   => true
+    case Done(_)       => false
+    case Blocked(_)    => false
+    case Skipped()     => false
+    case Failed(_)     => false
+}
+
+func isQueued(s UnitStatus) bool = s match {
+    case Queued() => true
+    case _        => false
+}
+
+func isActive(s UnitStatus) bool = s match {
+    case Translating() => true
+    case Verifying()   => true
+    case _             => false
+}
+
+func isDone(s UnitStatus) bool = s match {
+    case Done(_) => true
+    case _       => false
+}
+
+func isBlocked(s UnitStatus) bool = s match {
+    case Blocked(_) => true
+    case _          => false
+}
+
+func isSkipped(s UnitStatus) bool = s match {
+    case Skipped() => true
+    case _         => false
+}
+
+func isFailed(s UnitStatus) bool = s match {
+    case Failed(_) => true
+    case _         => false
+}
+
+func glyph(s UnitStatus) string = s match {
+    case Queued()      => "○"
+    case Translating() => "◐"
+    case Verifying()   => "◑"
+    case Done(_)       => "✓"
+    case Blocked(_)    => "?"
+    case Skipped()     => "⊘"
+    case Failed(_)     => "✗"
+}
+
+func statusLabel(s UnitStatus) string = s match {
+    case Queued()      => "queued"
+    case Translating() => "translating"
+    case Verifying()   => "verifying"
+    case Done(_)       => "done"
+    case Blocked(_)    => "blocked"
+    case Skipped()     => "skipped"
+    case Failed(r)     => "failed: " + r
+}
+
+func phaseLabel(p ProgressPhase) string = p match {
+    case PhaseReading()   => "reading"
+    case PhaseEmitting()  => "emitting"
+    case PhaseVerifying() => "verifying"
+}
+
+func logLine(e EngineEvent) string = e match {
+    case EvProgress(unit, ev) => unit.Value + "  " + phaseLabel(ev.Phase) + ": " + ev.Note
+    case EvStatus(unit, st)   => unit.Value + "  → " + statusLabel(st)
+}
+
+// pkgOf is the package prefix of a unit id ("core/value" → "core").
+func pkgOf(id string) string = str.S(id).Split("/").Get(0).ToString()

@@ -2,11 +2,12 @@ package main
 
 import (
     . "github.com/martianoff/gala-assimilator/app/ui"
+    "github.com/martianoff/gala-assimilator/app/engine"
 )
 
-// Entry point: wire the engine port (a stub this milestone) into the TUI and
-// launch it. When the real engine lands, only this line changes — swap the
-// stub for an adapter over the engine's public port.
+// Entry point: wire the engine's public port into the TUI and launch it.
+// MockEngine() is the deterministic offline engine for now; the real GoEngine
+// swaps in here by changing this one line.
 func main() {
-    RunApp(NewStubPort())
+    RunApp(engine.MockEngine())
 }

@@ -2,28 +2,29 @@ package ui
 
 import (
     . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
 )
 
 // ============================================================================
 // App wiring — the Program triple + the maximal runtime entry point.
 //
 // gala_tui exposes no single `RunFull`; `RunWithMouse` is its maximal runtime
-// (mouse + resize + subscriptions over the async Update loop). RunApp wires
-// the injected EnginePort into the model and launches it.
+// (mouse + resize + the async future loop that drains the run's tick Cmds).
+// RunApp injects the engine's public port and launches the app.
 // ============================================================================
 
 // NewProgram builds the Elm triple for the given engine port and viewport.
-// Exposed (not just used by RunApp) so tests construct the exact same Program.
-func NewProgram(port EnginePort, cols int, rows int) Program[Model, Msg] =
+// Exposed so tests construct the exact same Program.
+func NewProgram(port engine.EnginePort, cols int, rows int) Program[Model, Msg] =
     Program[Model, Msg](
         Initial = NewModel(port, cols, rows),
         Update  = (m, msg) => update(m, msg),
         View    = (m) => view(m),
     )
 
-// RunApp launches the TUI against `port`, sizing the initial model to the
-// live terminal. Returns the final model when the user quits.
-func RunApp(port EnginePort) Model {
+// RunApp launches the TUI against `port`, sizing the initial model to the live
+// terminal. Returns the final model when the user quits.
+func RunApp(port engine.EnginePort) Model {
     val (w, h) = TermSize()
     val program = NewProgram(port, w, h)
     return RunWithMouse[Model, Msg](program, (ev) => inputToMsg(ev), NoSubs[Msg]())
