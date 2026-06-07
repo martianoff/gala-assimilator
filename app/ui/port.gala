@@ -1,0 +1,56 @@
+package ui
+
+// ============================================================================
+// UI-side engine port.
+//
+// The TUI never touches the migration engine's internals (parsers, IR,
+// emitters). It speaks to it through this single interface, which trades only
+// in plain value types declared here. This milestone backs the port with an
+// in-package stub (see stub.gala); a later milestone swaps in an adapter over
+// the real `app/engine` public surface — without the UI changing.
+//
+// Keep this surface small and value-only: no gala_tui widgets, no engine IR.
+// ============================================================================
+
+// SourceInfo is the result of probing a candidate source directory.
+//
+//   Lang     — detected source language ("" when nothing recognised).
+//   Marker   — the evidence that pinned the language (e.g. "go.mod found").
+//   FileCnt  — number of source files discovered.
+//   Detected — false when the directory holds no recognised project.
+struct SourceInfo(
+    Lang     string,
+    Marker   string,
+    FileCnt  int,
+    Detected bool,
+)
+
+// MigrationConfig is the interview's output — everything S1 collects, handed
+// to the engine when the user starts a scan.
+struct MigrationConfig(
+    SourceDir    string,
+    TargetLang   string,
+    Unsupported  UnsupportedPolicy,
+    RetryBudget  int,
+    AgentBackend AgentBackend,
+    Ambiguity    string,
+)
+
+// ScanOutcome is the (placeholder) result of a project scan. A later
+// milestone fills this with the real work plan; for now it carries enough to
+// prove the async round-trip into S2.
+struct ScanOutcome(
+    UnitCount int,
+    Summary   string,
+)
+
+// EnginePort is the entire engine surface the UI is allowed to call.
+// Implementations must be pure-ish and fast to *invoke* — any real work an
+// implementation does happens off the Update loop because the UI only ever
+// calls these from inside a `Cmd` (see update.gala's Async scan).
+type EnginePort interface {
+    // DetectSource probes `dir` and reports what kind of project lives there.
+    DetectSource(dir string) SourceInfo
+    // ScanProject walks the configured project and returns a work plan.
+    ScanProject(cfg MigrationConfig) ScanOutcome
+}

@@ -1,13 +1,12 @@
 package main
 
-// gala-assimilator entrypoint — BOOTSTRAP PLACEHOLDER.
-//
-// This exists only so the workspace builds end-to-end and the pre-merge
-// `gala build -o gala_assimilator ./cmd/gala_assimilator` gate can pass while the
-// project is scaffolded. It does NOT yet wire the migration engine to the
-// gala_tui UI. Real wiring (engine port + gala_tui RunFull) lands in a later
-// milestone; deliberately no gala_tui / app/ui dependency is pulled in here yet.
+import (
+    . "github.com/martianoff/gala-assimilator/app/ui"
+)
 
+// Entry point: wire the engine port (a stub this milestone) into the TUI and
+// launch it. When the real engine lands, only this line changes — swap the
+// stub for an adapter over the engine's public port.
 func main() {
-    Println("gala-assimilator (bootstrap) — engine/UI wiring not yet implemented")
+    RunApp(NewStubPort())
 }

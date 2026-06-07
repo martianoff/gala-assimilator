@@ -1,0 +1,143 @@
+package engine
+
+// Tests for the domain ACP payloads + the sealed Message set.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+)
+
+// ----------------------------------------------------------------------------
+// Shared fixtures
+// ----------------------------------------------------------------------------
+
+func sampleAssignment() TaskAssignment =
+    TaskAssignment(
+        Task   = TaskId(Value = "task-1"),
+        Unit   = UnitId(Value = "unit-1"),
+        Source = SourceContext(
+            SourceText   = "func id(x int) int = x",
+            Dependencies = ArrayOf[DependencySnippet](
+                DependencySnippet(Name = "int", Text = "builtin"),
+            ),
+        ),
+        Target = TargetConventions(
+            Language = "go",
+            Notes    = ArrayOf[string]("gofmt", "no naked returns"),
+        ),
+        PriorFailure = None[PriorFailure](),
+        Answers      = EmptyArray[Answer](),
+    )
+
+func sampleFlag() UnsupportedFlag =
+    UnsupportedFlag(Construct = "go-style defer", Reason = "no faithful target construct")
+
+// ----------------------------------------------------------------------------
+// All six messages + exhaustive MessageKind
+// ----------------------------------------------------------------------------
+
+func allSixMessages() Array[Message] {
+    val task = TaskId(Value = "task-1")
+    return ArrayOf[Message](
+        MsgTaskAssignment(Payload = sampleAssignment()),
+        MsgProgressEvent(Payload = ProgressEvent(Task = task, Phase = PhaseReading(), Note = "reading")),
+        MsgResult(Payload = Result(
+            Task = task, TargetText = "x", Rationale = "identity",
+            Flags = EmptyArray[UnsupportedFlag](),
+        )),
+        MsgClarification(Payload = Clarification(Task = task, Question = "is x nullable?")),
+        MsgAnswer(Payload = Answer(Task = task, Response = "no")),
+        MsgVerdict(Payload = Verdict(
+            Task = task, Outcome = Accept(), Reasons = ArrayOf[string]("semantics preserved"),
+        )),
+    )
+}
+
+func TestConstructAllSixMessages(t T) T =
+    Eq(t, allSixMessages().Length(), 6)
+
+func TestMessageKindExhaustive(t T) T {
+    val msgs = allSixMessages()
+    val expected = ArrayOf[string](
+        "task_assignment", "progress_event", "result", "clarification", "answer", "verdict",
+    )
+    var i = 0
+    var t2 = t
+    for i < msgs.Length() {
+        t2 = Eq(t2, MessageKind(msgs.Get(i)), expected.Get(i))
+        i = i + 1
+    }
+    return t2
+}
+
+// ----------------------------------------------------------------------------
+// VerdictOutcome + ProgressPhase exhaustiveness
+// ----------------------------------------------------------------------------
+
+func outcomeTag(o VerdictOutcome) string = o match {
+    case Accept() => "accept"
+    case Reject() => "reject"
+}
+
+func TestVerdictOutcomeExhaustive(t T) T {
+    val t1 = Eq(t, outcomeTag(Accept()), "accept")
+    return Eq(t1, outcomeTag(Reject()), "reject")
+}
+
+func phaseTag(p ProgressPhase) string = p match {
+    case PhaseReading()   => "reading"
+    case PhaseEmitting()  => "emitting"
+    case PhaseVerifying() => "verifying"
+}
+
+func TestProgressPhaseExhaustive(t T) T {
+    val t1 = Eq(t, phaseTag(PhaseReading()), "reading")
+    val t2 = Eq(t1, phaseTag(PhaseEmitting()), "emitting")
+    return Eq(t2, phaseTag(PhaseVerifying()), "verifying")
+}
+
+// A Verifying-phase ProgressEvent is constructible and matchable.
+func TestVerifyingProgressEvent(t T) T {
+    val ev = ProgressEvent(Task = TaskId(Value = "task-1"), Phase = PhaseVerifying(), Note = "self-checking")
+    return ev.Phase match {
+        case PhaseVerifying() => IsTrue(t, true)
+        case PhaseReading()   => Fail(t, "expected Verifying")
+        case PhaseEmitting()  => Fail(t, "expected Verifying")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Re-submission carriers + the "surface, don't guess" Flags path
+// ----------------------------------------------------------------------------
+
+func TestPriorFailureCarrier(t T) T {
+    val base = sampleAssignment()
+    val retry = base.Copy(PriorFailure = Some[PriorFailure](PriorFailure(
+        Summary = "previous attempt changed evaluation order",
+        Flags   = ArrayOf[UnsupportedFlag](sampleFlag()),
+    )))
+    return retry.PriorFailure match {
+        case Some(pf) => Eq(t, pf.Flags.Length(), 1)
+        case None()   => Fail(t, "retry assignment must carry a PriorFailure")
+    }
+}
+
+func TestAnswersCarrier(t T) T {
+    val base = sampleAssignment()
+    val answered = base.Copy(Answers = ArrayOf[Answer](
+        Answer(Task = TaskId(Value = "task-1"), Response = "no, x is non-null"),
+    ))
+    val t1 = Eq(t, answered.Answers.Length(), 1)
+    return Eq(t1, answered.Answers.Get(0).Response, "no, x is non-null")
+}
+
+func TestResultWithFlags(t T) T {
+    val r = Result(
+        Task = TaskId(Value = "task-1"), TargetText = "",
+        Rationale = "construct has no faithful target",
+        Flags     = ArrayOf[UnsupportedFlag](sampleFlag()),
+    )
+    val t1 = Eq(t, r.Flags.Length(), 1)
+    return Eq(t1, r.Flags.Get(0).Construct, "go-style defer")
+}

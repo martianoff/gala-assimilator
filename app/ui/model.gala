@@ -1,0 +1,119 @@
+package ui
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ============================================================================
+// Model — the single immutable app state.
+//
+// Routing is a `state.ScreenStack` of route tokens (S1 root → S2 → S3 → S6).
+// Keyboard focus on S1 is a `state.FocusManager` ring; every interactive
+// control owns one pane id so Tab/Shift-Tab and mouse focus share one source
+// of truth. Viewport size (Cols/Rows) drives the responsive layout and is
+// refreshed from ResizeInput.
+// ============================================================================
+
+// Route tokens for the ScreenStack. Kept as functions so there's one spelling.
+func RouteS1() string = "S1"   // Setup / Interview
+func RouteS2() string = "S2"   // Scan (placeholder this milestone)
+func RouteS3() string = "S3"   // Plan (placeholder)
+func RouteS6() string = "S6"   // Report (placeholder)
+
+// Focus pane ids for S1 — order defines the Tab ring.
+func PaneBrowse() string      = "browse"
+func PaneTarget() string      = "target"
+func PaneUnsupported() string = "unsupported"
+func PaneRetry() string       = "retry"
+func PaneBackend() string     = "backend"
+func PaneAmbiguity() string   = "ambiguity"
+func PaneScan() string        = "scan"
+
+func s1Panes() Array[string] =
+    ArrayOf[string](
+        PaneBrowse(),
+        PaneTarget(),
+        PaneUnsupported(),
+        PaneRetry(),
+        PaneBackend(),
+        PaneAmbiguity(),
+        PaneScan(),
+    )
+
+// Minimum viewport the full layout needs; below this the view shows a resize
+// notice instead of a broken layout.
+func MinCols() int = 60
+func MinRows() int = 14
+
+// Above this width the retry-budget and agent-backend controls share one row;
+// below it they stack so nothing is clipped.
+func WideCols() int = 86
+
+struct Model(
+    Screens  ScreenStack,
+    Focus    FocusRing,
+    Port     EnginePort,
+    Cols     int,
+    Rows     int,
+    SourceDir    string,
+    Source       SourceInfo,
+    TargetIdx    int,
+    Unsupported  UnsupportedPolicy,
+    Retry        int,
+    Backend      AgentBackend,
+    AmbiguityIdx int,
+    Scanning bool,
+    LastScan Option[ScanOutcome],
+)
+
+// browseDirs is the small set of sample project paths the Browse control
+// cycles through (a real file picker lands in a later milestone).
+func browseDirs() Array[string] =
+    ArrayOf[string](
+        "/workdir/myproject",
+        "/workdir/sample-lib",
+        "/workdir/legacy-app",
+    )
+
+// NewModel builds the initial state for the given engine port and viewport.
+// Detection runs once up front so S1's "Detected source" row is populated on
+// first paint; it's cheap and lets the snapshot tests be deterministic.
+func NewModel(port EnginePort, cols int, rows int) Model {
+    val dir = browseDirs().Get(0)
+    return Model(
+        Screens  = NewScreenStack(RouteS1()),
+        Focus    = NewFocusRing(s1Panes()),
+        Port     = port,
+        Cols     = cols,
+        Rows     = rows,
+        SourceDir    = dir,
+        Source       = port.DetectSource(dir),
+        TargetIdx    = 0,
+        Unsupported  = FlagContinue(),
+        Retry        = 3,
+        Backend      = MockBackend(),
+        AmbiguityIdx = 0,
+        Scanning = false,
+        LastScan = None[ScanOutcome](),
+    )
+}
+
+// TargetLang is the currently-selected target language label.
+func (m Model) TargetLang() string =
+    TargetLangOptions().Get(clampIdx(m.TargetIdx, TargetLangOptions().Length()))
+
+// Ambiguity is the currently-selected ambiguity-default label.
+func (m Model) Ambiguity() string =
+    AmbiguityOptions().Get(clampIdx(m.AmbiguityIdx, AmbiguityOptions().Length()))
+
+// Config snapshots the interview into the value the engine port consumes.
+func (m Model) Config() MigrationConfig =
+    MigrationConfig(
+        SourceDir    = m.SourceDir,
+        TargetLang   = m.TargetLang(),
+        Unsupported  = m.Unsupported,
+        RetryBudget  = m.Retry,
+        AgentBackend = m.Backend,
+        Ambiguity    = m.Ambiguity(),
+    )

@@ -16,6 +16,9 @@
 # gala_team runtime / local state
 .gala_team/
 
+# GALA local analysis cache
+/.gala/
+
 # Editor / OS
 .idea/
 .vscode/

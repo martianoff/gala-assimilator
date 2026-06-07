@@ -1,0 +1,98 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// Reducer (Update) tests via StepAll — pure message sequences, no terminal.
+// Cover focus cycling, the cyclers/steppers, radio selection, the async scan
+// round-trip, and back-navigation.
+// ============================================================================
+
+func prog() Program[Model, Msg] = NewProgram(NewStubPort(), 110, 20)
+
+func TestTabAdvancesFocus(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MFocusNext()))
+    return Eq(t, m1.Focus.Current(), PaneTarget())
+}
+
+func TestShiftTabWrapsToLastPane(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MFocusPrev()))
+    return Eq(t, m1.Focus.Current(), PaneScan())
+}
+
+func TestCycleTargetWrapsAround(t T) T {
+    // 3 target options → 3 forward cycles returns to GALA.
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MCycleTarget(), MCycleTarget(), MCycleTarget()))
+    return Eq(t, m1.TargetLang(), "GALA")
+}
+
+func TestRetryStepperClampsAtMin(t T) T {
+    val msgs = ArrayOf[Msg](
+        MStepRetry(Dir = -1), MStepRetry(Dir = -1),
+        MStepRetry(Dir = -1), MStepRetry(Dir = -1),
+    )
+    val (m1, _) = StepAll(prog(), msgs)
+    return Eq(t, m1.Retry, RetryMin())
+}
+
+func TestRetryStepperClampsAtMax(t T) T {
+    val msgs = ArrayOf[Msg](
+        MStepRetry(Dir = 1), MStepRetry(Dir = 1), MStepRetry(Dir = 1),
+        MStepRetry(Dir = 1), MStepRetry(Dir = 1), MStepRetry(Dir = 1),
+        MStepRetry(Dir = 1), MStepRetry(Dir = 1),
+    )
+    val (m1, _) = StepAll(prog(), msgs)
+    return Eq(t, m1.Retry, RetryMax())
+}
+
+func TestSetUnsupportedPolicy(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MSetUnsupported(P = StopAll())))
+    return IsTrue(t, UnsupportedEq(m1.Unsupported, StopAll()))
+}
+
+func TestSetBackendClaude(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MSetBackend(B = ClaudeBackend())))
+    return IsTrue(t, BackendEq(m1.Backend, ClaudeBackend()))
+}
+
+func TestBrowseCyclesSourceDirAndRedetects(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MBrowse()))
+    val t1 = Eq(t, m1.SourceDir, "/workdir/sample-lib")
+    // Detection re-ran for the new directory.
+    return IsTrue(t1, m1.Source.Detected)
+}
+
+func TestScanRequestedEntersScanningState(t T) T {
+    val (m1, cmds) = StepAll(prog(), ArrayOf[Msg](MScanRequested()))
+    val t1 = IsTrue(t, m1.Scanning)
+    // A (non-quit) Cmd was emitted to do the work off the loop.
+    return IsTrue(t1, cmds.NonEmpty())
+}
+
+func TestScanCompletedPushesS2(t T) T {
+    val out = ScanOutcome(UnitCount = 7, Summary = "done")
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MScanCompleted(Out = out)))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS2())
+    return IsFalse(t1, m1.Scanning)
+}
+
+func TestBackFromS2ReturnsToS1(t T) T {
+    val out = ScanOutcome(UnitCount = 7, Summary = "done")
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MScanCompleted(Out = out), MBack()))
+    return Eq(t, m1.Screens.Current(), RouteS1())
+}
+
+func TestBackAtRootQuits(t T) T {
+    val (_, cmds) = StepAll(prog(), ArrayOf[Msg](MBack()))
+    return IsTrue(t, cmds.Exists((c) => IsQuit(c)))
+}
+
+func TestResizeUpdatesViewport(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MResized(W = 80, H = 30)))
+    val t1 = Eq(t, m1.Cols, 80)
+    return Eq(t1, m1.Rows, 30)
+}

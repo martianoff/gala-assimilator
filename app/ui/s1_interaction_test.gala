@@ -1,0 +1,76 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-tui/harness"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// Interaction tests through the gala_tui full (mouse-aware) harness.
+//
+// One keyboard path and one mouse path, asserting the resulting Model + View
+// transition — proving the mouse/keyboard parity rule on a concrete action.
+// ============================================================================
+
+func s1Harness() harness.Harness[Model, Msg] {
+    val program = NewProgram(NewStubPort(), 110, 20)
+    return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 20)
+}
+
+// Keyboard: Tab to the target-language cycler, ArrowRight cycles it forward.
+func TestKeyboardCyclesTargetLanguage(t T) T {
+    val s = s1Harness().Start()
+        .Press(PlainKey(Tab()))         // browse → target
+        .Press(PlainKey(ArrowRight()))  // cycle target forward
+    val t1 = Eq(t, s.Model.TargetLang(), "TypeScript")
+    // View reflects the new selection.
+    val out = str.S(Snapshot(view(s.Model), 110, 20))
+    return IsTrue(t1, out.Contains("‹ TypeScript ▾ ›"))
+}
+
+// Mouse: clicking the "skip" radio selects the Skip policy (no keyboard used).
+func TestMouseSelectsSkipPolicy(t T) T {
+    val s0 = s1Harness().Start()
+    // Default policy is flag & continue.
+    val pre = IsTrue(t, UnsupportedEq(s0.Model.Unsupported, FlagContinue()))
+    val rowOpt = s0.FindRow("skip")
+    return rowOpt match {
+        case Some(y) => {
+            val rowText = str.S(s0.Text()).Lines().Get(y)
+            val colOpt = rowText.IndexOf("skip")
+            return colOpt match {
+                case Some(x) => {
+                    val s1 = s0.Click(x + 1, y)
+                    val t1 = IsTrue(pre, UnsupportedEq(s1.Model.Unsupported, SkipUnit()))
+                    // The view now marks skip selected.
+                    val out = str.S(Snapshot(view(s1.Model), 110, 20))
+                    return IsTrue(t1, out.Contains("(•) skip"))
+                }
+                case None() => IsTrue(pre, false)
+            }
+        }
+        case None() => IsTrue(pre, false)
+    }
+}
+
+// Mouse: clicking the scan button starts the scan and enters the scanning state.
+func TestMouseClickScanStartsScan(t T) T {
+    val s0 = s1Harness().Start()
+    val rowOpt = s0.FindRow("scan project")
+    return rowOpt match {
+        case Some(y) => {
+            val rowText = str.S(s0.Text()).Lines().Get(y)
+            val colOpt = rowText.IndexOf("scan project")
+            return colOpt match {
+                case Some(x) => {
+                    val s1 = s0.Click(x + 1, y)
+                    return IsTrue(t, s1.Model.Scanning)
+                }
+                case None() => IsTrue(t, false)
+            }
+        }
+        case None() => IsTrue(t, false)
+    }
+}
