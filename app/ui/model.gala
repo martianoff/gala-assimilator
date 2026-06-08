@@ -62,9 +62,13 @@ func WideCols() int = 86
 struct Model(
     Screens ScreenStack,
     Focus   FocusRing,
-    Port    engine.EnginePort,
-    Cols    int,
-    Rows    int,
+    // MakePort builds an engine port from a backend name ("mock"/"go"/"claude").
+    // The S1 selection decides which name is passed when a scan starts; the
+    // resulting port (Port) then drives the whole run.
+    MakePort func(string) engine.EnginePort,
+    Port     engine.EnginePort,
+    Cols     int,
+    Rows     int,
     // S1 interview
     SourceDir    string,
     Source       SourceInfo,
@@ -95,21 +99,26 @@ func browseDirs() Array[string] =
         "/workdir/legacy-app",
     )
 
-// NewModel builds the initial state for the given engine port and viewport.
-func NewModel(port engine.EnginePort, cols int, rows int) Model {
+// NewModel builds the initial state for the given engine-port factory and
+// viewport. The default backend is Go (the real scanner), matching the app's
+// prior hardcoded GoEngine; the active Port is built from that and rebuilt from
+// the S1 selection when a scan starts.
+func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model {
     val dir = browseDirs().Get(0)
+    val defaultBackend = GoBackend()
     return Model(
-        Screens = NewScreenStack(RouteS1()),
-        Focus   = NewFocusRing(s1Panes()),
-        Port    = port,
-        Cols    = cols,
-        Rows    = rows,
+        Screens  = NewScreenStack(RouteS1()),
+        Focus    = NewFocusRing(s1Panes()),
+        MakePort = makePort,
+        Port     = makePort(BackendName(defaultBackend)),
+        Cols     = cols,
+        Rows     = rows,
         SourceDir    = dir,
         Source       = detectSource(dir),
         TargetIdx    = 0,
         Unsupported  = FlagContinue(),
         Retry        = 3,
-        Backend      = MockBackend(),
+        Backend      = defaultBackend,
         AmbiguityIdx = 0,
         Scanning     = false,
         Workspace = None[engine.WorkspaceModel](),

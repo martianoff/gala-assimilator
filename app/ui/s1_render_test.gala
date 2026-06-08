@@ -14,7 +14,7 @@ import (
 // ============================================================================
 
 func TestS1WideRendersEveryControl(t T) T {
-    val m = NewModel(engine.MockEngine(), 110, 20)
+    val m = NewModel(mockFactory(), 110, 20)
     val out = str.S(Snapshot(view(m), 110, 20))
     val t1 = IsTrue(t,  out.Contains("Gala Assimilator — new migration"))
     val t2 = IsTrue(t1, out.Contains("Source project"))
@@ -24,13 +24,13 @@ func TestS1WideRendersEveryControl(t T) T {
     val t6 = IsTrue(t5, out.Contains("‹ GALA ▾ ›"))
     val t7 = IsTrue(t6, out.Contains("(•) flag & continue"))
     val t8 = IsTrue(t7, out.Contains("( ) skip"))
-    val t9 = IsTrue(t8, out.Contains("(•) Mock"))
+    val t9 = IsTrue(t8, out.Contains("(•) Go"))   // Go is the default backend
     val t10 = IsTrue(t9, out.Contains("‹ prefer immutable + Copy ▾ ›"))
     return IsTrue(t10, out.Contains("[ scan project → ]"))
 }
 
 func TestS1NarrowRendersEveryControl(t T) T {
-    val m = NewModel(engine.MockEngine(), 72, 20)
+    val m = NewModel(mockFactory(), 72, 20)
     val out = str.S(Snapshot(view(m), 72, 20))
     val t1 = IsTrue(t,  out.Contains("Gala Assimilator — new migration"))
     val t2 = IsTrue(t1, out.Contains("Target language"))
@@ -42,7 +42,7 @@ func TestS1NarrowRendersEveryControl(t T) T {
 
 // Wide: retry + backend share one row.
 func TestS1WideCombinesRetryAndBackend(t T) T {
-    val m = NewModel(engine.MockEngine(), 110, 20)
+    val m = NewModel(mockFactory(), 110, 20)
     val lines = str.S(Snapshot(view(m), 110, 20)).Lines()
     val combined = lines.Exists((ln) => ln.Contains("Retry budget") && ln.Contains("Agent backend"))
     return IsTrue(t, combined)
@@ -50,7 +50,7 @@ func TestS1WideCombinesRetryAndBackend(t T) T {
 
 // Narrow: retry + backend are on separate rows (the layout reflowed).
 func TestS1NarrowStacksRetryAndBackend(t T) T {
-    val m = NewModel(engine.MockEngine(), 72, 20)
+    val m = NewModel(mockFactory(), 72, 20)
     val lines = str.S(Snapshot(view(m), 72, 20)).Lines()
     val combined = lines.Exists((ln) => ln.Contains("Retry budget") && ln.Contains("Agent backend"))
     val hasRetry = lines.Exists((ln) => ln.Contains("Retry budget"))
@@ -62,7 +62,7 @@ func TestS1NarrowStacksRetryAndBackend(t T) T {
 
 // Below the declared minimum the layout collapses to a resize notice.
 func TestBelowMinimumShowsResizeNotice(t T) T {
-    val m = NewModel(engine.MockEngine(), 40, 8)
+    val m = NewModel(mockFactory(), 40, 8)
     val out = str.S(Snapshot(view(m), 40, 8))
     val t1 = IsTrue(t, out.Contains("Resize to"))
     return IsFalse(t1, out.Contains("Target language"))

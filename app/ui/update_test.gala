@@ -14,7 +14,12 @@ import (
 // the assimilation to completion.
 // ============================================================================
 
-func prog() Program[Model, Msg] = NewProgram(engine.MockEngine(), 110, 30)
+// mockFactory is the deterministic name→port factory used across UI tests — it
+// ignores the name and always returns the offline MockEngine, so `gala test`
+// never touches the live Claude backend regardless of the selected backend.
+func mockFactory() func(string) engine.EnginePort = (name string) => engine.MockEngine()
+
+func prog() Program[Model, Msg] = NewProgram(mockFactory(), 110, 30)
 
 // StepAll2 continues a message sequence from an existing model (StepAll only
 // starts from a Program's Initial).

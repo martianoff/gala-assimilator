@@ -330,15 +330,17 @@ func browse(m Model) Model {
 
 // ----- engine flow: scan → plan → run → tick --------------------------------
 
-// startScan probes the project through the port (Scan→Plan) off the loop.
+// startScan builds the engine port from the S1 backend selection, then probes
+// the project through it (Scan→Plan) off the loop. The selected port is stored
+// so the rest of the run (Run/Advance/ActOnUnit/AnswerBlocker) uses it too.
 func startScan(m Model) Tuple[Model, Cmd[Msg]] {
-    val port = m.Port
+    val port = m.MakePort(BackendName(m.Backend))
     val root = m.SourceDir
     val cmd = Async[engine.WorkspaceModel, Msg](
         () => port.Scan(engine.ScanRequest(Root = root)),
         (ws) => MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
     )
-    return (m.Copy(Scanning = true), cmd)
+    return (m.Copy(Port = port, Scanning = true), cmd)
 }
 
 func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) Model =
