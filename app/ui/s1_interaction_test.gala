@@ -16,7 +16,7 @@ import (
 // ============================================================================
 
 func s1Harness() harness.Harness[Model, Msg] {
-    val program = NewProgram(engine.MockEngine(), 110, 20)
+    val program = NewProgram(mockFactory(), 110, 20)
     return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 20)
 }
 

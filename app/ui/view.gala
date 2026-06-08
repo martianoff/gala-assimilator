@@ -130,9 +130,11 @@ func unsupportedRow(m Model) Widget {
 
 func backendGroup(m Model) Widget {
     val f = m.Focus.IsFocused(PaneBackend())
+    val isGo     = BackendEq(m.Backend, GoBackend())
     val isMock   = BackendEq(m.Backend, MockBackend())
     val isClaude = BackendEq(m.Backend, ClaudeBackend())
     return Row(ArrayOf[LayoutChild](
+        radioCell(isGo,     f, "Go",     MSetBackend(B = GoBackend())),
         radioCell(isMock,   f, "Mock",   MSetBackend(B = MockBackend())),
         radioCell(isClaude, f, "Claude", MSetBackend(B = ClaudeBackend())),
     ))
@@ -151,7 +153,7 @@ func retryBackendRow(m Model) Widget =
         Fixed(18, retryControl(m)),
         Flex(1, Text("")),
         Fixed(15, TextStyled("Agent backend", DefaultStyle().WithDim())),
-        Fixed(22, backendGroup(m)),
+        Fixed(32, backendGroup(m)),
     ))
 
 func retryRow(m Model) Widget = fieldRow("Retry budget", retryControl(m))
