@@ -1,3 +1,7 @@
+github.com/martianoff/gala-acp v0.1.0 h1:3cg5ydnKmtwTymICJtv/y4Mg6+7acyCpd92jEOTMkDI=
+github.com/martianoff/gala-acp v0.1.0/gala.mod h1:/Sk/cYEcTC1+E+eZOPMqMnpRQedoMtya3Yox5kanTCc=
+github.com/martianoff/gala-acp/agent v0.1.0 h1:jAxEjzS62eL7bthYBYE0vpLHtb99U57chY/n7T2nPno=
+github.com/martianoff/gala-acp/agent v0.1.0/gala.mod h1:/Sk/cYEcTC1+E+eZOPMqMnpRQedoMtya3Yox5kanTCc=
 github.com/martianoff/gala-tui v0.9.2 h1:Bv60HWe1r+k6Gx/PIUYgQpC2cxGJOs6tKBT2aNQvW5I=
 github.com/martianoff/gala-tui v0.9.2/gala.mod h1:ahBvh7Vjv2NDl0hHZ7iOUMzkD3kbIx8LvA+gvcnUxNc=
 github.com/martianoff/gala-tui/harness v0.9.2 h1:19G01hf2wkiBiym814uLXfXzSeG2THvcnI6A1ZzeaB4=

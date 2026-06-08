@@ -8,15 +8,16 @@ package engine
 // SourceTests are built (sourceTestRefs), so they can't even reach the Verifier.
 // This file is the pluggable seam for that single source-test signal.
 //
-// DEFERRED — the real `gala build` / `gala test` invocation. Exactly like the mock
-// translator (run.gala header), the real verifier is NOT wired yet: translation is
-// still the MockTranslator, so a unit's emitted TargetText is "// mock translation"
-// rather than real GALA the toolchain could compile and run. A real Verifier will,
-// per unit, materialize the emitted target plus its 1:1-replicated source tests
-// into a scratch module, run `gala test`, and map green/red onto VerifyResult.
-// Until translation emits real GALA there is nothing real to compile, so
-// MockVerifier (deterministic pass) stands in. Swapping in the real verifier is a
-// port substitution behind *EngineWithVerifier — the gate itself does not change.
+// DEFERRED — the real `gala build` / `gala test` invocation. The real verifier is
+// not wired yet: it will, per unit, materialize the emitted target plus its
+// 1:1-replicated source tests into a scratch module, run `gala test`, and map
+// green/red onto VerifyResult. That work is gated on the default backend emitting
+// real GALA — under the deterministic MockTranslator a unit's TargetText is the
+// placeholder "// mock translation", which there is nothing to compile. (The live
+// Claude backend, ClaudeEngine(), DOES emit real GALA; wiring the toolchain
+// verifier behind it is the next step.) Until then MockVerifier (deterministic
+// pass) stands in, and swapping in the real verifier is a port substitution behind
+// *EngineWithVerifier — the gate itself does not change.
 //
 // Transport-neutral (CLAUDE.md / architecture.md): NO gala_tui, NO app/ui, no IO.
 

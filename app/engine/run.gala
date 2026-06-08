@@ -1,125 +1,109 @@
 package engine
 
-// The agent-run contract: the translator port (AgentRunner) plus its stream-as-
-// data transcript (RunTranscript) and sealed terminus (RunOutcome).
+// The engine's agent-run machinery is gala-acp's GENERIC run contract
+// (github.com/martianoff/gala-acp), instantiated with this engine's domain
+// payloads. acp.AgentRunner[A,R,C] / acp.RunTranscript / acp.RunOutcome /
+// acp.RunStep give us the stream-as-data transcript plus its sealed terminus; we
+// plug in:
 //
-// TEMPORARY IN-REPO STAND-IN for the generic gala-acp library. The architect
-// brief is to consume `acp.AgentRunner[A,R,C]` / `acp.RunTranscript` /
-// `acp.RunOutcome` from github.com/martianoff/gala-acp and delete this copy.
-// gala-acp v0.1.0 RESOLVES and its GALA sources transpile cleanly under our
-// 0.49.2 toolchain — but 0.49.2's dependency manager does not propagate
-// gala-acp's transitive `// go` dependency (github.com/google/uuid): it emits a
-// `require` with neither a `replace` to a local copy nor a go.sum entry, so any
-// package importing gala-acp fails the workspace build/test with
-//   "missing go.sum entry for github.com/google/uuid".
-// Until the toolchain is bumped, this file mirrors the library's run.gala shape
-// (specialized to our payloads) so only these few types get swapped out later.
+//   A = TaskAssignment   — the unit handed to the translator
+//   R = Result           — emitted target text + rationale + flags
+//   C = Clarification    — a question that ends the run
 //
-// Transport-neutral: pure data, no gala_tui / app/ui, no IO.
+// These acp.* types are an ENGINE-INTERNAL detail: they never cross EnginePort.
+// finishUnit (port.gala) adapts an acp transcript into the engine's public
+// EngineEvent / UnitStatus at the boundary, and acp's string-keyed ProgressEvent
+// is mapped to the engine's sealed-phase ProgressUpdate there (phaseFromTag).
+// All acp pattern-matching is isolated in acp_bridge.gala — GALA cannot match a
+// package-qualified case, so exactly one file dot-imports acp to destructure it.
+//
+// Two deterministic, OFFLINE runners are built over the acp generics here:
+//   - MockTranslator  — streams Reading->Emitting->Verifying, ends in a Result.
+//     The engine's default backend; needs no network or credentials, so it is
+//     what `gala test` and the offline UI run against.
+//   - ScriptedRunner  — pins any terminus / cancel so each RunOutcome /
+//     CancelOutcome case is exercised THROUGH the port.
+// The real Claude backend (live `claude` subprocess) lives in
+// claude_translator.gala.
 
 import (
     . "martianoff/gala/collection_immutable"
+    acp "github.com/martianoff/gala-acp"
 )
 
-// ----------------------------------------------------------------------------
-// Run transcript — stream-as-data
-// ----------------------------------------------------------------------------
-
-// RunStep is one non-terminal item the agent emits while working. Sealed with a
-// single case for now: a run terminus is deliberately NOT a RunStep, so a step
-// can never be mistaken for the end of a run.
-sealed type RunStep {
-    case StepProgress(Event ProgressEvent)
-}
-
-// RunOutcome is the sealed terminus of a run — exactly how a Submit ends. Sealed
-// so every consumer handles all three ways a run can finish. (Specialized here;
-// the library type is generic over the result / clarification payloads.)
-sealed type RunOutcome {
-    case OutcomeResult(Value Result)               // agent produced a translation
-    case OutcomeClarification(Value Clarification)  // agent needs an answer; run ends here
-    case OutcomeAborted(Reason string)              // wholesale failure / nothing produced / cancelled
-}
-
-// RunTranscript is the full outcome of a Submit: the ordered intermediate steps
-// followed by exactly one sealed terminus.
-struct RunTranscript(
-    Steps Array[RunStep],
-    Final RunOutcome,
-)
-
-// CancelOutcome is the result of asking the runner to cancel a task — a pure
-// acknowledgement value; the actual teardown is the implementation's IO.
-sealed type CancelOutcome {
-    case Cancelled()  // the task was running and has been stopped
-    case NotRunning() // no live task with that id (already done / never seen)
-}
-
-// ----------------------------------------------------------------------------
-// The AgentRunner port (translator backend)
-// ----------------------------------------------------------------------------
-
-// AgentRunner is the translator port: a struct of function values (the GALA-
-// idiomatic port). Submit: TaskAssignment -> RunTranscript; Cancel: TaskId ->
-// CancelOutcome. The function values are pure from the contract's view; a real
-// backend performs its IO inside them and returns the resulting value.
-struct AgentRunner(
-    Submit func(TaskAssignment) RunTranscript,
-    Cancel func(TaskId) CancelOutcome,
-)
-
-// RunOutcomeTag projects a RunOutcome to a stable lowercase token.
-func RunOutcomeTag(o RunOutcome) string = o match {
-    case OutcomeResult(_)        => "result"
-    case OutcomeClarification(_) => "clarification"
-    case OutcomeAborted(_)       => "aborted"
-}
-
-// progressStep is the in-transcript step builder for a domain progress note.
-func progressStep(task TaskId, phase ProgressPhase, note string) RunStep =
-    StepProgress(Event = ProgressEvent(Task = task, Phase = phase, Note = note))
-
-// ----------------------------------------------------------------------------
-// Deterministic backends (the extraction seam)
-// ----------------------------------------------------------------------------
-
-// MockTranslator is the default translator this contract ships: a runner whose
-// Submit deterministically streams Reading -> Emitting -> Verifying and ends in
-// OutcomeResult (the success path), and whose Cancel reports Cancelled. The real
-// extracted translator replaces this constructor.
-func MockTranslator() AgentRunner =
-    AgentRunner(
+// MockTranslator is the deterministic OFFLINE translator: its Submit streams a
+// faithful Reading->Emitting->Verifying progress prefix and ends in an
+// OutcomeResult with placeholder target text; its Cancel reports Cancelled.
+func MockTranslator() acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
         Submit = (a TaskAssignment) => translatorTranscript(a),
-        Cancel = (_ TaskId) => Cancelled(),
+        Cancel = (_ string) => acp.Cancelled(),
     )
 
 // ScriptedRunner pins the terminus a Submit produces and the CancelOutcome a
 // Cancel returns, so every RunOutcome / CancelOutcome case can be exercised
-// THROUGH THE PORT (not just via hand-built transcripts). The progress prefix is
-// the same faithful Reading->Emitting->Verifying shape.
-func ScriptedRunner(outcome RunOutcome, cancel CancelOutcome) AgentRunner =
-    AgentRunner(
-        Submit = (a TaskAssignment) => RunTranscript(
+// THROUGH THE PORT. The progress prefix is the same Reading->Emitting->Verifying
+// shape the mock streams.
+func ScriptedRunner(
+    outcome acp.RunOutcome[Result, Clarification],
+    cancel acp.CancelOutcome,
+) acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => acp.RunTranscript[Result, Clarification](
             Steps = mockSteps(a.Task),
             Final = outcome,
         ),
-        Cancel = (_ TaskId) => cancel,
+        Cancel = (_ string) => cancel,
     )
 
-func translatorTranscript(a TaskAssignment) RunTranscript =
-    RunTranscript(
+func translatorTranscript(a TaskAssignment) acp.RunTranscript[Result, Clarification] =
+    acp.RunTranscript[Result, Clarification](
         Steps = mockSteps(a.Task),
-        Final = OutcomeResult(Value = Result(
+        Final = resultOutcome(Result(
             Task       = a.Task,
             TargetText = "// mock translation",
-            Rationale  = "deterministic mock output (extraction seam stub)",
+            Rationale  = "deterministic offline mock output",
             Flags      = EmptyArray[UnsupportedFlag](),
         )),
     )
 
-func mockSteps(task TaskId) Array[RunStep] =
-    ArrayOf[RunStep](
-        progressStep(task, PhaseReading(), "reading source unit"),
-        progressStep(task, PhaseEmitting(), "emitting target text"),
-        progressStep(task, PhaseVerifying(), "verifying output"),
+// mockSteps is the Reading->Emitting->Verifying progress prefix, keyed by the
+// task id. The phase is acp's opaque string tag; the engine boundary maps it back
+// to the sealed ProgressPhase (phaseFromTag).
+func mockSteps(task TaskId) Array[acp.RunStep] =
+    ArrayOf[acp.RunStep](
+        acp.ProgressStep(task.Value, "reading", "reading source unit"),
+        acp.ProgressStep(task.Value, "emitting", "emitting target text"),
+        acp.ProgressStep(task.Value, "verifying", "verifying output"),
     )
+
+// ----------------------------------------------------------------------------
+// Engine-domain terminus / cancel constructors
+// ----------------------------------------------------------------------------
+// These wrap the acp generic case constructors so the rest of the engine — and
+// the tests — build run termini without naming acp's type parameters at every
+// call site.
+
+func resultOutcome(r Result) acp.RunOutcome[Result, Clarification] =
+    acp.OutcomeResult[Result, Clarification](Value = r)
+
+func clarifyOutcome(c Clarification) acp.RunOutcome[Result, Clarification] =
+    acp.OutcomeClarification[Result, Clarification](Value = c)
+
+func abortOutcome(reason string) acp.RunOutcome[Result, Clarification] =
+    acp.OutcomeAborted[Result, Clarification](Reason = reason)
+
+func cancelledAck() acp.CancelOutcome = acp.Cancelled()
+
+func notRunningAck() acp.CancelOutcome = acp.NotRunning()
+
+// ScriptedBlockerEngine is a deterministic EnginePort whose every unit run
+// terminates in a clarification, so the first unit reaches Blocked through the
+// real Advance/finish path. It lets the UI exercise the blocker/answer flow in
+// tests WITHOUT touching the acp run contract (the acp.* terminus constructors
+// stay engine-internal). Pass the question the blocked unit should ask.
+func ScriptedBlockerEngine(question string) EnginePort =
+    MockEngineWith(ScriptedRunner(
+        clarifyOutcome(Clarification(Task = TaskId(Value = "scripted"), Question = question)),
+        cancelledAck(),
+    ))

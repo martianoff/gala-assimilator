@@ -16,12 +16,11 @@ import (
 // leaves Blocked.
 // ============================================================================
 
-// blockingEngine yields a clarification for every unit it translates.
-func blockingEngine() engine.EnginePort {
-    val clar = engine.OutcomeClarification(Value = engine.Clarification(
-        Task = engine.TaskId(Value = "t"), Question = "Is x nullable?"))
-    return engine.MockEngineWith(engine.ScriptedRunner(clar, engine.Cancelled()))
-}
+// blockingEngine yields a clarification for every unit it translates. The
+// acp run-outcome constructors are engine-internal, so the UI uses the engine's
+// acp-free helper rather than building a ScriptedRunner itself.
+func blockingEngine() engine.EnginePort =
+    engine.ScriptedBlockerEngine("Is x nullable?")
 
 func blockedAt(m Model, idx int) bool = m.Run match {
     case Some(rs) => runview.IsBlockedAt(rs, idx)
