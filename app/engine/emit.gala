@@ -1,0 +1,158 @@
+package engine
+
+// The EMIT / INTEGRATE step — write the migrated GALA project to disk from a
+// completed run (RunState) plus the scanned WorkspaceModel (MVP §… "integrate").
+//
+// Structure-preserving: each source package maps to a target directory mirroring
+// its repo-relative layout, each Done unit's emitted TargetText is written to its
+// target path (`.go` -> `.gala`), and each package gets its own target `gala.mod`
+// whose module path comes from targetModulePath (the single, pluggable source->
+// target module mapping; a real mapping replaces that one function later).
+//
+// Safety: every write is confined to the chosen output root (underRoot guards
+// against a unit path escaping via `..`), directories are created as needed, and a
+// write is planned purely first (plannedWrites) then executed, stopping at the
+// first IO failure with IntegrateFailed rather than a half-described success.
+//
+// NOTE — with the deterministic MockTranslator a Done unit's TargetText is the
+// placeholder "// mock translation", so the emitted files are placeholders; real
+// GALA output arrives unchanged through this same step once the live Claude backend
+// drives the run (ClaudeEngine). Only Done units are emitted; Failed / Skipped /
+// Blocked units are left out (nothing faithful to write).
+//
+// Transport-neutral: this is a deliberate IO edge (like goscan's scan and the
+// checkpoint persistence); no gala_tui / app/ui, and no acp.* crosses the port.
+
+import (
+    . "martianoff/gala/std"
+    . "martianoff/gala/collection_immutable"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// IntegrateResult is the sealed outcome of an emit: the list of files written, or a
+// reason the emit stopped (an IO failure or a refused out-of-root path).
+sealed type IntegrateResult {
+    case Integrated(Files Array[string])
+    case IntegrateFailed(Reason string)
+}
+
+// targetModulePath is THE source->target module mapping. MVP default: keep the
+// source module path and append a clear "_gala" suffix, so the emitted project is
+// obviously the migrated twin and never collides with the source module. This is
+// the single seam a real, configured mapping plugs into later.
+func targetModulePath(sourceModulePath string) string = sourceModulePath + "_gala"
+
+// targetUnitPath maps a source unit's repo-relative path to its target, preserving
+// the package layout and swapping the extension (`mathx/add.go` -> `mathx/add.gala`).
+func targetUnitPath(sourcePath string) string =
+    strings.TrimSuffix(sourcePath, ".go") + ".gala"
+
+// galaModContents renders a minimal target gala.mod declaring the mapped module.
+func galaModContents(moduleName string) string =
+    "module " + moduleName + "\n\ngala 0.49.2\n"
+
+// fileWrite is one planned write: an absolute target path and its content.
+struct fileWrite(
+    Path    string,
+    Content string,
+)
+
+// integrateProject writes the migrated project rooted at outRoot. It plans all
+// writes purely, then executes them, halting at the first failure.
+func integrateProject(state RunState, model WorkspaceModel, outRoot string) IntegrateResult {
+    val cleanRoot = path.Clean(outRoot)
+    val done      = doneTargets(state)
+    return writeAll(plannedWrites(model, done, cleanRoot), cleanRoot)
+}
+
+// doneTargets indexes each Done unit's emitted TargetText by its unit id; non-Done
+// units are absent, so only completed translations are emitted.
+func doneTargets(state RunState) HashMap[string, string] =
+    state.Units.FoldLeft[HashMap[string, string]](
+        EmptyHashMap[string, string](),
+        (acc HashMap[string, string], u UnitRun) => doneTarget(u) match {
+            case Some(text) => acc.Put(u.Unit.Value, text)
+            case None()     => acc
+        },
+    )
+
+func doneTarget(u UnitRun) Option[string] = u.Status match {
+    case Done(r)       => Some[string](r.TargetText)
+    case Queued()      => None[string]()
+    case Translating() => None[string]()
+    case Verifying()   => None[string]()
+    case Blocked(_)    => None[string]()
+    case Skipped()     => None[string]()
+    case Failed(_)     => None[string]()
+}
+
+// plannedWrites is the pure plan: per package a target gala.mod plus one file per
+// Done unit, all paths absolute under cleanRoot.
+func plannedWrites(model WorkspaceModel, done HashMap[string, string], cleanRoot string) Array[fileWrite] =
+    model.Packages.FlatMap((p Package) => packageWrites(p, done, cleanRoot))
+
+func packageWrites(p Package, done HashMap[string, string], cleanRoot string) Array[fileWrite] {
+    val mod = fileWrite(
+        Path    = path.Join(packageDir(cleanRoot, p.Id), "gala.mod"),
+        Content = galaModContents(targetModulePath(p.ModulePath)),
+    )
+    val units = p.Units.FlatMap((u Unit) => unitWrites(u, done, cleanRoot))
+    return ArrayOf[fileWrite](mod).AppendAll(units)
+}
+
+func unitWrites(u Unit, done HashMap[string, string], cleanRoot string) Array[fileWrite] =
+    done.Get(u.Id.Value) match {
+        case Some(text) => ArrayOf[fileWrite](fileWrite(
+            Path    = path.Join(cleanRoot, targetUnitPath(u.Path)),
+            Content = text,
+        ))
+        case None() => EmptyArray[fileWrite]()
+    }
+
+// packageDir is the target directory for a package: the output root itself for the
+// module-root package ("."), else the slash-relative subdirectory.
+func packageDir(cleanRoot string, id PackageId) string {
+    if id.Value == "." { return cleanRoot }
+    return path.Join(cleanRoot, id.Value)
+}
+
+// writeAll executes the plan, collecting written paths and halting at the first
+// failure. Each write is confined to cleanRoot and creates its parent dirs.
+func writeAll(plan Array[fileWrite], cleanRoot string) IntegrateResult {
+    var written = EmptyArray[string]()
+    var failure = ""
+    var i = 0
+    for i < plan.Length() && failure == "" {
+        val fw  = plan.Get(i)
+        val err = writeOne(fw, cleanRoot)
+        if err.IsDefined() { failure = err.Get() } else { written = written.Append(fw.Path) }
+        i = i + 1
+    }
+    if failure != "" { return IntegrateFailed(Reason = failure) }
+    return Integrated(Files = written)
+}
+
+// writeOne writes a single planned file. Returns Some(reason) on refusal/failure,
+// None on success. It refuses any path that resolves outside the output root.
+func writeOne(fw fileWrite, cleanRoot string) Option[string] {
+    if !underRoot(cleanRoot, fw.Path) {
+        return Some[string]("refused write outside output root: " + fw.Path)
+    }
+    if fs.MkdirAll(path.Dir(fw.Path), 493).IsFailure() {
+        return Some[string]("mkdir failed for: " + fw.Path)
+    }
+    if fs.WriteFileString(fw.Path, fw.Content, 420).IsFailure() {
+        return Some[string]("write failed for: " + fw.Path)
+    }
+    return None[string]()
+}
+
+// underRoot is the containment guard: the cleaned target must equal the root or sit
+// beneath it. Separators are normalized to '/' so the prefix check is OS-neutral.
+func underRoot(cleanRoot string, target string) bool {
+    val r   = path.ToSlash(path.Clean(cleanRoot))
+    val tgt = path.ToSlash(path.Clean(target))
+    return tgt == r || strings.HasPrefix(tgt, r + "/")
+}

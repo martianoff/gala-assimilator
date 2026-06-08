@@ -158,3 +158,33 @@ func TestAcceptOnDoneStaysDone(t T) T {
         case _       => Fail(t, "accepting a Done unit keeps it Done")
     }
 }
+
+// ----------------------------------------------------------------------------
+// Vacuous pass: a unit with NO 1:1 source test reaches Done but flagged unverified.
+// ----------------------------------------------------------------------------
+
+// In the stub workspace, app/main's package has only an AddedTest (no SourceTest),
+// so app/main passes the gate vacuously -> Done but unverified; core/value is
+// covered by core/value_test -> a clean, verified Done.
+func TestUnverifiedWhenNoSourceTest(t T) T {
+    val eng   = MockEngine()
+    val final = RunToCompletion(eng, scanned(eng))
+    val t1 = Eq(t, doneUnverified(final, "app/main"), true)   // no source test -> surfaced
+    return Eq(t1, doneUnverified(final, "core/value"), false) // covered -> clean
+}
+
+// doneUnverified is true when the named unit is Done AND its result carries the
+// unverified-coverage flag.
+func doneUnverified(state RunState, id string) bool =
+    state.Units.Find((u UnitRun) => u.Unit.Value == id) match {
+        case Some(u) => u.Status match {
+            case Done(r)       => IsUnverified(r)
+            case Queued()      => false
+            case Translating() => false
+            case Verifying()   => false
+            case Blocked(_)    => false
+            case Skipped()     => false
+            case Failed(_)     => false
+        }
+        case None() => false
+    }

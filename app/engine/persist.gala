@@ -56,7 +56,12 @@ func saveCheckpoint(state RunState, path string) bool {
     val body = encodeCheckpoint(cp)
     val tmp  = path + ".tmp"
     if fs.WriteFileString(tmp, body, 420).IsFailure() { return false }
-    return atomicRename(tmp, path).GetOrElse(false)
+    if atomicRename(tmp, path).IsFailure() {
+        // Rename failed — remove the orphan temp so a failed save leaves no litter.
+        fs.RemoveAll(tmp)
+        return false
+    }
+    return true
 }
 
 // loadCheckpoint reads a checkpoint back. Missing file -> Missing; unreadable or

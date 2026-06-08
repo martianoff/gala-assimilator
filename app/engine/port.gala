@@ -130,6 +130,7 @@ struct EnginePort(
     Resume         func(Checkpoint) RunState,
     SaveCheckpoint func(RunState, string) bool,
     LoadCheckpoint func(string) CheckpointLoad,
+    Integrate      func(RunState, WorkspaceModel, string) IntegrateResult,
 )
 
 // ----------------------------------------------------------------------------
@@ -161,6 +162,7 @@ func MockEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clari
     Resume         = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
     SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
     LoadCheckpoint = (path string) => loadCheckpoint(path),
+    Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
 )
 
 // ----------------------------------------------------------------------------
@@ -283,9 +285,11 @@ func gateOutcome(verifier Verifier, u UnitRun, o acp.RunOutcome[Result, Clarific
 
 // verifyGate runs the verifier over the unit's 1:1-replicated source tests (only;
 // AddedTest units were excluded when the plan was built) and turns the verdict
-// into a terminus. A pass admits the translation to Done. A fail, or a source test
-// that can't be faithfully verified, surfaces as Failed with a reason that NAMES
-// the problem — never a silent pass, never a silent drop.
+// into a terminus. A pass admits the translation to Done — but a pass with NO 1:1
+// source test behind it is only vacuous, so withCoverageFlag stamps that result
+// "unverified" rather than a clean Done. A fail, or a source test that can't be
+// faithfully verified, surfaces as Failed with a reason that NAMES the problem —
+// never a silent pass, never a silent drop.
 func verifyGate(verifier Verifier, u UnitRun, r Result) UnitStatus {
     val verdict = verifier.Verify(VerifyRequest(
         Unit        = u.Unit,
@@ -293,7 +297,7 @@ func verifyGate(verifier Verifier, u UnitRun, r Result) UnitStatus {
         SourceTests = u.SourceTests,
     ))
     return verdict match {
-        case VerifyPass()             => Done(Output = r)
+        case VerifyPass()             => Done(Output = withCoverageFlag(r, u.SourceTests))
         case VerifyFail(failing, why) => Failed(Reason = verifyFailReason(failing, why))
         case VerifyUnsupported(why)   => Failed(Reason = "needs review: untranslatable source test: " + why)
     }
