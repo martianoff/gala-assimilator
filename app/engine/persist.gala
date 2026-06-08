@@ -1,0 +1,431 @@
+package engine
+
+// M5 — disk-backed checkpoint persistence. A long assimilation survives quit /
+// crash and resumes (MVP §9): the engine writes a Checkpoint to disk ATOMICALLY
+// and reads it back, distinguishing absence from corruption so a half-written or
+// garbage file never crashes the resume ("surface, don't guess").
+//
+// SERIALIZATION — hand-rolled JSON over GALA std's low-level streaming codec
+// (`json.JsonEncoderImpl` / `json.JsonDecoderImpl`). The high-level `json.Codec[T]`
+// auto-derives only for plain structs; the Checkpoint is a tree of SEALED types
+// (UnitStatus, EngineEvent, ProgressPhase) with payloads, which need an explicit
+// discriminator ("k") to round-trip — so each type gets a faithful encode/decode
+// pair here. The encoder escapes arbitrary string content (real source text, with
+// newlines / quotes), so the round-trip is exact. A leading "v":1 guards against
+// format skew. Limitation: the decode is positional (it relies on the field order
+// this encoder writes), which is fine for our own files; an externally reordered
+// (but still valid-JSON) object is not supported — but a malformed or wrong-version
+// file is caught and surfaced as Corrupt rather than crashing.
+//
+// ATOMICITY — GALA std `fs` has no rename, so the temp-write-then-rename step uses
+// Go's `os.Rename` directly (the same os-interop idiom `fs.gala` itself uses);
+// everything else goes through `martianoff/gala/fs`. os.Rename is atomic within a
+// filesystem, so a crash mid-write leaves either the old file or the new one, never
+// a torn checkpoint.
+//
+// IO lives here, at this deliberate edge (like goscan.gala's scan and the Claude
+// backend); the pure scan / plan / run / gate machinery is untouched, and no acp.*
+// or other internal type crosses the new EnginePort methods.
+
+import (
+    "os"
+    . "martianoff/gala/std"
+    . "martianoff/gala/collection_immutable"
+    "martianoff/gala/fs"
+    json "martianoff/gala/json"
+)
+
+// CheckpointLoad is the sealed result of reading a checkpoint from disk: the
+// restored snapshot, a clean "no file there", or a present-but-unreadable file
+// with the reason. Absence and corruption are DISTINCT — neither is a crash.
+sealed type CheckpointLoad {
+    case Loaded(Value Checkpoint)
+    case Missing()
+    case Corrupt(Reason string)
+}
+
+// ----------------------------------------------------------------------------
+// Save / load (the IO edge)
+// ----------------------------------------------------------------------------
+
+// saveCheckpoint serializes the run's checkpoint and writes it atomically: encode
+// -> write a sibling temp file -> os.Rename over the target. Returns false on any
+// IO failure rather than throwing, so the caller can surface a save failure.
+func saveCheckpoint(state RunState, path string) bool {
+    val cp   = Checkpoint(Units = state.Units, Log = state.Log)
+    val body = encodeCheckpoint(cp)
+    val tmp  = path + ".tmp"
+    if fs.WriteFileString(tmp, body, 420).IsFailure() { return false }
+    return atomicRename(tmp, path).GetOrElse(false)
+}
+
+// loadCheckpoint reads a checkpoint back. Missing file -> Missing; unreadable or
+// undecodable content -> Corrupt(reason); a clean parse -> Loaded.
+func loadCheckpoint(path string) CheckpointLoad {
+    if !fs.Exists(path) { return Missing() }
+    val read = fs.ReadFileString(path)
+    if read.IsFailure() { return Corrupt(Reason = "unreadable checkpoint: " + read.Err.Error()) }
+    val decoded = Try[Checkpoint](() => decodeCheckpoint(read.Get()))
+    if decoded.IsFailure() { return Corrupt(Reason = "undecodable checkpoint: " + decoded.Err.Error()) }
+    return Loaded(Value = decoded.Get())
+}
+
+// atomicRename wraps os.Rename (absent from GALA std fs). os.Rename is atomic on a
+// single filesystem; the Try captures any failure (e.g. cross-device, permissions).
+func atomicRename(from string, to string) Try[bool] = Try[bool](() => {
+    val err = os.Rename(from, to)
+    if err != nil { panic(err) }
+    return true
+})
+
+// ----------------------------------------------------------------------------
+// Encode
+// ----------------------------------------------------------------------------
+
+func encodeCheckpoint(cp Checkpoint) string {
+    val w = json.NewJsonEncoder()
+    w.WriteStartObject()
+    w.WriteKey("v");     w.WriteInt(1)
+    w.WriteKey("units"); encArray[UnitRun](w, cp.Units, encUnitRun)
+    w.WriteKey("log");   encArray[EngineEvent](w, cp.Log, encEngineEvent)
+    w.WriteEndObject()
+    return w.String()
+}
+
+// encArray writes a JSON array, delegating each element to `enc`.
+func encArray[T any](w *json.JsonEncoderImpl, arr Array[T], enc func(*json.JsonEncoderImpl, T)) {
+    w.WriteStartArray()
+    var i = 0
+    for i < arr.Length() {
+        enc(w, arr.Get(i))
+        i = i + 1
+    }
+    w.WriteEndArray()
+}
+
+func encStr(w *json.JsonEncoderImpl, s string) { w.WriteString(s) }
+
+func encUnitId(w *json.JsonEncoderImpl, id UnitId) { w.WriteString(id.Value) }
+func encTaskId(w *json.JsonEncoderImpl, id TaskId) { w.WriteString(id.Value) }
+
+func encUnitRun(w *json.JsonEncoderImpl, u UnitRun) {
+    w.WriteStartObject()
+    w.WriteKey("unit");        encUnitId(w, u.Unit)
+    w.WriteKey("assignment");  encAssignment(w, u.Assignment)
+    w.WriteKey("status");      encUnitStatus(w, u.Status)
+    w.WriteKey("sourceTests"); encArray[SourceTestRef](w, u.SourceTests, encSourceTestRef)
+    w.WriteEndObject()
+}
+
+func encAssignment(w *json.JsonEncoderImpl, a TaskAssignment) {
+    w.WriteStartObject()
+    w.WriteKey("task");   encTaskId(w, a.Task)
+    w.WriteKey("unit");   encUnitId(w, a.Unit)
+    w.WriteKey("source"); encSourceContext(w, a.Source)
+    w.WriteKey("target"); encTargetConventions(w, a.Target)
+    w.WriteKey("priorFailure")
+    if a.PriorFailure.IsDefined() { encPriorFailure(w, a.PriorFailure.Get()) } else { w.WriteNull() }
+    w.WriteKey("answers"); encArray[Answer](w, a.Answers, encAnswer)
+    w.WriteEndObject()
+}
+
+func encSourceContext(w *json.JsonEncoderImpl, s SourceContext) {
+    w.WriteStartObject()
+    w.WriteKey("sourceText");   w.WriteString(s.SourceText)
+    w.WriteKey("dependencies"); encArray[DependencySnippet](w, s.Dependencies, encDependency)
+    w.WriteEndObject()
+}
+
+func encDependency(w *json.JsonEncoderImpl, d DependencySnippet) {
+    w.WriteStartObject()
+    w.WriteKey("name"); w.WriteString(d.Name)
+    w.WriteKey("text"); w.WriteString(d.Text)
+    w.WriteEndObject()
+}
+
+func encTargetConventions(w *json.JsonEncoderImpl, t TargetConventions) {
+    w.WriteStartObject()
+    w.WriteKey("language"); w.WriteString(t.Language)
+    w.WriteKey("notes");    encArray[string](w, t.Notes, encStr)
+    w.WriteEndObject()
+}
+
+func encPriorFailure(w *json.JsonEncoderImpl, pf PriorFailure) {
+    w.WriteStartObject()
+    w.WriteKey("summary"); w.WriteString(pf.Summary)
+    w.WriteKey("flags");   encArray[UnsupportedFlag](w, pf.Flags, encFlag)
+    w.WriteEndObject()
+}
+
+func encFlag(w *json.JsonEncoderImpl, f UnsupportedFlag) {
+    w.WriteStartObject()
+    w.WriteKey("construct"); w.WriteString(f.Construct)
+    w.WriteKey("reason");    w.WriteString(f.Reason)
+    w.WriteEndObject()
+}
+
+func encAnswer(w *json.JsonEncoderImpl, a Answer) {
+    w.WriteStartObject()
+    w.WriteKey("task");     encTaskId(w, a.Task)
+    w.WriteKey("response"); w.WriteString(a.Response)
+    w.WriteEndObject()
+}
+
+func encSourceTestRef(w *json.JsonEncoderImpl, st SourceTestRef) {
+    w.WriteStartObject()
+    w.WriteKey("unit");   encUnitId(w, st.Unit)
+    w.WriteKey("path");   w.WriteString(st.Path)
+    w.WriteKey("source"); w.WriteString(st.Source)
+    w.WriteEndObject()
+}
+
+func encResult(w *json.JsonEncoderImpl, r Result) {
+    w.WriteStartObject()
+    w.WriteKey("task");       encTaskId(w, r.Task)
+    w.WriteKey("targetText"); w.WriteString(r.TargetText)
+    w.WriteKey("rationale");  w.WriteString(r.Rationale)
+    w.WriteKey("flags");      encArray[UnsupportedFlag](w, r.Flags, encFlag)
+    w.WriteEndObject()
+}
+
+func encClarification(w *json.JsonEncoderImpl, c Clarification) {
+    w.WriteStartObject()
+    w.WriteKey("task");     encTaskId(w, c.Task)
+    w.WriteKey("question"); w.WriteString(c.Question)
+    w.WriteEndObject()
+}
+
+// encUnitStatus tags the sealed case with "k" and writes only that case's payload.
+func encUnitStatus(w *json.JsonEncoderImpl, s UnitStatus) {
+    w.WriteStartObject()
+    w.WriteKey("k")
+    s match {
+        case Queued()       => w.WriteString("queued")
+        case Translating()  => w.WriteString("translating")
+        case Verifying()    => w.WriteString("verifying")
+        case Skipped()      => w.WriteString("skipped")
+        case Done(r)        => { w.WriteString("done");    w.WriteKey("output");   encResult(w, r) }
+        case Blocked(c)     => { w.WriteString("blocked"); w.WriteKey("question"); encClarification(w, c) }
+        case Failed(reason) => { w.WriteString("failed");  w.WriteKey("reason");   w.WriteString(reason) }
+    }
+    w.WriteEndObject()
+}
+
+func encProgressUpdate(w *json.JsonEncoderImpl, p ProgressUpdate) {
+    w.WriteStartObject()
+    w.WriteKey("task");  encTaskId(w, p.Task)
+    w.WriteKey("phase"); w.WriteString(phaseToTag(p.Phase))
+    w.WriteKey("note");  w.WriteString(p.Note)
+    w.WriteEndObject()
+}
+
+func phaseToTag(p ProgressPhase) string = p match {
+    case PhaseReading()   => "reading"
+    case PhaseEmitting()  => "emitting"
+    case PhaseVerifying() => "verifying"
+}
+
+// encEngineEvent tags the sealed case with "k" and writes that case's payload.
+func encEngineEvent(w *json.JsonEncoderImpl, e EngineEvent) {
+    w.WriteStartObject()
+    w.WriteKey("k")
+    e match {
+        case EvProgress(unit, ev)    => {
+            w.WriteString("progress")
+            w.WriteKey("unit"); encUnitId(w, unit)
+            w.WriteKey("event"); encProgressUpdate(w, ev)
+        }
+        case EvStatus(unit, status)  => {
+            w.WriteString("status")
+            w.WriteKey("unit"); encUnitId(w, unit)
+            w.WriteKey("status"); encUnitStatus(w, status)
+        }
+    }
+    w.WriteEndObject()
+}
+
+// ----------------------------------------------------------------------------
+// Decode (positional — mirrors the encode order above; a malformed or
+// wrong-version file panics out to the Try in loadCheckpoint -> Corrupt)
+// ----------------------------------------------------------------------------
+
+func decodeCheckpoint(s string) Checkpoint {
+    val d = json.NewJsonDecoder(s)
+    d.StartObject()
+    d.ReadKey(); val v = d.ReadInt()
+    if v != 1 { panic("unsupported checkpoint version") }
+    d.ReadKey(); val units = decArray[UnitRun](d, decUnitRun)
+    d.ReadKey(); val log   = decArray[EngineEvent](d, decEngineEvent)
+    d.EndObject()
+    return Checkpoint(Units = units, Log = log)
+}
+
+// decArray reads a JSON array, delegating each element to `dec`.
+func decArray[T any](d *json.JsonDecoderImpl, dec func(*json.JsonDecoderImpl) T) Array[T] {
+    d.StartArray()
+    var out = EmptyArray[T]()
+    for d.HasMoreElements() {
+        out = out.Append(dec(d))
+    }
+    d.EndArray()
+    return out
+}
+
+func decStr(d *json.JsonDecoderImpl) string = d.ReadString()
+func decUnitId(d *json.JsonDecoderImpl) UnitId = UnitId(Value = d.ReadString())
+func decTaskId(d *json.JsonDecoderImpl) TaskId = TaskId(Value = d.ReadString())
+
+func decUnitRun(d *json.JsonDecoderImpl) UnitRun {
+    d.StartObject()
+    d.ReadKey(); val unit        = decUnitId(d)
+    d.ReadKey(); val assignment  = decAssignment(d)
+    d.ReadKey(); val status      = decUnitStatus(d)
+    d.ReadKey(); val sourceTests = decArray[SourceTestRef](d, decSourceTestRef)
+    d.EndObject()
+    return UnitRun(Unit = unit, Assignment = assignment, Status = status, SourceTests = sourceTests)
+}
+
+func decAssignment(d *json.JsonDecoderImpl) TaskAssignment {
+    d.StartObject()
+    d.ReadKey(); val task   = decTaskId(d)
+    d.ReadKey(); val unit   = decUnitId(d)
+    d.ReadKey(); val source = decSourceContext(d)
+    d.ReadKey(); val target = decTargetConventions(d)
+    d.ReadKey(); val prior  = decOptionPriorFailure(d)
+    d.ReadKey(); val answers = decArray[Answer](d, decAnswer)
+    d.EndObject()
+    return TaskAssignment(
+        Task = task, Unit = unit, Source = source, Target = target,
+        PriorFailure = prior, Answers = answers,
+    )
+}
+
+func decOptionPriorFailure(d *json.JsonDecoderImpl) Option[PriorFailure] {
+    if d.IsNull() { d.ReadNull(); return None[PriorFailure]() }
+    return Some[PriorFailure](decPriorFailure(d))
+}
+
+func decSourceContext(d *json.JsonDecoderImpl) SourceContext {
+    d.StartObject()
+    d.ReadKey(); val text = d.ReadString()
+    d.ReadKey(); val deps = decArray[DependencySnippet](d, decDependency)
+    d.EndObject()
+    return SourceContext(SourceText = text, Dependencies = deps)
+}
+
+func decDependency(d *json.JsonDecoderImpl) DependencySnippet {
+    d.StartObject()
+    d.ReadKey(); val name = d.ReadString()
+    d.ReadKey(); val text = d.ReadString()
+    d.EndObject()
+    return DependencySnippet(Name = name, Text = text)
+}
+
+func decTargetConventions(d *json.JsonDecoderImpl) TargetConventions {
+    d.StartObject()
+    d.ReadKey(); val lang  = d.ReadString()
+    d.ReadKey(); val notes = decArray[string](d, decStr)
+    d.EndObject()
+    return TargetConventions(Language = lang, Notes = notes)
+}
+
+func decPriorFailure(d *json.JsonDecoderImpl) PriorFailure {
+    d.StartObject()
+    d.ReadKey(); val summary = d.ReadString()
+    d.ReadKey(); val flags   = decArray[UnsupportedFlag](d, decFlag)
+    d.EndObject()
+    return PriorFailure(Summary = summary, Flags = flags)
+}
+
+func decFlag(d *json.JsonDecoderImpl) UnsupportedFlag {
+    d.StartObject()
+    d.ReadKey(); val construct = d.ReadString()
+    d.ReadKey(); val reason    = d.ReadString()
+    d.EndObject()
+    return UnsupportedFlag(Construct = construct, Reason = reason)
+}
+
+func decAnswer(d *json.JsonDecoderImpl) Answer {
+    d.StartObject()
+    d.ReadKey(); val task     = decTaskId(d)
+    d.ReadKey(); val response = d.ReadString()
+    d.EndObject()
+    return Answer(Task = task, Response = response)
+}
+
+func decSourceTestRef(d *json.JsonDecoderImpl) SourceTestRef {
+    d.StartObject()
+    d.ReadKey(); val unit   = decUnitId(d)
+    d.ReadKey(); val path   = d.ReadString()
+    d.ReadKey(); val source = d.ReadString()
+    d.EndObject()
+    return SourceTestRef(Unit = unit, Path = path, Source = source)
+}
+
+func decResult(d *json.JsonDecoderImpl) Result {
+    d.StartObject()
+    d.ReadKey(); val task   = decTaskId(d)
+    d.ReadKey(); val target = d.ReadString()
+    d.ReadKey(); val rat    = d.ReadString()
+    d.ReadKey(); val flags  = decArray[UnsupportedFlag](d, decFlag)
+    d.EndObject()
+    return Result(Task = task, TargetText = target, Rationale = rat, Flags = flags)
+}
+
+func decClarification(d *json.JsonDecoderImpl) Clarification {
+    d.StartObject()
+    d.ReadKey(); val task     = decTaskId(d)
+    d.ReadKey(); val question = d.ReadString()
+    d.EndObject()
+    return Clarification(Task = task, Question = question)
+}
+
+func decUnitStatus(d *json.JsonDecoderImpl) UnitStatus {
+    d.StartObject()
+    d.ReadKey(); val tag = d.ReadString()
+    val status = decUnitStatusByTag(d, tag)
+    d.EndObject()
+    return status
+}
+
+func decUnitStatusByTag(d *json.JsonDecoderImpl, tag string) UnitStatus {
+    if tag == "queued"      { return Queued() }
+    if tag == "translating" { return Translating() }
+    if tag == "verifying"   { return Verifying() }
+    if tag == "skipped"     { return Skipped() }
+    if tag == "done"        { d.ReadKey(); return Done(Output = decResult(d)) }
+    if tag == "blocked"     { d.ReadKey(); return Blocked(Question = decClarification(d)) }
+    if tag == "failed"      { d.ReadKey(); val r = d.ReadString(); return Failed(Reason = r) }
+    panic("unknown UnitStatus tag: " + tag)
+}
+
+func decProgressUpdate(d *json.JsonDecoderImpl) ProgressUpdate {
+    d.StartObject()
+    d.ReadKey(); val task  = decTaskId(d)
+    d.ReadKey(); val phase = phaseFromTag(d.ReadString())
+    d.ReadKey(); val note  = d.ReadString()
+    d.EndObject()
+    return ProgressUpdate(Task = task, Phase = phase, Note = note)
+}
+
+func decEngineEvent(d *json.JsonDecoderImpl) EngineEvent {
+    d.StartObject()
+    d.ReadKey(); val tag = d.ReadString()
+    val ev = decEngineEventByTag(d, tag)
+    d.EndObject()
+    return ev
+}
+
+func decEngineEventByTag(d *json.JsonDecoderImpl, tag string) EngineEvent {
+    if tag == "progress" {
+        d.ReadKey(); val unit = decUnitId(d)
+        d.ReadKey(); val event = decProgressUpdate(d)
+        return EvProgress(Unit = unit, Event = event)
+    }
+    if tag == "status" {
+        d.ReadKey(); val unit = decUnitId(d)
+        d.ReadKey(); val status = decUnitStatus(d)
+        return EvStatus(Unit = unit, Status = status)
+    }
+    panic("unknown EngineEvent tag: " + tag)
+}

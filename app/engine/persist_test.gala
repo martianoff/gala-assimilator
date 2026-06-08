@@ -1,0 +1,142 @@
+package engine
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// Tests for M5 disk-backed checkpoint persistence: an exact save/load round-trip,
+// kill-and-resume (a run saved mid-flight finishes from disk without re-translating
+// already-Done units), and the distinct Corrupt / Missing load outcomes. Every test
+// does REAL filesystem IO in a fresh temp dir (fs.MkdirTemp) — `gala test` runs from
+// a build dir and does not stage testdata/, so checkpoints are materialized at
+// runtime. Shared helpers (scanned) live in port_test.gala.
+
+func tempCkptDir() string = fs.MkdirTemp("", "gala_ckpt").GetOrElse("")
+
+// ----------------------------------------------------------------------------
+// Round-trip: Save then Load reconstructs an equal checkpoint.
+// ----------------------------------------------------------------------------
+
+// A run advanced a couple of ticks (so it has unit-status payloads AND a non-empty
+// event log) round-trips exactly: re-encoding the loaded checkpoint yields byte-for
+// -byte the same JSON as the original (the encoding is deterministic and faithful).
+func TestCheckpointRoundTripExact(t T) T {
+    val p   = path.Join(tempCkptDir(), "cp.json")
+    val eng = MockEngine()
+    val mid = eng.Advance(eng.Advance(scanned(eng)))
+    val t1  = Eq(t, eng.SaveCheckpoint(mid, p), true)
+    return eng.LoadCheckpoint(p) match {
+        case Loaded(cp) => {
+            val original = encodeCheckpoint(Checkpoint(Units = mid.Units, Log = mid.Log))
+            val restored = encodeCheckpoint(cp)
+            val t2 = Eq(t1, cp.Units.Length(), mid.Units.Length())
+            val t3 = Eq(t2, cp.Log.Length(), mid.Log.Length())
+            return Eq(t3, restored, original)
+        }
+        case Missing()  => Fail(t1, "expected Loaded, got Missing")
+        case Corrupt(r) => Fail(t1, "expected Loaded, got Corrupt: " + r)
+    }
+}
+
+// A real source unit's text (newlines, quotes) survives the round-trip via the
+// SourceTests/Source payloads — proving arbitrary string content is escaped faithfully.
+func TestCheckpointRoundTripRealSource(t T) T {
+    val p    = path.Join(tempCkptDir(), "real.json")
+    val port = GoEngine()
+    val root = materializeFixture()
+    val mid  = RunToCompletion(port, port.Run(port.Plan(port.Scan(ScanRequest(Root = root)))))
+    val t1   = Eq(t, port.SaveCheckpoint(mid, p), true)
+    return port.LoadCheckpoint(p) match {
+        case Loaded(cp) =>
+            Eq(t1, encodeCheckpoint(cp), encodeCheckpoint(Checkpoint(Units = mid.Units, Log = mid.Log)))
+        case Missing()  => Fail(t1, "expected Loaded, got Missing")
+        case Corrupt(r) => Fail(t1, "expected Loaded, got Corrupt: " + r)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Kill-and-resume: save mid-run, load, finish WITHOUT re-translating Done units.
+// ----------------------------------------------------------------------------
+
+// Drive the first unit all the way to Done (3 ticks), save, then resume the loaded
+// checkpoint into a FAIL engine whose translator aborts every submission. The
+// already-Done unit stays Done (it is never re-submitted — a re-translation would
+// have driven it to Failed), while the still-Queued units hit the fail runner. So
+// exactly the one pre-Done unit survives: the resume picked up from disk and did
+// not redo finished work.
+func TestKillAndResumeSkipsDoneUnits(t T) T {
+    val p   = path.Join(tempCkptDir(), "mid.json")
+    val eng = MockEngine()
+    val mid = eng.Advance(eng.Advance(eng.Advance(scanned(eng))))
+    val t1  = Eq(t, CountByDone(mid), 1)               // unit 0 reached Done
+    val t2  = Eq(t1, eng.SaveCheckpoint(mid, p), true)
+
+    val failEng = MockEngineWith(ScriptedRunner(abortOutcome("must not re-run a Done unit"), cancelledAck()))
+    return failEng.LoadCheckpoint(p) match {
+        case Loaded(cp) => {
+            val final = RunToCompletion(failEng, failEng.Resume(cp))
+            val t3 = Eq(t2, CountByDone(final), 1)      // ONLY the pre-Done unit is Done
+            return final.Units.Get(0).Status match {
+                case Done(_) => IsTrue(t3, true)        // it survived without re-translation
+                case _       => Fail(t3, "resumed Done unit must NOT be re-translated")
+            }
+        }
+        case Missing()  => Fail(t2, "expected Loaded, got Missing")
+        case Corrupt(r) => Fail(t2, "expected Loaded, got Corrupt: " + r)
+    }
+}
+
+// The happy resume also completes: loaded into the normal engine, RunToCompletion
+// drives every remaining unit to Done (4 total) — no loss across the save/load.
+func TestResumeCompletesRun(t T) T {
+    val p   = path.Join(tempCkptDir(), "resume.json")
+    val eng = MockEngine()
+    val mid = eng.Advance(eng.Advance(eng.Advance(scanned(eng))))
+    val t1  = Eq(t, eng.SaveCheckpoint(mid, p), true)
+    return eng.LoadCheckpoint(p) match {
+        case Loaded(cp) => Eq(t1, CountByDone(RunToCompletion(eng, eng.Resume(cp))), 4)
+        case Missing()  => Fail(t1, "expected Loaded, got Missing")
+        case Corrupt(r) => Fail(t1, "expected Loaded, got Corrupt: " + r)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Corrupt vs Missing — distinct, never a crash.
+// ----------------------------------------------------------------------------
+
+// A present-but-garbage file loads as Corrupt (the decoder fails out to a Try),
+// never Loaded and never a crash.
+func TestLoadCorruptFile(t T) T {
+    val p = path.Join(tempCkptDir(), "bad.json")
+    fs.WriteFileString(p, "{ this is not a checkpoint at all ", 420)
+    return MockEngine().LoadCheckpoint(p) match {
+        case Corrupt(_) => IsTrue(t, true)
+        case Loaded(_)  => Fail(t, "garbage must load as Corrupt, not Loaded")
+        case Missing()  => Fail(t, "the file exists -> Corrupt, not Missing")
+    }
+}
+
+// A wrong-version-but-valid-JSON file is also Corrupt (surface, don't guess).
+func TestLoadWrongVersion(t T) T {
+    val p = path.Join(tempCkptDir(), "v9.json")
+    fs.WriteFileString(p, "{\"v\":9,\"units\":[],\"log\":[]}", 420)
+    return MockEngine().LoadCheckpoint(p) match {
+        case Corrupt(_) => IsTrue(t, true)
+        case Loaded(_)  => Fail(t, "an unknown version must be Corrupt")
+        case Missing()  => Fail(t, "the file exists -> Corrupt, not Missing")
+    }
+}
+
+// An absent path loads as Missing — distinct from Corrupt.
+func TestLoadMissingFile(t T) T {
+    val p = path.Join(tempCkptDir(), "does-not-exist.json")
+    return MockEngine().LoadCheckpoint(p) match {
+        case Missing()  => IsTrue(t, true)
+        case Loaded(_)  => Fail(t, "no file -> Missing")
+        case Corrupt(_) => Fail(t, "no file -> Missing, not Corrupt")
+    }
+}

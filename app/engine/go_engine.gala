@@ -40,9 +40,11 @@ func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarifi
     Advance       = (s RunState) => advance(runner, verifier, s),
     Events        = (s RunState) => s.Log,
     ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
-    AnswerBlocker = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
-    Checkpoint    = (s RunState) => Checkpoint(Units = s.Units, Log = s.Log),
-    Resume        = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
+    AnswerBlocker  = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
+    Checkpoint     = (s RunState) => Checkpoint(Units = s.Units, Log = s.Log),
+    Resume         = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
+    SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
+    LoadCheckpoint = (path string) => loadCheckpoint(path),
 )
 
 // goPlanFor builds the plan from a scanned workspace, threading each unit's REAL
