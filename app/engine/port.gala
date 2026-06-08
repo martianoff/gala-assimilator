@@ -114,16 +114,22 @@ struct StepResult(
 // ----------------------------------------------------------------------------
 
 // EnginePort is the engine's whole public surface. The UI depends only on this.
+//
+// Checkpoint / Resume snapshot a run in memory; SaveCheckpoint / LoadCheckpoint
+// persist that snapshot to disk so a run survives quit / crash (M5). All types
+// crossing the port are pure domain values — no acp.*, no gala_tui.
 struct EnginePort(
-    Scan          func(ScanRequest) WorkspaceModel,
-    Plan          func(WorkspaceModel) MigrationPlan,
-    Run           func(MigrationPlan) RunState,
-    Advance       func(RunState) RunState,
-    Events        func(RunState) Array[EngineEvent],
-    ActOnUnit     func(RunState, UnitId, UnitAction) RunState,
-    AnswerBlocker func(RunState, UnitId, Answer) RunState,
-    Checkpoint    func(RunState) Checkpoint,
-    Resume        func(Checkpoint) RunState,
+    Scan           func(ScanRequest) WorkspaceModel,
+    Plan           func(WorkspaceModel) MigrationPlan,
+    Run            func(MigrationPlan) RunState,
+    Advance        func(RunState) RunState,
+    Events         func(RunState) Array[EngineEvent],
+    ActOnUnit      func(RunState, UnitId, UnitAction) RunState,
+    AnswerBlocker  func(RunState, UnitId, Answer) RunState,
+    Checkpoint     func(RunState) Checkpoint,
+    Resume         func(Checkpoint) RunState,
+    SaveCheckpoint func(RunState, string) bool,
+    LoadCheckpoint func(string) CheckpointLoad,
 )
 
 // ----------------------------------------------------------------------------
@@ -150,9 +156,11 @@ func MockEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clari
     Advance       = (s RunState) => advance(runner, verifier, s),
     Events        = (s RunState) => s.Log,
     ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
-    AnswerBlocker = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
-    Checkpoint    = (s RunState) => Checkpoint(Units = s.Units, Log = s.Log),
-    Resume        = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
+    AnswerBlocker  = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
+    Checkpoint     = (s RunState) => Checkpoint(Units = s.Units, Log = s.Log),
+    Resume         = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
+    SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
+    LoadCheckpoint = (path string) => loadCheckpoint(path),
 )
 
 // ----------------------------------------------------------------------------
