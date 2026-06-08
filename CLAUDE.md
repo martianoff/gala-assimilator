@@ -2,17 +2,20 @@
 
 A TUI tool, written in **GALA** (transpiles to Go) and built on the
 [`gala_tui`](https://github.com/martianoff/gala-tui) Elm-architecture framework,
-that migrates a project/library from one language to another. The first
-supported source language is GALA itself; the architecture is built so new
-language frontends and backends plug in behind stable ports.
+that migrates a project/library from one language to another by **orchestrating
+AI agents** through a translate → verify → fix loop (0 % → 100 %). The first
+supported pair is **Go → GALA**; the architecture is built so a new language
+frontend/backend — or a new agent backend — plugs in behind stable ports.
 
 ## Must read
 
 - **[docs/architecture.md](docs/architecture.md)** — component map + the layering
-  invariant. The migration engine is transport-neutral and sits behind a port;
-  the TUI consumes that port. Engine internals (parsers, IR, emitters) MUST NOT
-  leak into the `app/ui` layer, and the UI's widget/model types MUST NOT leak
-  into the engine. Skim it before editing across that seam.
+  invariant. The migration engine is transport-neutral and sits behind a port
+  (`EnginePort`); the TUI consumes that port. Engine internals (the agent-run
+  contract, the Go frontend, the verify gate, run state) MUST NOT leak into the
+  `app/ui` layer, and the UI's widget/model types MUST NOT leak into the engine.
+  In particular the `gala-acp` run-contract types never cross the port. Skim it
+  before editing across that seam.
 
 ## How this project is built and tested
 

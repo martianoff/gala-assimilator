@@ -22,6 +22,10 @@ import (
 func blockingEngine() engine.EnginePort =
     engine.ScriptedBlockerEngine("Is x nullable?")
 
+// blockingFactory makes the model's active port the (offline) blocking engine,
+// so MRunTick advances units to Blocked. Never returns the live Claude backend.
+func blockingFactory() func(string) engine.EnginePort = (name string) => blockingEngine()
+
 func blockedAt(m Model, idx int) bool = m.Run match {
     case Some(rs) => runview.IsBlockedAt(rs, idx)
     case None()   => false
@@ -39,7 +43,7 @@ func TestAnswerBlockerLeavesBlocked(t T) T {
     val ws = port.Scan(engine.ScanRequest(Root = "/x"))
     val plan = port.Plan(ws)
     val st = port.Run(plan)
-    val program = NewProgram(port, 100, 20)
+    val program = NewProgram(blockingFactory(), 100, 20)
     val h = harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 100, 20)
 
     // Run the first unit to Blocked (Queued→Translating→Verifying→clarification).
@@ -75,7 +79,7 @@ func TestBlockerBadgeOpensS5(t T) T {
 }
 
 func NewHarnessOnRun(port engine.EnginePort, ws engine.WorkspaceModel, st engine.RunState) harness.Session[Model, Msg] {
-    val h = harness.NewHarnessFull[Model, Msg](NewProgram(port, 100, 20), (e) => inputToMsg(e), 100, 20)
+    val h = harness.NewHarnessFull[Model, Msg](NewProgram(blockingFactory(), 100, 20), (e) => inputToMsg(e), 100, 20)
     return h.Start()
         .SendMsg(MScanPlanned(Workspace = ws, Plan = port.Plan(ws)))
         .SendMsg(MRunStarted(State = st))

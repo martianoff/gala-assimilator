@@ -23,7 +23,7 @@ func onS4Done(cols int, rows int) Model {
     val st = port.Run(plan)
     val setup = ArrayOf[Msg](MScanPlanned(Workspace = ws, Plan = plan), MRunStarted(State = st))
     val msgs = setup.AppendAll(ticks(3)).Append(MOpenUnit())
-    val (m1, _) = StepAll(NewProgram(port, cols, rows), msgs)
+    val (m1, _) = StepAll(NewProgram(mockFactory(), cols, rows), msgs)
     return m1
 }
 

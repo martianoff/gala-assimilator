@@ -13,19 +13,21 @@ import (
 // RunApp injects the engine's public port and launches the app.
 // ============================================================================
 
-// NewProgram builds the Elm triple for the given engine port and viewport.
-// Exposed so tests construct the exact same Program.
-func NewProgram(port engine.EnginePort, cols int, rows int) Program[Model, Msg] =
+// NewProgram builds the Elm triple for the given engine-port factory and
+// viewport. The factory (name → EnginePort) lets the S1 backend choice decide
+// which engine runs. Exposed so tests construct the exact same Program.
+func NewProgram(makePort func(string) engine.EnginePort, cols int, rows int) Program[Model, Msg] =
     Program[Model, Msg](
-        Initial = NewModel(port, cols, rows),
+        Initial = NewModel(makePort, cols, rows),
         Update  = (m, msg) => update(m, msg),
         View    = (m) => view(m),
     )
 
-// RunApp launches the TUI against `port`, sizing the initial model to the live
-// terminal. Returns the final model when the user quits.
-func RunApp(port engine.EnginePort) Model {
+// RunApp launches the TUI against the given engine-port factory, sizing the
+// initial model to the live terminal. Returns the final model when the user
+// quits.
+func RunApp(makePort func(string) engine.EnginePort) Model {
     val (w, h) = TermSize()
-    val program = NewProgram(port, w, h)
+    val program = NewProgram(makePort, w, h)
     return RunWithMouse[Model, Msg](program, (ev) => inputToMsg(ev), NoSubs[Msg]())
 }

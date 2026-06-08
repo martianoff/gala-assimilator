@@ -5,10 +5,11 @@ import (
     "github.com/martianoff/gala-assimilator/app/engine"
 )
 
-// Entry point: wire the engine's public port into the TUI and launch it.
-// GoEngine() scans the real Go project the user points S1 at and drives it
-// through the same port the UI consumes; swap to engine.MockEngine() for a
-// deterministic fixture-only run. The UI drives whatever port it is given.
+// Entry point: hand the TUI the engine's backend factory. The S1 "Agent
+// backend" choice (Go / Mock / Claude) decides which name is passed to
+// engine.SelectBackend when a scan starts, and that port drives the run —
+// "claude" is the live backend, "go"/"mock" stay offline. The UI never picks
+// the engine itself; it just drives whatever the factory returns.
 func main() {
-    RunApp(engine.GoEngine())
+    RunApp((name string) => engine.SelectBackend(name))
 }
