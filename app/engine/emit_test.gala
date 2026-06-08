@@ -1,0 +1,60 @@
+package engine
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// Tests for the emit / integrate step: scan + run the mathx/main fixture, emit it
+// to a fresh temp dir, and assert the on-disk tree — structure-preserving target
+// dirs, a per-package gala.mod with the mapped target module path, and each Done
+// unit's .gala file present with its TargetText. Real filesystem IO in temp dirs
+// (fs.MkdirTemp) — `gala test` does not stage testdata/. materializeFixture lives
+// in goscan_test.gala.
+
+// The emitted tree mirrors the source packages: a root + mathx gala.mod with
+// "_gala"-suffixed module paths, and main / add / add_test as .gala files.
+func TestEmitWritesProjectTree(t T) T {
+    val src   = materializeFixture()
+    val out   = fs.MkdirTemp("", "gala_emit").GetOrElse("")
+    val port  = GoEngine()
+    val model = port.Scan(ScanRequest(Root = src))
+    val final = RunToCompletion(port, port.Run(port.Plan(model)))
+
+    val t1 = port.Integrate(final, model, out) match {
+        case Integrated(files)  => Eq(t, files.Length(), 5) // 2 gala.mod + 3 units
+        case IntegrateFailed(r) => Fail(t, "integrate failed: " + r)
+    }
+
+    // Per-package gala.mod carries the mapped (suffixed) target module path.
+    val rootMod  = fs.ReadFileString(path.Join(out, "gala.mod")).GetOrElse("")
+    val t2 = Eq(t1, strings.Contains(rootMod, "module example.com/simpleproj_gala"), true)
+    val mathxMod = fs.ReadFileString(path.Join(out, "mathx", "gala.mod")).GetOrElse("")
+    val t3 = Eq(t2, strings.Contains(mathxMod, "module example.com/simpleproj/mathx_gala"), true)
+
+    // Each unit's emitted text is written to its target path (.go -> .gala, layout
+    // preserved). With the mock translator that text is the placeholder.
+    val mainOut = fs.ReadFileString(path.Join(out, "main.gala")).GetOrElse("")
+    val t4 = Eq(t3, mainOut, "// mock translation")
+    val t5 = Eq(t4, fs.Exists(path.Join(out, "mathx", "add.gala")), true)
+    return Eq(t5, fs.Exists(path.Join(out, "mathx", "add_test.gala")), true)
+}
+
+// targetModulePath is the single source->target module mapping seam: source path
+// in, "_gala"-suffixed path out.
+func TestTargetModuleMapping(t T) T =
+    Eq(t, targetModulePath("example.com/proj"), "example.com/proj_gala")
+
+// A path that would escape the output root is refused, never written.
+func TestEmitRefusesOutOfRoot(t T) T {
+    val out = fs.MkdirTemp("", "gala_emit_guard").GetOrElse("")
+    val plan = ArrayOf[fileWrite](fileWrite(Path = path.Join(out, "../escape.gala"), Content = "x"))
+    return writeAll(plan, path.Clean(out)) match {
+        case IntegrateFailed(r) => Eq(t, strings.Contains(r, "outside output root"), true)
+        case Integrated(_)      => Fail(t, "a path escaping the root must be refused")
+    }
+}

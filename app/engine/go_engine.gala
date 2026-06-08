@@ -45,6 +45,7 @@ func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarifi
     Resume         = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
     SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
     LoadCheckpoint = (path string) => loadCheckpoint(path),
+    Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
 )
 
 // goPlanFor builds the plan from a scanned workspace, threading each unit's REAL
