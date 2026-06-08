@@ -3,6 +3,7 @@ package ui
 import (
     . "github.com/martianoff/gala-tui"
     "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
 )
 
 // ============================================================================
@@ -23,11 +24,27 @@ func NewProgram(makePort func(string) engine.EnginePort, cols int, rows int) Pro
         View    = (m) => view(m),
     )
 
-// RunApp launches the TUI against the given engine-port factory, sizing the
-// initial model to the live terminal. Returns the final model when the user
-// quits.
+// NewProgramResume is NewProgram seeded with a launch checkpoint probe (S0
+// resume/corrupt prompt) and auto-save enabled.
+func NewProgramResume(
+    makePort func(string) engine.EnginePort,
+    offer runview.LoadSummary,
+    cols int,
+    rows int,
+) Program[Model, Msg] =
+    Program[Model, Msg](
+        Initial = NewModelResume(makePort, offer, true, cols, rows),
+        Update  = (m, msg) => update(m, msg),
+        View    = (m) => view(m),
+    )
+
+// RunApp launches the TUI against the given engine-port factory. On startup it
+// probes the default project's checkpoint (IO here, before the pure loop) and
+// offers Resume / Start fresh accordingly; auto-save is on for the live run.
 func RunApp(makePort func(string) engine.EnginePort) Model {
     val (w, h) = TermSize()
-    val program = NewProgram(makePort, w, h)
+    val probePort = makePort(BackendName(GoBackend()))
+    val offer = runview.ClassifyLoad(probePort.LoadCheckpoint(CheckpointPath(DefaultSourceDir())))
+    val program = NewProgramResume(makePort, offer, w, h)
     return RunWithMouse[Model, Msg](program, (ev) => inputToMsg(ev), NoSubs[Msg]())
 }

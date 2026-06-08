@@ -2,6 +2,7 @@ package ui
 
 import (
     "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
 )
@@ -19,11 +20,13 @@ import (
 // ============================================================================
 
 // Route tokens for the ScreenStack.
+func RouteS0() string = "S0"   // Resume / corrupt-checkpoint launch prompt
 func RouteS1() string = "S1"   // Setup / Interview
 func RouteS2() string = "S2"   // Plan summary
 func RouteS3() string = "S3"   // Assimilation dashboard
 func RouteS4() string = "S4"   // Unit / diff review
 func RouteS5() string = "S5"   // Blocker / clarification
+func RouteS6() string = "S6"   // Run report (+ resume affordance)
 
 // S1 focus pane ids — order defines the Tab ring.
 func PaneBrowse() string      = "browse"
@@ -89,6 +92,10 @@ struct Model(
     LogScroll  int,   // lines scrolled up from the tail (0 = following latest)
     // S5 clarification answer buffer (the unit under review/answer is TreeCursor)
     AnswerText string,
+    // checkpoint / resume
+    Persist     bool,                         // auto-save the run during ticks (app: on; tests: off)
+    ResumeOffer Option[runview.LoadSummary],  // a checkpoint found at launch (S0 prompt)
+    LastSaveOk  bool,                         // last auto-save result (S3 indicator)
 )
 
 // browseDirs is the small set of sample project paths the Browse control cycles.
@@ -129,6 +136,34 @@ func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model
         TreeCursor = 0,
         LogScroll  = 0,
         AnswerText = "",
+        Persist     = false,
+        ResumeOffer = None[runview.LoadSummary](),
+        LastSaveOk  = true,
+    )
+}
+
+// DefaultSourceDir is the project the launch resume-probe checks.
+func DefaultSourceDir() string = browseDirs().Get(0)
+
+// NewModelResume seeds the model from a launch checkpoint probe. A "loaded" or
+// "corrupt" summary opens the S0 prompt on top of S1 (so Start fresh falls back
+// to S1); "missing" is just a normal S1 start. `persist` enables auto-save during
+// the run (the app passes true; tests pass false to stay IO-free).
+func NewModelResume(
+    makePort func(string) engine.EnginePort,
+    offer runview.LoadSummary,
+    persist bool,
+    cols int,
+    rows int,
+) Model {
+    val base = NewModel(makePort, cols, rows)
+    if (offer.Kind == "missing") {
+        return base.Copy(Persist = persist)
+    }
+    return base.Copy(
+        Persist     = persist,
+        ResumeOffer = Some(offer),
+        Screens     = base.Screens.Push(RouteS0()),
     )
 }
 

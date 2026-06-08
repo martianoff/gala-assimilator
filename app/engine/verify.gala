@@ -101,3 +101,31 @@ func isSourceTest(k UnitKind) bool = k match {
     case SourceUnit() => false
     case AddedTest()  => false
 }
+
+// ----------------------------------------------------------------------------
+// Coverage surfacing — "no source test" is NOT a clean pass
+// ----------------------------------------------------------------------------
+
+// unverifiedConstruct is the UnsupportedFlag.Construct tag the gate stamps on a
+// translation that cleared verification with NO 1:1 source test behind it. A unit
+// whose package has no SourceTest passes the gate only VACUOUSLY — there is nothing
+// to contradict the translation, so there is also zero correctness signal. Per the
+// product invariant ("surface, don't guess") that result is flagged unverified
+// rather than presented as a clean Done; the flag rides the result's existing
+// Flags channel so the UI can render it and a checkpoint round-trips it.
+val unverifiedConstruct = "unverified"
+
+// withCoverageFlag returns the result unchanged when the unit had 1:1 source tests
+// (a real signal), and stamps the unverified flag when it had none.
+func withCoverageFlag(r Result, sourceTests Array[SourceTestRef]) Result {
+    if sourceTests.Length() > 0 { return r }
+    return r.Copy(Flags = r.Flags.Append(UnsupportedFlag(
+        Construct = unverifiedConstruct,
+        Reason    = "no 1:1 source test covers this unit; the gate passed vacuously",
+    )))
+}
+
+// IsUnverified reports whether a Result carries the unverified-coverage flag — the
+// public read for "this translation has no source-test signal behind it".
+func IsUnverified(r Result) bool =
+    r.Flags.Exists((f UnsupportedFlag) => f.Construct == unverifiedConstruct)

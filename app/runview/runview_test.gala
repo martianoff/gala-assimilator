@@ -173,6 +173,33 @@ func TestProjectPlan(t T) T {
     return IsTrue(t2, pv.Items.Exists((id) => id == "core/value"))
 }
 
+// ----- ClassifyLoad ---------------------------------------------------------
+
+func TestClassifyLoaded(t T) T {
+    val units = ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Queued()))
+    val cp = Checkpoint(Units = units, Log = EmptyArray[EngineEvent]())
+    val s = ClassifyLoad(Loaded(Value = cp))
+    val t1 = Eq(t,  s.Kind, "loaded")
+    val t2 = Eq(t1, s.Done, 1)
+    val t3 = Eq(t2, s.Total, 2)
+    return IsTrue(t3, s.Cp.IsDefined())
+}
+
+func TestClassifyMissing(t T) T {
+    val s = ClassifyLoad(Missing())
+    val t1 = Eq(t, s.Kind, "missing")
+    return IsTrue(t1, s.Cp.IsEmpty())
+}
+
+func TestClassifyCorrupt(t T) T {
+    val s = ClassifyLoad(Corrupt(Reason = "bad json"))
+    val t1 = Eq(t, s.Kind, "corrupt")
+    val t2 = Eq(t1, s.Reason, "bad json")
+    return IsTrue(t2, s.Cp.IsEmpty())
+}
+
 func planItem(id string) PlanItem =
     PlanItem(
         Unit   = UnitId(Value = id),
