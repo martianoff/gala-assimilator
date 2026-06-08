@@ -263,3 +263,37 @@ func FirstBlocked(rs RunState) Option[int] {
 
 // BlockedCount is how many units await a clarification answer.
 func BlockedCount(rs RunState) int = countWhere(rs, isBlocked)
+
+// ============================================================================
+// Checkpoint load → UI summary
+// ============================================================================
+
+// LoadSummary is a CheckpointLoad projected for the UI: a plain kind token plus
+// the done/total figures for the resume offer (when loaded), the reason (when
+// corrupt), and the checkpoint itself (opaque to the UI — handed back to
+// port.Resume on accept). The UI switches on Kind (a string), never matching
+// the engine's sealed CheckpointLoad.
+struct LoadSummary(
+    Kind   string,            // "loaded" | "missing" | "corrupt"
+    Done   int,
+    Total  int,
+    Reason string,
+    Cp     Option[Checkpoint],
+)
+
+func ClassifyLoad(load CheckpointLoad) LoadSummary = load match {
+    case Loaded(cp) => LoadSummary(
+        Kind   = "loaded",
+        Done   = doneInUnits(cp.Units),
+        Total  = cp.Units.Length(),
+        Reason = "",
+        Cp     = Some(cp),
+    )
+    case Missing()  => LoadSummary(
+        Kind = "missing", Done = 0, Total = 0, Reason = "", Cp = None[Checkpoint]())
+    case Corrupt(r) => LoadSummary(
+        Kind = "corrupt", Done = 0, Total = 0, Reason = r, Cp = None[Checkpoint]())
+}
+
+func doneInUnits(units Array[UnitRun]) int =
+    units.Count((u UnitRun) => isDone(u.Status))

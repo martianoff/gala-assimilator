@@ -61,6 +61,14 @@ sealed type Msg {
     case MReviewEdit()
     case MAnswerSubmit()
 
+    // checkpoint / resume
+    case MResumeAccept()                       // S0: resume from the offered checkpoint
+    case MStartFresh()                         // S0: discard the offer, go to S1
+    case MOpenReport()                         // S3 → S6 report
+    case MResumeFromDisk()                     // S6: reload the checkpoint and resume
+    case MResumeLoaded(Load engine.CheckpointLoad)
+    case MCheckpointSaved(Ok bool)
+
     // engine + runtime
     case MScanPlanned(Workspace engine.WorkspaceModel, Plan engine.MigrationPlan)
     case MRunStarted(State engine.RunState)
@@ -112,6 +120,13 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MReviewEdit()   => (m, NoCmd[Msg]())   // edit-prompt: stub this round
     case MAnswerSubmit() => submitAnswer(m)
 
+    case MResumeAccept()    => resumeAccept(m)
+    case MStartFresh()      => (m.Copy(Screens = m.Screens.Pop(), ResumeOffer = None[runview.LoadSummary]()), NoCmd[Msg]())
+    case MOpenReport()      => (m.Copy(Screens = m.Screens.Push(RouteS6())), NoCmd[Msg]())
+    case MResumeFromDisk()  => (m, loadCmd(m.Port, m.SourceDir))
+    case MResumeLoaded(load) => resumeLoaded(m, load)
+    case MCheckpointSaved(ok) => (m.Copy(LastSaveOk = ok), NoCmd[Msg]())
+
     case MScanPlanned(ws, plan) => (scanPlanned(m, ws, plan), NoCmd[Msg]())
     case MRunStarted(st)        => runStarted(m, st)
     case MRunTick()             => runTick(m)
@@ -140,6 +155,7 @@ func otherS3(p string) string = if (p == PaneTree()) PaneLog() else PaneTree()
 
 func activate(m Model) Tuple[Model, Cmd[Msg]] {
     val r = m.Screens.Current()
+    if (r == RouteS0()) { return s0Activate(m) }
     if (r == RouteS1()) { return s1Activate(m) }
     if (r == RouteS2()) {
         if (m.S2Focus == PaneStart()) { return startRun(m) }
@@ -147,7 +163,17 @@ func activate(m Model) Tuple[Model, Cmd[Msg]] {
     }
     if (r == RouteS3()) { return openUnit(m) }
     if (r == RouteS5()) { return submitAnswer(m) }
+    if (r == RouteS6()) { return (m, loadCmd(m.Port, m.SourceDir)) }   // resume from disk
     return noCmd(m)
+}
+
+// s0Activate: Enter resumes when a checkpoint loaded, else starts fresh.
+func s0Activate(m Model) Tuple[Model, Cmd[Msg]] = m.ResumeOffer match {
+    case Some(offer) => {
+        if (offer.Kind == "loaded") { return resumeAccept(m) }
+        return (m.Copy(Screens = m.Screens.Pop(), ResumeOffer = None[runview.LoadSummary]()), NoCmd[Msg]())
+    }
+    case None() => (m.Copy(Screens = m.Screens.Pop()), NoCmd[Msg]())
 }
 
 // ----- S4 / S5: open, review, answer ----------------------------------------
@@ -208,6 +234,40 @@ func submitAnswer(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
     case None() => noCmd(m)
 }
 
+// ----- checkpoint resume ----------------------------------------------------
+
+// resumeAccept resumes from the launch offer's checkpoint (S0 → S3).
+func resumeAccept(m Model) Tuple[Model, Cmd[Msg]] = m.ResumeOffer match {
+    case Some(offer) => resumeWith(m, offer)
+    case None()      => noCmd(m)
+}
+
+// resumeLoaded handles a disk reload (S6 resume): resume on Loaded, else stay.
+func resumeLoaded(m Model, load engine.CheckpointLoad) Tuple[Model, Cmd[Msg]] {
+    val offer = runview.ClassifyLoad(load)
+    if (offer.Kind == "loaded") { return resumeWith(m, offer) }
+    return noCmd(m)
+}
+
+// resumeWith rebuilds the run from a checkpoint via the port and routes to S3,
+// continuing the assimilation from the frontier (resuming the tick loop).
+func resumeWith(m Model, offer runview.LoadSummary) Tuple[Model, Cmd[Msg]] = offer.Cp match {
+    case Some(cp) => {
+        val st = m.Port.Resume(cp)
+        val m2 = m.Copy(
+            Run         = Some(st),
+            ResumeOffer = None[runview.LoadSummary](),
+            S3Focus     = PaneTree(),
+            TreeCursor  = 0,
+            LogScroll   = 0,
+            Screens     = NewScreenStack(RouteS1()).Push(RouteS3()),
+        )
+        val cont = if (runview.AnyActionable(st)) tickCmd() else NoCmd[Msg]()
+        return (m2, withSave(m2, st, cont))
+    }
+    case None() => noCmd(m)
+}
+
 // reviewedUnitId is the engine UnitId of the unit currently under review (the
 // tree cursor). Field access only — no engine pattern-match here.
 func reviewedUnitId(m Model) Option[engine.UnitId] = m.Run match {
@@ -226,6 +286,8 @@ func keyChar(m Model, c rune) Tuple[Model, Cmd[Msg]] {
     if (r == RouteS5()) { return (typeAnswer(m, c), NoCmd[Msg]()) }
     if (c == 'q') { return (m, QuitCmd[Msg]()) }
     if (r == RouteS4()) { return reviewKey(m, c) }
+    if (r == RouteS3() && c == 'p') { return (m.Copy(Screens = m.Screens.Push(RouteS6())), NoCmd[Msg]()) }
+    if (r == RouteS6() && c == 'r') { return (m, loadCmd(m.Port, m.SourceDir)) }   // resume from disk
     return noCmd(m)
 }
 
@@ -376,20 +438,26 @@ func runStarted(m Model, st engine.RunState) Tuple[Model, Cmd[Msg]] {
     return (m2, tickCmd())
 }
 
-// runTick advances one engine step; re-schedules itself while work remains, so
-// the dashboard animates to completion and then quiesces.
+// runTick advances one engine step; re-schedules itself while work remains, and
+// (when persisting) auto-checkpoints the changed state off the loop, so a long
+// run is continuously saved.
 func runTick(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
     case Some(st) => {
         if (runview.AnyActionable(st)) {
             val next = m.Port.Advance(st)
             val m2 = m.Copy(Run = Some(next))
-            if (runview.AnyActionable(next)) { return (m2, tickCmd()) }
-            return (m2, NoCmd[Msg]())
+            val cont = if (runview.AnyActionable(next)) tickCmd() else NoCmd[Msg]()
+            return (m2, withSave(m2, next, cont))
         }
         return (m, NoCmd[Msg]())
     }
     case None() => (m, NoCmd[Msg]())
 }
+
+// withSave batches an auto-checkpoint Cmd before `base` when persistence is on.
+// Off (tests) it returns `base` unchanged, so no IO is issued.
+func withSave(m Model, state engine.RunState, base Cmd[Msg]) Cmd[Msg] =
+    if (m.Persist) Batch[Msg](saveCmd(m.Port, state, m.SourceDir), base) else base
 
 // tickCmd schedules the next tick off the Update loop (a Future the runtime
 // drains). In tests, MRunTick is sent directly instead.
