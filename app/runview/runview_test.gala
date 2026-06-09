@@ -40,6 +40,15 @@ func rsOf(units Array[UnitRun]) RunState =
 
 func noFlags() Array[UnsupportedFlag] = EmptyArray[UnsupportedFlag]()
 
+// mkSourceTest builds a SourceTest unit: one whose own id appears in its carried
+// SourceTestRefs (the parity-counting shape ProjectRun keys off). Plain mkUnit
+// units carry no SourceTests, so they are non-test source units.
+func mkSourceTest(id string, status UnitStatus) UnitRun {
+    val base = mkUnit(id, "x", status)
+    return base.Copy(SourceTests = ArrayOf[SourceTestRef](
+        SourceTestRef(Unit = UnitId(Value = id), Path = id + ".go", Source = "")))
+}
+
 // ----- UnitAt + UnitDetailVM ------------------------------------------------
 
 func TestUnitAtOutOfRange(t T) T {
@@ -149,6 +158,55 @@ func TestProjectRunCountsAndPct(t T) T {
     val t4 = Eq(t3, vm.Counts.Queued, 1)
     val t5 = Eq(t4, vm.Counts.Active, 1)        // Verifying counts as active
     return Eq(t5, vm.Counts.Blocked, 1)
+}
+
+// ----- tests-passing parity metric ------------------------------------------
+
+// No SourceTest units → both figures are zero (added/ordinary units never count).
+func TestProjectRunTestsZero(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("a/main", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b/util", "x", Queued())))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.TestsTotal, 0)
+    return Eq(t1, vm.TestsPassing, 0)
+}
+
+// Two source tests, one Done → 1 of 2 passing; the ordinary unit is excluded.
+func TestProjectRunTestsSomePassing(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkSourceTest("a/value_test", doneStatus("o", "r", noFlags())),
+        mkSourceTest("b/calc_test",  Verifying()),
+        mkUnit("a/value", "x", doneStatus("o", "r", noFlags()))))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.TestsTotal, 2)
+    return Eq(t1, vm.TestsPassing, 1)
+}
+
+// Both source tests Done → all passing.
+func TestProjectRunTestsAllPassing(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkSourceTest("a/value_test", doneStatus("o", "r", noFlags())),
+        mkSourceTest("b/calc_test",  doneStatus("o", "r", noFlags()))))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.TestsTotal, 2)
+    return Eq(t1, vm.TestsPassing, 2)
+}
+
+// Stage tracks the run's high-level position: queued work → run, only the gate
+// left → verify, nothing actionable → report.
+func TestProjectRunStage(t T) T {
+    val running = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", Queued()),
+        mkUnit("b", "x", Verifying())))
+    val verifying = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Verifying())))
+    val reported = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags()))))
+    val t1 = Eq(t,  ProjectRun(running).Stage,   StageRun())
+    val t2 = Eq(t1, ProjectRun(verifying).Stage, StageVerify())
+    return Eq(t2, ProjectRun(reported).Stage, StageReport())
 }
 
 func TestAnyActionable(t T) T {
