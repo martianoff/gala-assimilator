@@ -46,6 +46,20 @@ language or backend never crosses the seam.
   `app/engine/verify.gala`) with a sealed `VerifyResult`
   (pass / fail / unsupported), and a unit with no source-test coverage is flagged
   unverified rather than silently passed.
+- **Real toolchain verify gate — mechanism landed.** `RealVerifier`
+  (`app/engine/realverify.gala`) implements the `Verifier` contract against the
+  actual toolchain: per unit it materializes the emitted target + its 1:1 source
+  tests into an **isolated** scratch GALA module under `os.TempDir()`, runs
+  `gala build` then `gala test`, and maps the result — compile error → `VerifyFail`
+  with the build diagnostics, red test → `VerifyFail` with the test output, all
+  green → `VerifyPass`. The actual toolchain stderr becomes the failure reason, so
+  the fix loop re-translates against **real** errors. The process runner is an
+  injected port (`ToolchainRunner`): tests drive the green / compile-error / test-
+  failure mappings with a deterministic fake (`app/engine/realverify_test.gala`),
+  so the suite spawns no `gala` and never risks the nested-`gala test` workspace-
+  contention bug. `MockVerifier` stays the default; the real gate is opt-in
+  (`ClaudeEngineRealVerify` / `SelectBackend "claude-verify"`). End-to-end
+  validation is the remaining step — see below.
 - **Blocker park / answer.** A unit that needs clarification parks as `Blocked`;
   the user answers it on S5 and the unit re-queues and continues. Driven through
   the real run machinery in `app/ui/s5_test.gala` via `ScriptedBlockerEngine`.
@@ -65,17 +79,17 @@ language or backend never crosses the seam.
   is wired and selectable on S1, but there is no runtime smoke test exercising it
   against the real Claude CLI/API. All current tests run offline against
   `MockEngine`.
-- **The real verify gate is still deferred under the mock translator.** This is
-  the most important open item. The gate's *contract* is done, but the real
-  `gala build` / `gala test` invocation is **not wired** — see the `DEFERRED`
-  header in `app/engine/verify.gala`. The real verifier will, per unit,
-  materialize the emitted target plus its 1:1-replicated source tests into a
-  scratch module, run `gala test`, and map green/red onto `VerifyResult`. That
-  work is gated on the default backend emitting real GALA: under the deterministic
-  `MockTranslator` a unit's target text is the placeholder `// mock translation`,
-  which there is nothing to compile. Until then `MockVerifier` (a deterministic
-  pass) stands in, and swapping in the real verifier is a port substitution —
-  the gate itself does not change.
+- **Real verify gate — end-to-end validation pending the live backend.** The
+  mechanism has landed (see Done: `RealVerifier`, `app/engine/realverify.gala`): it
+  materializes a scratch module and runs `gala build`/`gala test`, mapping the
+  result onto `VerifyResult` with the real diagnostics. What remains is exercising
+  it **for real**, which is gated on the backend emitting real GALA — under the
+  default `MockTranslator` a unit's target is the placeholder `// mock translation`,
+  which won't compile, so the real gate stays opt-in (not the default) until the
+  live-backend round. Open sub-items for that round: confirm the scratch-module
+  layout (the provisional `gala.mod` / flat-file shape in `realverify.gala`) builds
+  a real translated unit, and resolve how a unit's dependencies are supplied to the
+  scratch build.
 - **Translation quality vs. the live backend not yet validated end-to-end.** The
   live Claude backend *does* emit real GALA, but actual Go → GALA output quality
   has not been validated through the full pipeline. The current proof is of the
@@ -84,9 +98,10 @@ language or backend never crosses the seam.
   follow-ups).** The iterative translate → verify → fix loop above is wired and
   bounded, but under the default `MockVerifier` (deterministic pass) a unit never
   actually fails, so the *fix* half only runs against scripted/test verifiers
-  today. The loop becomes load-bearing once **(a)** the real verify gate (next
-  item) supplies a genuine pass/fail, and **(b)** a non-mock backend emits real
-  GALA for the diagnostics to actually improve. The paired UI follow-up is
+  today. The real gate that supplies a genuine pass/fail now exists (`RealVerifier`,
+  above); the loop becomes load-bearing once it runs **for real** — i.e. a non-mock
+  backend emits real GALA for the scratch build to compile and the diagnostics to
+  actually improve across attempts. The paired UI follow-up is
   **surfacing the loop** in the TUI — per-unit attempt counts and the new `EvRetry`
   activity-log lines on S3/S4 — so a reviewer can watch a unit retry and converge.
 
@@ -96,9 +111,13 @@ A reviewer can check the MVP is complete against this list:
 
 - [ ] A real multi-package Go project migrates **0 → 100%** end-to-end against the
       **live Claude backend** (not just the mock).
-- [ ] The **real verify gate runs `gala build` / `gala test`** per unit — the
-      `DEFERRED` path in `app/engine/verify.gala` is wired and a unit only reaches
-      `Done` when its 1:1 source tests genuinely pass on the emitted target.
+- [x] The **real verify gate runs `gala build` / `gala test`** per unit —
+      `RealVerifier` (`app/engine/realverify.gala`) materializes a scratch module,
+      runs the toolchain, and maps green/red onto `VerifyResult` with the real
+      diagnostics. *(Mechanism landed; the box below tracks running it for real.)*
+- [ ] The real gate is **exercised end-to-end against a non-mock backend**: a unit
+      only reaches `Done` when its 1:1 source tests genuinely pass on the emitted
+      target, observed on a real `gala build`/`gala test` run (not the fake runner).
 - [ ] Emitted GALA **transpiles back to Go and passes the source's own tests** —
       the migration is demonstrably semantics-preserving on a non-trivial project.
 - [ ] The **fix loop runs against the real verify gate**: a genuine verify failure
