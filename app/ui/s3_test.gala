@@ -3,6 +3,7 @@ package ui
 import (
     . "github.com/martianoff/gala-tui"
     "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
     "github.com/martianoff/gala-tui/harness"
     . "martianoff/gala/collection_immutable"
     str "martianoff/gala/strings"
@@ -36,6 +37,16 @@ func logLenOf(m Model) int = m.Run match {
     case None()   => 0
 }
 
+func testsPassingOf(m Model) int = m.Run match {
+    case Some(rs) => runview.ProjectRun(rs).TestsPassing
+    case None()   => 0
+}
+
+func testsTotalOf(m Model) int = m.Run match {
+    case Some(rs) => runview.ProjectRun(rs).TestsTotal
+    case None()   => 0
+}
+
 // ----- render snapshots ------------------------------------------------------
 
 func TestS3WideRendersSplitBoard(t T) T {
@@ -65,6 +76,27 @@ func TestS3ReachesFullProgress(t T) T {
     return IsTrue(t, out.Contains("(100%)"))
 }
 
+// The breadcrumb (Scan › Plan › Run › Verify › Report) and the tests-passing
+// counter both render in the S3 header — at wide and narrow widths.
+func TestS3BreadcrumbAndTestsWide(t T) T {
+    val m = midRunModel(110, 24, 3)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t,  out.Contains("Scan"))
+    val t2 = IsTrue(t1, out.Contains("Plan"))
+    val t3 = IsTrue(t2, out.Contains("Verify"))
+    val t4 = IsTrue(t3, out.Contains("Report"))
+    val t5 = IsTrue(t4, out.Contains("›"))            // breadcrumb separator
+    return IsTrue(t5, out.Contains("passing"))         // tests counter readout
+}
+
+func TestS3BreadcrumbAndTestsNarrow(t T) T {
+    val m = midRunModel(72, 24, 3)
+    val out = str.S(Snapshot(view(m), 72, 24))
+    val t1 = IsTrue(t,  out.Contains("Scan"))
+    val t2 = IsTrue(t1, out.Contains("Report"))
+    return IsTrue(t2, out.Contains("passing"))
+}
+
 // ----- interaction: start a run, watch it climb -----------------------------
 
 func s3Harness() harness.Harness[Model, Msg] {
@@ -90,6 +122,31 @@ func TestRunGrowsLogAndDoneCount(t T) T {
     val t1 = Eq(t, s1.Model.Screens.Current(), RouteS3())
     val t2 = IsTrue(t1, after > before)   // activity log grew
     return IsTrue(t2, d1 > d0)            // done-count increased
+}
+
+// The tests-passing count climbs as the run advances: 0 at the start, reaching
+// the full source-test total once the run settles.
+func TestTestsPassingClimbs(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val s0 = s3Harness().Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = plan))
+        .SendMsg(MRunStarted(State = st))
+    val before = testsPassingOf(s0.Model)
+    var s = s0
+    var i = 0
+    for i < 20 {
+        s = s.SendMsg(MRunTick())
+        i = i + 1
+    }
+    val after = testsPassingOf(s.Model)
+    val total = testsTotalOf(s.Model)
+    val t1 = Eq(t,  before, 0)            // nothing passing before any tick
+    val t2 = IsTrue(t1, total > 0)        // the stub has a source test
+    val t3 = IsTrue(t2, after > before)   // the count climbed
+    return Eq(t3, after, total)           // all source tests pass once settled
 }
 
 // Keyboard parity: Tab toggles the focused pane on S3.
