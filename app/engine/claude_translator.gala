@@ -38,20 +38,31 @@ import (
 // the still-deterministic verify gate). The backend the "Claude" option selects.
 func ClaudeEngine() EnginePort = GoEngineWithVerifier(ClaudeTranslator(), MockVerifier())
 
+// ClaudeEngineRealVerify is ClaudeEngine with the REAL toolchain verify gate
+// (RealVerifier over the default GalaToolchainRunner) instead of the deterministic
+// mock — the live translator's GALA actually gets `gala build`/`gala test`'d, and a
+// red result feeds the fix loop real diagnostics. Opt-in (the mock verifier stays
+// the default) because it is only meaningful once the backend emits real GALA: under
+// the mock translator the target won't compile. See realverify.gala.
+func ClaudeEngineRealVerify() EnginePort =
+    GoEngineWithVerifier(ClaudeTranslator(), RealVerifier(GalaToolchainRunner()))
+
 // SelectBackend maps a backend name to an EnginePort — the composition-root
 // selector the UI's "Claude" / offline options drive:
-//   - "claude" — the LIVE Claude translator over the real Go frontend.
-//   - "go"     — the real Go frontend on the deterministic mock translator.
-//   - anything else — the fully offline stub engine (the safe default: no IO, no
-//     credentials).
+//   - "claude"        — the LIVE Claude translator over the real Go frontend.
+//   - "claude-verify" — the same, but with the REAL toolchain verify gate.
+//   - "go"            — the real Go frontend on the deterministic mock translator.
+//   - anything else   — the fully offline stub engine (the safe default: no IO, no
+//                       credentials).
 // It lives in the engine (not cmd) on purpose: under the 0.49.2 toolchain a
 // non-entry package's self-import is not rewritten, so `cmd` importing the engine
 // would break the whole-workspace `gala test`. The UI entrypoint calls this once
 // it is the build's entry (where self-imports DO resolve), keeping selection in
 // one tested place meanwhile.
 func SelectBackend(name string) EnginePort {
-    if name == "claude" { return ClaudeEngine() }
-    if name == "go"     { return GoEngine() }
+    if name == "claude"        { return ClaudeEngine() }
+    if name == "claude-verify" { return ClaudeEngineRealVerify() }
+    if name == "go"            { return GoEngine() }
     return MockEngine()
 }
 
