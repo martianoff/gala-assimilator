@@ -18,6 +18,21 @@ language or backend never crosses the seam.
   units to completion. Proven end-to-end in `app/ui/update_test.gala`
   (`TestRunDrivesToCompletion`: every unit reaches `Done`, nothing left
   actionable).
+- **Iterative translate → verify → fix loop (run-to-fixpoint).** A unit is no
+  longer a single forward pass. On a verify **fail** it re-enters `Translating`
+  with the verify diagnostics fed back as added context (threaded onto the
+  assignment's `PriorFailure`), then re-verifies — repeating until it passes
+  (→ `Done`) or a **configurable per-unit cap** (default 3, `DefaultMaxAttempts()`)
+  is reached, at which point it settles `Failed` carrying the last diagnostics: a
+  visible failure, never a silent give-up or an infinite spin (per the product
+  invariant, a visible failure beats a wrong-but-green translation). The **run**
+  loops to a fixpoint over all units; `IsComplete` is precisely "no unit in
+  Queued / Translating / Verifying". Attempt count is tracked per unit
+  (`UnitRun.Attempts`, round-tripped through the checkpoint) and the loop turning
+  is streamed as `EvRetry` events. All in the engine, behind `EnginePort` (no UI
+  types). Proven in `app/engine/loop_test.gala`: fail-then-pass → `Done` at attempt
+  2; never-passes → `Failed` at the cap with diagnostics; the run reaches the
+  completion fixpoint.
 - **S1–S6 screens, mouse + keyboard, responsive.** The interview (S1), plan (S2),
   dashboard (S3), diff/review (S4), blocker (S5), and summary/resume (S6) screens
   are tested through real input and at wide/narrow widths. See
@@ -65,6 +80,15 @@ language or backend never crosses the seam.
   live Claude backend *does* emit real GALA, but actual Go → GALA output quality
   has not been validated through the full pipeline. The current proof is of the
   **pipeline**, not of the translation.
+- **Fix loop needs a real failure signal + UI surfacing (the loop's dependent
+  follow-ups).** The iterative translate → verify → fix loop above is wired and
+  bounded, but under the default `MockVerifier` (deterministic pass) a unit never
+  actually fails, so the *fix* half only runs against scripted/test verifiers
+  today. The loop becomes load-bearing once **(a)** the real verify gate (next
+  item) supplies a genuine pass/fail, and **(b)** a non-mock backend emits real
+  GALA for the diagnostics to actually improve. The paired UI follow-up is
+  **surfacing the loop** in the TUI — per-unit attempt counts and the new `EvRetry`
+  activity-log lines on S3/S4 — so a reviewer can watch a unit retry and converge.
 
 ## Definition of done for the MVP
 
@@ -77,6 +101,11 @@ A reviewer can check the MVP is complete against this list:
       `Done` when its 1:1 source tests genuinely pass on the emitted target.
 - [ ] Emitted GALA **transpiles back to Go and passes the source's own tests** —
       the migration is demonstrably semantics-preserving on a non-trivial project.
+- [ ] The **fix loop runs against the real verify gate**: a genuine verify failure
+      re-translates with the diagnostics fed back and a real fix reaches `Done`,
+      observed end-to-end (not only against scripted/test verifiers).
+- [ ] The TUI **surfaces the loop**: per-unit attempt counts and `EvRetry`
+      activity-log lines render on S3/S4.
 - [ ] A unit with no faithful target is **flagged** (unsupported-construct /
       unverified), never silently passed or guessed — per the product invariant in
       [CLAUDE.md](../CLAUDE.md).

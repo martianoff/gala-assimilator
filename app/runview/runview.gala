@@ -222,8 +222,9 @@ func phaseLabel(p ProgressPhase) string = p match {
 }
 
 func logLine(e EngineEvent) string = e match {
-    case EvProgress(unit, ev) => unit.Value + "  " + phaseLabel(ev.Phase) + ": " + ev.Note
-    case EvStatus(unit, st)   => unit.Value + "  → " + statusLabel(st)
+    case EvProgress(unit, ev)       => unit.Value + "  " + phaseLabel(ev.Phase) + ": " + ev.Note
+    case EvStatus(unit, st)         => unit.Value + "  → " + statusLabel(st)
+    case EvRetry(unit, _, reason)   => unit.Value + "  ↻ re-translate (verify failed): " + reason
 }
 
 // pkgOf is the package prefix of a unit id ("core/value" → "core").

@@ -15,8 +15,9 @@ func scanned(eng EnginePort) RunState =
 
 func countProgress(log Array[EngineEvent]) int =
     log.Count((e EngineEvent) => e match {
-        case EvProgress(_, _) => true
-        case EvStatus(_, _)   => false
+        case EvProgress(_, _)  => true
+        case EvStatus(_, _)    => false
+        case EvRetry(_, _, _)  => false
     })
 
 func firstUnitId(s RunState) UnitId = s.Units.Get(0).Unit
@@ -51,6 +52,7 @@ func TestMockRunStreamsPhaseTransitions(t T) T {
             case _             => Fail(t, "first transition should be Translating")
         }
         case EvProgress(_, _) => Fail(t, "first event should be a status transition")
+        case EvRetry(_, _, _) => Fail(t, "first event should be a status transition")
     }
 }
 

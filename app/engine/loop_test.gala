@@ -1,0 +1,149 @@
+package engine
+
+// Tests for the ITERATIVE translate -> verify -> fix loop (the run-to-fixpoint
+// machinery). A unit no longer makes a single forward pass: on a verify FAIL it is
+// re-translated with the diagnostics fed back, bounded by a per-unit attempt cap.
+// These drive the loop THROUGH the port (Advance / RunToCompletion):
+//   - fail-once-then-pass  -> Done with attempt count 2
+//   - never-passes         -> Failed at the cap, carrying the last diagnostics
+//   - the run reaches the completion fixpoint (IsComplete)
+//   - the loop emits EvRetry events (the activity log shows the loop turning)
+//   - the cap is configurable (cap = 1 -> a single attempt, no retry)
+// Shared helpers (scanned / firstUnitId) live in port_test.gala.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    strings "martianoff/gala/strings"
+    acp "github.com/martianoff/gala-acp"
+)
+
+// improvingTranslator emits a DIFFERENT translation once the assignment carries a
+// PriorFailure: the first attempt yields "// first attempt", and every retry (which
+// the loop threads a PriorFailure onto) yields "// fixed translation". It models a
+// backend that actually USES the fed-back diagnostics to do better next time.
+func improvingTranslator() acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => acp.RunTranscript[Result, Clarification](
+            Steps = mockSteps(a.Task),
+            Final = resultOutcome(improvedResult(a)),
+        ),
+        Cancel = (_ string) => cancelledAck(),
+    )
+
+func improvedResult(a TaskAssignment) Result {
+    val text = a.PriorFailure match {
+        case Some(_) => "// fixed translation"
+        case None()  => "// first attempt"
+    }
+    return Result(Task = a.Task, TargetText = text, Rationale = "improving mock", Flags = EmptyArray[UnsupportedFlag]())
+}
+
+// fixedOnlyVerifier passes ONLY the improved output, so the first attempt fails and
+// the retry (which produces the fixed output) passes — exercising the fix loop.
+func fixedOnlyVerifier() Verifier =
+    Verifier(Verify = (req VerifyRequest) => (req.TargetText == "// fixed translation") match {
+        case true  => VerifyPass()
+        case false => VerifyFail(Failing = ArrayOf[UnitId](req.Unit), Reason = "needs the fix")
+    })
+
+func countRetry(log Array[EngineEvent]) int =
+    log.Count((e EngineEvent) => e match {
+        case EvRetry(_, _, _) => true
+        case EvProgress(_, _) => false
+        case EvStatus(_, _)   => false
+    })
+
+// ----------------------------------------------------------------------------
+// Fail once, then pass on retry -> Done with attempt count 2.
+// ----------------------------------------------------------------------------
+
+func TestVerifyFailThenRetryPasses(t T) T {
+    val eng = MockEngineWithVerifier(improvingTranslator(), fixedOnlyVerifier())
+    val finished = RunToCompletion(eng, scanned(eng))
+    val t1 = Eq(t, CountByDone(finished), 4)            // every unit converged
+    return finished.Units.Get(0).Status match {
+        case Done(_) => Eq(t1, finished.Units.Get(0).Attempts, 2)  // attempt 1 failed, attempt 2 passed
+        case _       => Fail(t1, "unit should reach Done after exactly one retry")
+    }
+}
+
+// The loop turning is visible in the stream: one EvRetry per unit (each retried
+// exactly once), alongside the intact EvProgress / EvStatus events.
+func TestFixLoopEmitsRetryEvents(t T) T {
+    val eng = MockEngineWithVerifier(improvingTranslator(), fixedOnlyVerifier())
+    val finished = RunToCompletion(eng, scanned(eng))
+    return Eq(t, countRetry(finished.Log), 4)
+}
+
+// ----------------------------------------------------------------------------
+// Never passes -> Failed at the cap, carrying the last diagnostics (no silent spin).
+// ----------------------------------------------------------------------------
+
+func TestVerifyNeverPassesHitsCapAndFails(t T) T {
+    val eng = MockEngineWithVerifier(
+        MockTranslator(),
+        ScriptedVerifier(VerifyFail(
+            Failing = ArrayOf[UnitId](UnitId(Value = "core/value_test")),
+            Reason  = "assertion mismatch",
+        )),
+    )
+    val finished = RunToCompletion(eng, scanned(eng))
+    val t1 = Eq(t, CountByDone(finished), 0)
+    return finished.Units.Get(0).Status match {
+        case Failed(reason) => {
+            val a = Eq(t1, finished.Units.Get(0).Attempts, DefaultMaxAttempts())  // spent the whole budget
+            val b = Eq(a, strings.Contains(reason, "assertion mismatch"), true) // last diagnostics carried
+            return Eq(b, strings.Contains(reason, "verify exhausted"), true)    // surfaced as exhaustion
+        }
+        case _ => Fail(t1, "a unit that never passes must settle Failed at the cap")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Run-to-fixpoint: RunToCompletion settles every unit; IsComplete holds and Advance
+// is a no-op (no unit left in Queued / Translating / Verifying).
+// ----------------------------------------------------------------------------
+
+func TestRunReachesCompletionFixpoint(t T) T {
+    val eng = MockEngine()
+    val finished = RunToCompletion(eng, scanned(eng))
+    val t1 = IsTrue(t, IsComplete(finished))
+    return Eq(t1, eng.Advance(finished).Log.Length(), finished.Log.Length())
+}
+
+// A run with a never-passing verifier ALSO reaches the fixpoint — the cap guarantees
+// termination even when nothing converges (every unit settles Failed).
+func TestStuckRunStillCompletes(t T) T {
+    val eng = MockEngineWithVerifier(
+        MockTranslator(),
+        ScriptedVerifier(VerifyFail(
+            Failing = ArrayOf[UnitId](UnitId(Value = "x")),
+            Reason  = "stuck",
+        )),
+    )
+    val finished = RunToCompletion(eng, scanned(eng))
+    return IsTrue(t, IsComplete(finished))
+}
+
+// ----------------------------------------------------------------------------
+// The per-unit attempt cap is configurable: cap = 1 means a single attempt with no
+// retry — a verify fail fails immediately rather than re-translating.
+// ----------------------------------------------------------------------------
+
+func TestCapIsConfigurable(t T) T {
+    val eng = MockEngineWithVerifierCap(
+        MockTranslator(),
+        ScriptedVerifier(VerifyFail(
+            Failing = ArrayOf[UnitId](UnitId(Value = "x")),
+            Reason  = "nope",
+        )),
+        1,
+    )
+    val finished = RunToCompletion(eng, scanned(eng))
+    return finished.Units.Get(0).Status match {
+        case Failed(_) => Eq(t, finished.Units.Get(0).Attempts, 1)  // exactly one attempt, no retry
+        case _         => Fail(t, "cap = 1 must settle Failed after a single attempt")
+    }
+}

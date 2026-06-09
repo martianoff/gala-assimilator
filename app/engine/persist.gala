@@ -119,6 +119,7 @@ func encUnitRun(w *json.JsonEncoderImpl, u UnitRun) {
     w.WriteKey("assignment");  encAssignment(w, u.Assignment)
     w.WriteKey("status");      encUnitStatus(w, u.Status)
     w.WriteKey("sourceTests"); encArray[SourceTestRef](w, u.SourceTests, encSourceTestRef)
+    w.WriteKey("attempts");    w.WriteInt(u.Attempts)
     w.WriteEndObject()
 }
 
@@ -245,6 +246,12 @@ func encEngineEvent(w *json.JsonEncoderImpl, e EngineEvent) {
             w.WriteKey("unit"); encUnitId(w, unit)
             w.WriteKey("status"); encUnitStatus(w, status)
         }
+        case EvRetry(unit, attempt, reason) => {
+            w.WriteString("retry")
+            w.WriteKey("unit");    encUnitId(w, unit)
+            w.WriteKey("attempt"); w.WriteInt(attempt)
+            w.WriteKey("reason");  w.WriteString(reason)
+        }
     }
     w.WriteEndObject()
 }
@@ -286,8 +293,9 @@ func decUnitRun(d *json.JsonDecoderImpl) UnitRun {
     d.ReadKey(); val assignment  = decAssignment(d)
     d.ReadKey(); val status      = decUnitStatus(d)
     d.ReadKey(); val sourceTests = decArray[SourceTestRef](d, decSourceTestRef)
+    d.ReadKey(); val attempts    = d.ReadInt()
     d.EndObject()
-    return UnitRun(Unit = unit, Assignment = assignment, Status = status, SourceTests = sourceTests)
+    return UnitRun(Unit = unit, Assignment = assignment, Status = status, SourceTests = sourceTests, Attempts = attempts)
 }
 
 func decAssignment(d *json.JsonDecoderImpl) TaskAssignment {
@@ -431,6 +439,12 @@ func decEngineEventByTag(d *json.JsonDecoderImpl, tag string) EngineEvent {
         d.ReadKey(); val unit = decUnitId(d)
         d.ReadKey(); val status = decUnitStatus(d)
         return EvStatus(Unit = unit, Status = status)
+    }
+    if tag == "retry" {
+        d.ReadKey(); val unit = decUnitId(d)
+        d.ReadKey(); val attempt = d.ReadInt()
+        d.ReadKey(); val reason = d.ReadString()
+        return EvRetry(Unit = unit, Attempt = attempt, Reason = reason)
     }
     panic("unknown EngineEvent tag: " + tag)
 }
