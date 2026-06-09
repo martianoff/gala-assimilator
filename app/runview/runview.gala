@@ -28,12 +28,15 @@ struct PlanVM(
     Items    Array[string],
 )
 
-// UnitRowVM is one row of S3's unit tree.
+// UnitRowVM is one row of S3's unit tree. Attempts is how many translate→verify
+// cycles the unit has spent (UnitRun.Attempts): 1 on a clean first pass, >1 once
+// the fix loop has re-translated it — the UI surfaces that as a per-row badge.
 struct UnitRowVM(
-    Pkg    string,
-    Id     string,
-    Glyph  string,
-    Status string,
+    Pkg      string,
+    Id       string,
+    Glyph    string,
+    Status   string,
+    Attempts int,
 )
 
 // StatusCounts is the per-status tally shown beside S3's progress bar.
@@ -55,6 +58,9 @@ struct StatusCounts(
 // "run" while units are still queued/translating, "verify" once only the gate
 // remains, "report" when nothing is actionable. The UI maps these to the
 // Scan→Plan→Run→Verify→Report breadcrumb; it never matches engine state itself.
+// Complete mirrors the engine's IsComplete: the run has reached a fixpoint (no
+// unit is still in a transient phase) so the fix loop has stopped turning. While
+// false the UI shows the loop "iterating…"; true flips it to a settled "complete".
 struct RunVM(
     Total        int,
     Done         int,
@@ -65,6 +71,7 @@ struct RunVM(
     TestsTotal   int,
     TestsPassing int,
     Stage        string,
+    Complete     bool,
 )
 
 // Run-stage tokens (the engine-neutral names the UI breadcrumb maps to labels).
@@ -98,6 +105,7 @@ func ProjectRun(rs RunState) RunVM {
         TestsTotal   = sourceTests.Length(),
         TestsPassing = sourceTests.Count((u UnitRun) => isDone(u.Status)),
         Stage        = runStage(rs),
+        Complete     = IsComplete(rs),
     )
 }
 
@@ -146,10 +154,11 @@ func countWhere(rs RunState, pred func(UnitStatus) bool) int =
 
 func unitRow(u UnitRun) UnitRowVM =
     UnitRowVM(
-        Pkg    = pkgOf(u.Unit.Value),
-        Id     = u.Unit.Value,
-        Glyph  = glyph(u.Status),
-        Status = statusLabel(u.Status),
+        Pkg      = pkgOf(u.Unit.Value),
+        Id       = u.Unit.Value,
+        Glyph    = glyph(u.Status),
+        Status   = statusLabel(u.Status),
+        Attempts = u.Attempts,
     )
 
 // ----- status predicates + labels (the engine pattern-match surface) --------
@@ -224,7 +233,7 @@ func phaseLabel(p ProgressPhase) string = p match {
 func logLine(e EngineEvent) string = e match {
     case EvProgress(unit, ev)       => unit.Value + "  " + phaseLabel(ev.Phase) + ": " + ev.Note
     case EvStatus(unit, st)         => unit.Value + "  → " + statusLabel(st)
-    case EvRetry(unit, _, reason)   => unit.Value + "  ↻ re-translate (verify failed): " + reason
+    case EvRetry(unit, attempt, reason) => s"${unit.Value}  ↻ retry ${attempt}: ${reason}"
 }
 
 // pkgOf is the package prefix of a unit id ("core/value" → "core").
