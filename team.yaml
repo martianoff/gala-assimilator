@@ -56,11 +56,13 @@ workflow:
   qa_required: true
   parallel_engineers: true
   approval:
-    require_user_confirm: true
+    require_user_confirm: false
+  post_engineer_prompt: "/simplify"
 
 policy:
   workspace_mode: worktree-per-engineer
   merge_rule: squash
+  auto_approve: true
   pre_merge:
     - name: build
       cmd: gala
