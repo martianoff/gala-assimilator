@@ -28,15 +28,24 @@ struct PlanVM(
     Items    Array[string],
 )
 
-// UnitRowVM is one row of S3's unit tree. Attempts is how many translate→verify
-// cycles the unit has spent (UnitRun.Attempts): 1 on a clean first pass, >1 once
-// the fix loop has re-translated it — the UI surfaces that as a per-row badge.
+// UnitRowVM is one row of the run view's unit tree. Attempts is how many
+// translate→verify cycles the unit has spent (UnitRun.Attempts): 1 on a clean
+// first pass, >1 once the fix loop has re-translated it — the UI surfaces that as a
+// per-row badge.
+//
+// Flagged / Unverified are the correctness markers that keep the product invariant
+// visible: a unit that reached Done but raised an unsupported-construct flag
+// (Flagged) or passed the gate with NO 1:1 source-test coverage (Unverified) must
+// never look identical to a clean pass. Both are derived from the Done result's
+// flags; a non-Done unit carries neither.
 struct UnitRowVM(
-    Pkg      string,
-    Id       string,
-    Glyph    string,
-    Status   string,
-    Attempts int,
+    Pkg        string,
+    Id         string,
+    Glyph      string,
+    Status     string,
+    Attempts   int,
+    Flagged    bool,
+    Unverified bool,
 )
 
 // StatusCounts is the per-status tally shown beside S3's progress bar.
@@ -101,7 +110,7 @@ func ProjectRun(rs RunState) RunVM {
         Pct          = pct,
         Counts       = statusCounts(rs),
         Rows         = rs.Units.Map((u UnitRun) => unitRow(u)),
-        Log          = rs.Log.Map((e EngineEvent) => logLine(e)),
+        Log          = rs.Log.Map((e EngineEvent) => logLine(e)).AppendAll(flagLogLinesAll(rs)),
         TestsTotal   = sourceTests.Length(),
         TestsPassing = sourceTests.Count((u UnitRun) => isDone(u.Status)),
         Stage        = runStage(rs),
@@ -154,12 +163,49 @@ func countWhere(rs RunState, pred func(UnitStatus) bool) int =
 
 func unitRow(u UnitRun) UnitRowVM =
     UnitRowVM(
-        Pkg      = pkgOf(u.Unit.Value),
-        Id       = u.Unit.Value,
-        Glyph    = glyph(u.Status),
-        Status   = statusLabel(u.Status),
-        Attempts = u.Attempts,
+        Pkg        = pkgOf(u.Unit.Value),
+        Id         = u.Unit.Value,
+        Glyph      = glyph(u.Status),
+        Status     = statusLabel(u.Status),
+        Attempts   = u.Attempts,
+        Flagged    = unitFlagged(u),
+        Unverified = unitUnverified(u),
     )
+
+// unitUnverified is true when the unit reached Done but carries the verify gate's
+// no-coverage flag (IsUnverified) — it passed only vacuously, with no 1:1 source
+// test behind it. unitFlagged is true when the Done result raised any OTHER
+// (unsupported-construct) flag: a construct with no faithful target the translator
+// surfaced rather than guessed. A non-Done unit is neither.
+func unitUnverified(u UnitRun) bool = u.Status match {
+    case Done(r) => IsUnverified(r)
+    case _       => false
+}
+
+// unitFlagged uses the engine's per-flag classifier (IsUnverifiedFlag) so the
+// gate's "unverified" tag stays defined in exactly one place (verify.gala).
+func unitFlagged(u UnitRun) bool = u.Status match {
+    case Done(r) => r.Flags.Exists((f UnsupportedFlag) => !IsUnverifiedFlag(f))
+    case _       => false
+}
+
+// flagLogLinesAll derives one activity-log line per flag carried by any Done unit.
+// Flags ride on the translation Result, not on the engine event stream, so they are
+// projected here and appended after the streamed events — a flagged or unverified
+// unit always leaves a visible trace in the activity log, never a silent pass.
+func flagLogLinesAll(rs RunState) Array[string] =
+    rs.Units.FlatMap((u UnitRun) => flagLogLines(u))
+
+func flagLogLines(u UnitRun) Array[string] = u.Status match {
+    case Done(r) => r.Flags.Map((f UnsupportedFlag) => flagLogLine(u.Unit.Value, f))
+    case _       => EmptyArray[string]()
+}
+
+func flagLogLine(id string, f UnsupportedFlag) string =
+    if (IsUnverifiedFlag(f))
+        s"${id}  ⚠ unverified — ${f.Reason}"
+    else
+        s"${id}  ⚑ flagged ${f.Construct} — ${f.Reason}"
 
 // ----- status predicates + labels (the engine pattern-match surface) --------
 
@@ -233,8 +279,26 @@ func phaseLabel(p ProgressPhase) string = p match {
 func logLine(e EngineEvent) string = e match {
     case EvProgress(unit, ev)       => unit.Value + "  " + phaseLabel(ev.Phase) + ": " + ev.Note
     case EvStatus(unit, st)         => unit.Value + "  → " + statusLabel(st)
-    case EvRetry(unit, attempt, reason) => s"${unit.Value}  ↻ retry ${attempt}: ${reason}"
+    case EvRetry(unit, attempt, reason) => runRetryLine(unit, attempt, reason)
 }
+
+// runRetryLine renders one turn of the fix loop: the unit, the attempt that just
+// failed, and a trimmed one-line reason. Verify diagnostics can be long and
+// multi-line (real toolchain output), so the reason is collapsed to a single line
+// and capped — enough for a reviewer to watch the loop converge without the log
+// drowning in a stack trace.
+func runRetryLine(unit UnitId, attempt int, reason string) string =
+    s"${unit.Value}  ↻ retry ${attempt}: ${trimReason(reason)}"
+
+func trimReason(reason string) string {
+    val oneLine = str.S(reason).ReplaceAll("\n", " ").Trim()
+    if (oneLine.Length() <= maxReasonLen()) { return oneLine.ToString() }
+    return oneLine.Take(maxReasonLen()).ToString() + "…"
+}
+
+// maxReasonLen caps the retry reason shown in the activity log so a long verify
+// diagnostic stays one readable line.
+func maxReasonLen() int = 60
 
 // pkgOf is the package prefix of a unit id ("core/value" → "core").
 func pkgOf(id string) string = str.S(id).Split("/").Get(0).ToString()

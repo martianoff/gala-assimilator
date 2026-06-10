@@ -461,20 +461,47 @@ func unitRowWidget(m Model, r runview.UnitRowVM, idx int) Widget {
     else
         DefaultStyle()
     val row = TextStyled("  " + r.Glyph + " " + r.Id, style).OnClick(MSelectUnit(Idx = idx))
-    // First-pass units (attempts ≤ 1) render clean; a retried unit gets a compact
-    // ×N badge (right-aligned on the row) so the fix loop is visible per row.
-    if (r.Attempts <= 1) { return row }
-    val badgeText = s"×${r.Attempts} "
-    val badge = TextStyled(badgeText, attemptBadgeStyle(selected)).OnClick(MSelectUnit(Idx = idx))
-    return Row(ArrayOf[LayoutChild](
-        Flex(1, row),
-        Fixed(RuneCount(badgeText), badge),
-    ))
+    val badges = rowBadges(r, selected, idx)
+    if (badges.IsEmpty()) { return row }
+    return Row(ArrayOf[LayoutChild](Flex(1, row)).AppendAll(badges))
+}
+
+// rowBadges are the compact right-aligned per-row markers that keep the fix loop
+// and correctness flags visible on the unit row: a ×N badge once a unit has retried
+// (attempts > 1), a ⚑ flag when its translation raised an unsupported-construct
+// flag, and a ⚠ caution when it passed the gate with no 1:1 source-test coverage
+// (unverified). A flagged or unverified unit is thus never visually identical to a
+// clean pass. Every badge re-targets the same select-unit click as the row.
+func rowBadges(r runview.UnitRowVM, selected bool, idx int) Array[LayoutChild] {
+    var badges = EmptyArray[LayoutChild]()
+    if (r.Attempts > 1) {
+        val badgeText = s"×${r.Attempts} "
+        badges = badges.Append(Fixed(RuneCount(badgeText),
+            TextStyled(badgeText, attemptBadgeStyle(selected)).OnClick(MSelectUnit(Idx = idx))))
+    }
+    if (r.Flagged) {
+        badges = badges.Append(Fixed(2, markerBadge("⚑ ", BrightRed(), selected, idx)))
+    }
+    if (r.Unverified) {
+        badges = badges.Append(Fixed(2, markerBadge("⚠ ", BrightYellow(), selected, idx)))
+    }
+    return badges
 }
 
 func attemptBadgeStyle(selected bool) Style {
     if (selected) { return DefaultStyle().WithReverse().WithBold() }
     return DefaultStyle().WithFg(BrightYellow())
+}
+
+// markerBadge is a one-glyph per-row badge (the ⚑ flag / ⚠ unverified markers): the
+// glyph in its color, or reverse-bold when the row is selected, re-targeting the
+// row's select-unit click. One shape, parameterized by glyph + color.
+func markerBadge(glyph string, fg Color, selected bool, idx int) Widget {
+    val style = if (selected)
+        DefaultStyle().WithReverse().WithBold()
+    else
+        DefaultStyle().WithFg(fg)
+    return TextStyled(glyph, style).OnClick(MSelectUnit(Idx = idx))
 }
 
 // ----- right: live activity log ---------------------------------------------

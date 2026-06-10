@@ -96,6 +96,16 @@ language or backend never crosses the seam.
   default suite (the nested-`gala test` contention bug). Runbook in
   [docs/verify-gate.md](verify-gate.md). Proves the *gate wiring* on one fixture —
   broad translation quality across real projects (live backend) remains open.
+- **The run view surfaces the loop + correctness flags.** The run view renders a
+  per-unit attempt badge (`×N`, once the fix loop re-translates a unit) and one
+  activity-log line per `EvRetry` (the attempt and a trimmed one-line diagnostic), so
+  a reviewer can watch a unit fail, re-translate against the real diagnostics, and
+  converge. It also keeps the product invariant visible: a unit that raised an
+  unsupported-construct flag (⚑) or passed with no 1:1 source-test coverage (⚠) is
+  marked on its row *and* in the activity log — never identical to a clean pass. The
+  signals are projected through the run view's own model (`ProjectRun`,
+  `app/runview/runview.gala`); the engine's "unverified" tag is owned in one place
+  (`IsUnverifiedFlag`, `app/engine/verify.gala`).
 
 ## In progress / gaps
 
@@ -127,13 +137,6 @@ language or backend never crosses the seam.
   live Claude backend *does* emit real GALA, but actual Go → GALA output quality
   has not been validated through the full pipeline. The current proof is of the
   **pipeline**, not of the translation.
-- **Surfacing the loop in the run view (the loop's UI follow-up).** The fix loop now
-  has a genuine real-failure signal end to end: the `ReferenceTranslator` emits real
-  GALA, the real gate produces a true red-test `VerifyFail`, and the loop recovers to
-  `Done` against it (`cmd/verifygate`, above). What remains is **surfacing the loop**
-  in the TUI — per-unit attempt counts and the `EvRetry` activity-log lines in the run
-  view — so a reviewer can watch a unit retry and converge.
-
 ## Definition of done for the MVP
 
 A reviewer can check the MVP is complete against this list:
@@ -157,11 +160,15 @@ A reviewer can check the MVP is complete against this list:
       `VerifyFail` carries the real diagnostics, the loop re-translates against them,
       and the unit reaches `Done` — driven through `RunToCompletion` over the real
       gate in `cmd/verifygate` (not only scripted/test verifiers).
-- [ ] The TUI **surfaces the loop**: per-unit attempt counts and `EvRetry`
-      activity-log lines render on S3/S4.
-- [ ] A unit with no faithful target is **flagged** (unsupported-construct /
+- [x] The TUI **surfaces the loop**: the run view renders a per-unit attempt badge
+      (`×N`) and one activity-log line per `EvRetry` (attempt + trimmed diagnostic),
+      so a reviewer can watch a unit retry and converge.
+- [x] A unit with no faithful target is **flagged** (unsupported-construct /
       unverified), never silently passed or guessed — per the product invariant in
-      [CLAUDE.md](../CLAUDE.md).
+      [CLAUDE.md](../CLAUDE.md). The run view marks a flagged unit (⚑) and an
+      unverified unit (⚠) on its row *and* in the activity log, so neither is ever
+      visually identical to a clean pass; the gate's "unverified" tag is owned in one
+      place (`IsUnverifiedFlag`, `app/engine/verify.gala`).
 - [ ] **Checkpoint/restore works across a process restart** through the UI: an
       interrupted run resumes from the dependency frontier and never re-translates
       finished units.

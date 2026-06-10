@@ -6,6 +6,7 @@ import (
     "github.com/martianoff/gala-assimilator/app/runview"
     "github.com/martianoff/gala-tui/harness"
     . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
     str "martianoff/gala/strings"
     . "martianoff/gala/test"
 )
@@ -147,6 +148,54 @@ func TestS3CompleteIndicator(t T) T {
     val out = str.S(Snapshot(view(m), 110, 24))
     val t1 = IsTrue(t, out.Contains("complete"))
     return IsTrue(t1, out.Contains("(100%)"))
+}
+
+// ----- correctness flags render on the run screen ---------------------------
+
+// mkDoneUnit builds a Done unit carrying the given translation flags, so a render
+// test can show a flagged / unverified unit without driving a live backend.
+func mkDoneUnit(id string, flags Array[engine.UnsupportedFlag]) engine.UnitRun =
+    engine.UnitRun(
+        Unit = engine.UnitId(Value = id),
+        Assignment = engine.TaskAssignment(
+            Task         = engine.TaskId(Value = id),
+            Unit         = engine.UnitId(Value = id),
+            Source       = engine.SourceContext(SourceText = "src", Dependencies = EmptyArray[engine.DependencySnippet]()),
+            Target       = engine.TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+            PriorFailure = None[engine.PriorFailure](),
+            Answers      = EmptyArray[engine.Answer](),
+        ),
+        Status = engine.Done(Output = engine.Result(
+            Task = engine.TaskId(Value = id), TargetText = "out", Rationale = "r", Flags = flags)),
+    )
+
+// flagFixtureState is a settled run with one unsupported-construct-flagged unit and
+// one unverified unit, so both correctness markers render on the run screen.
+func flagFixtureState() engine.RunState {
+    val unsupported = ArrayOf[engine.UnsupportedFlag](
+        engine.UnsupportedFlag(Construct = "generics", Reason = "no faithful target"))
+    val unverified = ArrayOf[engine.UnsupportedFlag](
+        engine.UnsupportedFlag(Construct = "unverified", Reason = "no 1:1 source test covers this unit"))
+    return engine.RunState(
+        Units = ArrayOf[engine.UnitRun](mkDoneUnit("core/value", unsupported), mkDoneUnit("app/main", unverified)),
+        Log   = EmptyArray[engine.EngineEvent]())
+}
+
+func flagRunModel(cols int, rows int) Model {
+    val program = NewProgram(mockFactory(), cols, rows)
+    val (m1, _) = StepAll(program, ArrayOf[Msg](MRunStarted(State = flagFixtureState())))
+    return m1
+}
+
+// A flagged unit (⚑) and an unverified unit (⚠) each render a per-row marker AND an
+// activity-log line, so a flagged/unverified unit is never identical to a clean pass.
+func TestRunScreenFlagAndUnverifiedMarkers(t T) T {
+    val m = flagRunModel(110, 24)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t,  out.Contains("⚑"))                  // per-row unsupported-flag marker
+    val t2 = IsTrue(t1, out.Contains("⚠"))                  // per-row unverified marker
+    val t3 = IsTrue(t2, out.Contains("flagged generics"))   // activity-log line for the flag
+    return IsTrue(t3, out.Contains("unverified"))           // activity-log line for unverified
 }
 
 // ----- interaction: start a run, watch it climb -----------------------------
