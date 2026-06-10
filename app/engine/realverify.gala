@@ -1,0 +1,165 @@
+package engine
+
+// RealVerifier — the engine's REAL verify gate: the toolchain-backed implementation
+// of the Verifier contract (verify.gala). It is the wiring the DEFERRED header in
+// verify.gala described: per unit, materialize the emitted target text + its
+// 1:1-replicated source tests into an ISOLATED scratch GALA module, run `gala build`
+// then `gala test` over it, and map the toolchain result onto a VerifyResult — a
+// compile error or a red test becomes a VerifyFail carrying the ACTUAL toolchain
+// stderr, so the fix loop (retryOrFail, port.gala) re-translates against real
+// diagnostics rather than a synthetic message.
+//
+// THE PROCESS RUNNER IS INJECTED (ToolchainRunner). RealVerifier never shells out
+// inside its own logic — it depends on a runner port. Why this matters:
+//   - tests inject a deterministic FAKE runner: the mapping (green/red/diagnostics)
+//     is exercised with NO real exec, no network, no flakiness — fully offline;
+//   - a real test that itself ran `gala test` while running INSIDE `gala test`
+//     would risk the known workspace-contention bug — concurrent `gala` invocations
+//     share a CWD-local gen/deps workspace and corrupt each other. The scratch
+//     module always builds/tests in its OWN temp dir (fs.MkdirTemp -> os.TempDir),
+//     never the project workspace, and the default runner is exercised only on the
+//     live-backend round, never from the suite.
+//
+// NOT THE DEFAULT, ON PURPOSE. MockVerifier stays the default everywhere so the
+// offline/deterministic suite is unchanged. RealVerifier is opt-in (see
+// ClaudeEngineRealVerify / SelectBackend "claude-verify"). It is only meaningful
+// end-to-end once the backend emits real GALA: under MockTranslator a unit's
+// TargetText is the placeholder "// mock translation", which won't compile — that
+// red result is expected, and is exactly why the real gate is not wired by default.
+//
+// Transport-neutral (CLAUDE.md / architecture.md): IO lives at this deliberate edge
+// (like goscan.gala / persist.gala / claude_translator.gala); NO gala_tui, NO
+// app/ui type crosses the Verifier contract.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+    "os/exec"
+)
+
+// ----------------------------------------------------------------------------
+// The injected toolchain-runner port
+// ----------------------------------------------------------------------------
+
+// ToolchainResult is one `gala <args>` invocation's outcome: whether it was green
+// (exit code 0) and its combined stdout+stderr. Ok captures "exit 0"; Output is the
+// real toolchain text the fix loop translates against on a red result.
+struct ToolchainResult(
+    Ok     bool,
+    Output string,
+)
+
+// ToolchainRunner is the injected "run the toolchain in dir X -> result" port: a
+// struct of one function value (the GALA-idiomatic port, like Verifier / AgentRunner).
+// Run(dir, args) runs `gala <args>` with working directory `dir`. RealVerifier
+// depends on this rather than calling exec itself, so a test can substitute a
+// deterministic fake (no real process) and the real run stays at the edge.
+struct ToolchainRunner(
+    Run func(string, Array[string]) ToolchainResult,
+)
+
+// GalaToolchainRunner is the DEFAULT real runner: it actually spawns `gala` in the
+// scratch dir and captures its combined output via os/exec. CombinedOutput buffers
+// both pipes internally (no drain-deadlock) and returns a non-nil error on a
+// non-zero exit — which we map to Ok = false, the real diagnostics still in Output.
+// Exercised only on the live-backend round; the suite always injects a fake.
+func GalaToolchainRunner() ToolchainRunner =
+    ToolchainRunner(Run = (dir string, args Array[string]) => runGalaCmd(dir, args))
+
+func runGalaCmd(dir string, args Array[string]) ToolchainResult {
+    val gargs = args.ToGoSlice()
+    val c = exec.Command("gala", gargs...)
+    c.Dir = dir
+    val out, err = c.CombinedOutput()
+    val text = string(out)
+    if err == nil { return ToolchainResult(Ok = true, Output = text) }
+    return ToolchainResult(Ok = false, Output = text)
+}
+
+// ----------------------------------------------------------------------------
+// The verifier
+// ----------------------------------------------------------------------------
+
+// RealVerifier builds the verify gate over an injected toolchain runner. The pure
+// mapping (materialize -> build -> test -> VerifyResult) is the same regardless of
+// whether the runner is the real `gala` or a test fake.
+func RealVerifier(runner ToolchainRunner) Verifier =
+    Verifier(Verify = (req VerifyRequest) => realVerify(runner, req))
+
+// realVerify materializes the unit into an isolated scratch module, runs the gate
+// over it, and cleans up — the temp dir is created under os.TempDir (fs.MkdirTemp
+// with an empty dir) so the build/test never touches the project workspace.
+func realVerify(runner ToolchainRunner, req VerifyRequest) VerifyResult {
+    val dirTry = fs.MkdirTemp("", "gala_verify")
+    if dirTry.IsFailure() {
+        return VerifyUnsupported(Reason = "verify: could not create scratch module: " + dirTry.Err.Error())
+    }
+    val dir = dirTry.Get()
+    val result = gateInDir(runner, req, dir)
+    fs.RemoveAll(dir)
+    return result
+}
+
+// gateInDir is the toolchain mapping: a failed materialize is surfaced (not a silent
+// pass); a red `gala build` is a compile-error fail carrying the build diagnostics;
+// a red `gala test` is a test fail carrying the test output; all green is a pass.
+// Build runs before test so a compile error is reported as such rather than as an
+// opaque test failure.
+func gateInDir(runner ToolchainRunner, req VerifyRequest, dir string) VerifyResult {
+    if !materializeModule(dir, req) {
+        return VerifyUnsupported(Reason = "verify: could not materialize scratch module under " + dir)
+    }
+    val build = runner.Run(dir, ArrayOf[string]("build", "./..."))
+    if !build.Ok {
+        return VerifyFail(Failing = gatedUnits(req), Reason = "gala build failed:\n" + build.Output)
+    }
+    val test = runner.Run(dir, ArrayOf[string]("test"))
+    if !test.Ok {
+        return VerifyFail(Failing = gatedUnits(req), Reason = "gala test failed:\n" + test.Output)
+    }
+    return VerifyPass()
+}
+
+// gatedUnits names the units a failure is attributed to: the 1:1 source tests fed to
+// this gate, or the unit under test itself when the package carried none (so a build
+// failure with no tests still names something concrete).
+func gatedUnits(req VerifyRequest) Array[UnitId] {
+    if req.SourceTests.IsEmpty() { return ArrayOf[UnitId](req.Unit) }
+    return req.SourceTests.Map((ref SourceTestRef) => ref.Unit)
+}
+
+// ----------------------------------------------------------------------------
+// Materialization (the scratch module on disk)
+// ----------------------------------------------------------------------------
+
+// materializeModule writes the scratch GALA module: a minimal gala.mod, the emitted
+// target as target.gala, and each 1:1 source test as its own .gala file. Returns
+// false if any write fails (surfaced as VerifyUnsupported upstream). The emitted
+// target and the replicated tests are expected to be COMPLETE GALA files (their own
+// `package` clause) — which holds once the backend emits real GALA; this is the
+// provisional layout the live-backend round will validate end-to-end.
+func materializeModule(dir string, req VerifyRequest) bool {
+    val head = writeScratch(path.Join(dir, "gala.mod"), scratchGalaMod()) &&
+               writeScratch(path.Join(dir, "target.gala"), req.TargetText)
+    return req.SourceTests.FoldLeft[bool](head, (acc bool, ref SourceTestRef) =>
+        acc && writeScratch(path.Join(dir, testFileName(ref)), ref.Source))
+}
+
+// writeScratch writes one file (mode 0o644 = 420) and reports success.
+func writeScratch(p string, content string) bool =
+    !fs.WriteFileString(p, content, 420).IsFailure()
+
+// testFileName flattens a source test's unit id into a sibling .gala file name
+// ("core/value_test" -> "core_value_test.gala") so the scratch module stays flat.
+func testFileName(ref SourceTestRef) string =
+    strings.ReplaceAll(ref.Unit.Value, "/", "_") + ".gala"
+
+// scratchGalaMod is the minimal module manifest for the scratch build. The toolchain
+// line is provisional (pinned here) pending the live-backend round that exercises a
+// real build; the dependency set a translated unit needs is future work, surfaced
+// there rather than guessed now.
+func scratchGalaMod() string =
+    "module gala_verify_scratch\n\ngala 0.53.0\n"

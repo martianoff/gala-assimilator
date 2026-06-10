@@ -49,6 +49,12 @@ func mkSourceTest(id string, status UnitStatus) UnitRun {
         SourceTestRef(Unit = UnitId(Value = id), Path = id + ".go", Source = "")))
 }
 
+// mkAttempted builds a unit that has spent `attempts` translate→verify cycles.
+func mkAttempted(id string, status UnitStatus, attempts int) UnitRun {
+    val base = mkUnit(id, "x", status)
+    return base.Copy(Attempts = attempts)
+}
+
 // ----- UnitAt + UnitDetailVM ------------------------------------------------
 
 func TestUnitAtOutOfRange(t T) T {
@@ -207,6 +213,35 @@ func TestProjectRunStage(t T) T {
     val t1 = Eq(t,  ProjectRun(running).Stage,   StageRun())
     val t2 = Eq(t1, ProjectRun(verifying).Stage, StageVerify())
     return Eq(t2, ProjectRun(reported).Stage, StageReport())
+}
+
+// ----- fix-loop: per-unit attempts + run-level complete/iterating -----------
+
+// Attempts project onto each row so the UI can badge a retried unit.
+func TestProjectRunUnitAttempts(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkAttempted("a/clean", doneStatus("o", "r", noFlags()), 1),
+        mkAttempted("b/retried", Failed(Reason = "boom"), 3)))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.Rows.Get(0).Attempts, 1)
+    return Eq(t1, vm.Rows.Get(1).Attempts, 3)
+}
+
+// An incomplete run (a transient unit remains) is still iterating → Complete false.
+func TestProjectRunIterating(t T) T {
+    val running = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Translating())))
+    return IsFalse(t, ProjectRun(running).Complete)
+}
+
+// An all-terminal run (Done / Failed / Skipped) has reached a fixpoint → Complete.
+func TestProjectRunComplete(t T) T {
+    val settled = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Failed(Reason = "boom")),
+        mkUnit("c", "x", Skipped())))
+    return IsTrue(t, ProjectRun(settled).Complete)
 }
 
 func TestAnyActionable(t T) T {

@@ -32,12 +32,18 @@ func GoEngineWith(runner acp.AgentRunner[TaskAssignment, Result, Clarification])
 // GoEngineWithVerifier builds the real-frontend engine over a caller-supplied
 // runner AND verifier — the seam where a real `gala test` verifier replaces the
 // mock once translation emits real GALA, with no change to the scan -> plan -> run
-// -> gate pipeline.
-func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier) EnginePort = EnginePort(
+// -> gate pipeline. Uses the default per-unit fix-loop cap; GoEngineWithVerifierCap
+// sets a custom one.
+func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier) EnginePort =
+    GoEngineWithVerifierCap(runner, verifier, DefaultMaxAttempts())
+
+// GoEngineWithVerifierCap is GoEngineWithVerifier with a configurable per-unit
+// attempt cap on the translate -> verify -> fix loop.
+func GoEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort = EnginePort(
     Scan          = (req ScanRequest) => ScanGoWorkspace(req.Root),
     Plan          = (m WorkspaceModel) => goPlanFor(m),
     Run           = (p MigrationPlan) => runFor(p),
-    Advance       = (s RunState) => advance(runner, verifier, s),
+    Advance       = (s RunState) => advance(runner, verifier, maxAttempts, s),
     Events        = (s RunState) => s.Log,
     ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
     AnswerBlocker  = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),

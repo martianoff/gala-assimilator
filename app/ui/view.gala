@@ -331,7 +331,18 @@ func breadcrumbRow(rv runview.RunVM) Widget {
             Fixed(RuneCount(label) + 1, TextStyled(label, stageStyle(i, curIdx))))
         i = i + 1
     }
-    return Row(children.Append(Flex(1, Text(""))))
+    val spaced = children.Append(Flex(1, Text("")))
+    return Row(spaced.Append(Fixed(13, iteratingIndicator(rv))))
+}
+
+// iteratingIndicator surfaces the run-level fix loop: "iterating…" while the loop
+// is still turning, flipping to a settled "complete ✓" once the run reaches a
+// fixpoint (RunVM.Complete, projected from the engine's IsComplete).
+func iteratingIndicator(rv runview.RunVM) Widget {
+    if (rv.Complete) {
+        return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen()))
+    }
+    return TextStyled(" iterating…", DefaultStyle().WithFg(BrightYellow()))
 }
 
 func stageStyle(i int, curIdx int) Style {
@@ -449,7 +460,21 @@ func unitRowWidget(m Model, r runview.UnitRowVM, idx int) Widget {
         DefaultStyle().WithReverse().WithBold()
     else
         DefaultStyle()
-    return TextStyled("  " + r.Glyph + " " + r.Id, style).OnClick(MSelectUnit(Idx = idx))
+    val row = TextStyled("  " + r.Glyph + " " + r.Id, style).OnClick(MSelectUnit(Idx = idx))
+    // First-pass units (attempts ≤ 1) render clean; a retried unit gets a compact
+    // ×N badge (right-aligned on the row) so the fix loop is visible per row.
+    if (r.Attempts <= 1) { return row }
+    val badgeText = s"×${r.Attempts} "
+    val badge = TextStyled(badgeText, attemptBadgeStyle(selected)).OnClick(MSelectUnit(Idx = idx))
+    return Row(ArrayOf[LayoutChild](
+        Flex(1, row),
+        Fixed(RuneCount(badgeText), badge),
+    ))
+}
+
+func attemptBadgeStyle(selected bool) Style {
+    if (selected) { return DefaultStyle().WithReverse().WithBold() }
+    return DefaultStyle().WithFg(BrightYellow())
 }
 
 // ----- right: live activity log ---------------------------------------------

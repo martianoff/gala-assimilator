@@ -1,0 +1,110 @@
+package engine
+
+// End-to-end proof that the REAL pipeline carries a MULTI-PACKAGE Go project from
+// 0% to 100% and integrates per-package output to disk — one deterministic,
+// offline test stitching the whole arc together:
+//
+//   materialize -> ScanGoWorkspace -> GoEngine().Run -> RunToCompletion -> Integrate
+//
+// It is the consolidated counterpart to the focused goscan / emit tests: where
+// those prove one stage each, this asserts the SEAM across all of them holds for a
+// project with more than one package. It FAILS if any package is left incomplete
+// (a unit short of Done) or if any package's integrated output is missing on disk.
+//
+// Offline + deterministic: GoEngine() uses the MockTranslator + MockVerifier (no
+// network, no credentials), so it runs unchanged under `gala test`. The two-package
+// fixture is materialized to a temp dir (goscan_test.gala's materializeFixture)
+// because the harness does not stage testdata/. Engine-only: no gala_tui / app/ui,
+// and no acp.* run-contract type crosses into the assertions.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// TestMultiPackageEndToEnd drives the full real pipeline over the two-package
+// fixture (module-root `main` importing `mathx` + `mathx`'s source/test pair) and
+// asserts the whole arc: the multi-package scan shape, every unit in EVERY package
+// reaching Done (IsComplete — 0% -> 100%), and per-package integrated output.
+func TestMultiPackageEndToEnd(t T) T {
+    val src  = materializeFixture()
+    val out  = fs.MkdirTemp("", "gala_e2e").GetOrElse("")
+    val port = GoEngine()
+
+    // (1) Scan real disk -> multi-package shape: >= 2 packages, the cross-package
+    // edge, and BOTH a SourceUnit and a SourceTest discovered from real files.
+    val model = port.Scan(ScanRequest(Root = src))
+    val t1 = Eq(t, model.Packages.Length() >= 2, true)
+    val t2 = Eq(t1, model.CrossEdges.Exists((e DepEdge) => e.From == "." && e.To == "mathx"), true)
+    val t3 = Eq(t2, e2eHasKind(model, "source"), true)
+    val t4 = Eq(t3, e2eHasKind(model, "source_test"), true)
+
+    // (2) Run the bounded translate -> verify -> fix loop to a fixpoint over ALL
+    // packages: 0% done before advancing, IsComplete + 100% Done after.
+    val plan  = port.Plan(model)
+    val start = port.Run(plan)
+    val total = plan.Items.Length()
+    val t5 = Eq(t4, CountByDone(start), 0)
+    val final = RunToCompletion(port, start)
+    val t6 = Eq(t5, IsComplete(final), true)
+    val t7 = Eq(t6, CountByDone(final), total)
+
+    // Per-package completeness: every unit in EVERY package reached Done. This is
+    // the "no package left behind" check — it fails even if the aggregate count is
+    // 100% but a single package's unit settled anywhere but Done.
+    val t8 = Eq(t7, e2eAllPackagesDone(final, model), true)
+
+    // (3) Integrate the completed run -> per-package output on disk.
+    val t9 = port.Integrate(final, model, out) match {
+        case Integrated(files)  => Eq(t8, files.Length() >= 2, true)
+        case IntegrateFailed(r) => Fail(t8, "integrate failed: " + r)
+    }
+
+    // Per-package proof: the module-root package and `mathx` EACH emitted a gala.mod
+    // (carrying the "_gala"-mapped target module path) and their units as .gala
+    // files (.go -> .gala, layout preserved). Missing either package's output fails.
+    return e2eAssertPerPackageOutput(t9, out)
+}
+
+// e2eHasKind reports whether ANY unit across the workspace carries the given kind
+// tag ("source" / "source_test") — proves both kinds were discovered from disk.
+func e2eHasKind(m WorkspaceModel, want string) bool =
+    m.Packages.Exists((p Package) => p.Units.Exists((u Unit) => kindTag(u.Kind) == want))
+
+// e2eAllPackagesDone is true only when EVERY package has all of its units settled
+// in Done — the per-package completeness invariant the aggregate count can't see.
+func e2eAllPackagesDone(state RunState, m WorkspaceModel) bool =
+    !m.Packages.Exists((p Package) => !e2ePackageDone(state, p))
+
+// e2ePackageDone is true when every unit of the package reached Done in the run —
+// phrased "no unit is not-Done" to mirror e2eAllPackagesDone and short-circuit.
+func e2ePackageDone(state RunState, p Package) bool =
+    !p.Units.Exists((u Unit) => !e2eUnitDone(state, u.Id))
+
+// e2eUnitDone looks a unit up in the run by id and reports whether it is Done,
+// reusing emit's doneTarget (Some iff Done) rather than re-matching UnitStatus.
+func e2eUnitDone(state RunState, id UnitId) bool =
+    state.Units.Find((ur UnitRun) => ur.Unit.Value == id.Value) match {
+        case Some(ur) => doneTarget(ur).IsDefined()
+        case None()   => false
+    }
+
+// e2eAssertPerPackageOutput asserts BOTH packages' integrated output exists on disk:
+// the module-root package at out/ and `mathx` at out/mathx/, each with its mapped
+// gala.mod and its units emitted as .gala files.
+func e2eAssertPerPackageOutput(t T, out string) T {
+    // Module-root package (".") -> out/ : gala.mod (mapped module) + main.gala.
+    val rootMod = fs.ReadFileString(path.Join(out, "gala.mod")).GetOrElse("")
+    val t1 = Eq(t, strings.Contains(rootMod, "module example.com/simpleproj_gala"), true)
+    val t2 = Eq(t1, fs.Exists(path.Join(out, "main.gala")), true)
+
+    // `mathx` package -> out/mathx/ : gala.mod (mapped module) + add.gala + add_test.gala.
+    val mathxMod = fs.ReadFileString(path.Join(out, "mathx", "gala.mod")).GetOrElse("")
+    val t3 = Eq(t2, strings.Contains(mathxMod, "module example.com/simpleproj/mathx_gala"), true)
+    val t4 = Eq(t3, fs.Exists(path.Join(out, "mathx", "add.gala")), true)
+    return Eq(t4, fs.Exists(path.Join(out, "mathx", "add_test.gala")), true)
+}
