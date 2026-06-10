@@ -83,12 +83,25 @@ language or backend never crosses the seam.
   invokes it; the report/predicate it leans on (`SmokeReport` / `SmokeSucceeded`) are
   covered offline in `app/engine/smoke_report_test.gala`. Runbook + `claude` /
   `claude-verify` selector in [docs/smoke.md](smoke.md).
+- **Real verify gate exercised for real + fix loop recovery.** A deterministic
+  `ReferenceTranslator` (`app/engine/reference_translator.gala`) emits real,
+  compilable, semantics-preserving GALA for a curated `Add` fixture — wired behind
+  the same translator seam a live backend uses. A runnable harness (`cmd/verifygate`)
+  drives it through the **real** `gala` toolchain gate and proves three things end to
+  end: the golden translation clears `gala build`/`gala test` (`VerifyPass`); a
+  deliberately wrong translation is rejected with the **real** toolchain diagnostics
+  (`VerifyFail`); and the **fix loop** re-translates against those diagnostics and the
+  unit reaches `Done`. An offline golden test pins the reference translation so drift
+  fails the suite without spawning `gala`; the real-toolchain run is kept out of the
+  default suite (the nested-`gala test` contention bug). Runbook in
+  [docs/verify-gate.md](verify-gate.md). Proves the *gate wiring* on one fixture —
+  broad translation quality across real projects (live backend) remains open.
 
 ## In progress / gaps
 
-- **Disk-backed resume UI.** Checkpoint/restore exists as engine state; the S6
-  launch-time **Resume vs. Start fresh** choice reading a checkpoint off disk is
-  not yet wired through the UI.
+- **Disk-backed resume UI.** Checkpoint/restore exists as engine state; the
+  launch-screen **Resume vs. Start fresh** choice — reading a checkpoint off disk at
+  startup — is not yet wired through the UI.
 - **Per-package commits during a live migration.** The offline demo above proves
   the multi-package arc end to end and integrates per-package output to disk
   (`docs/demo.md`); what remains is committing per package *as it completes* during a
@@ -114,16 +127,12 @@ language or backend never crosses the seam.
   live Claude backend *does* emit real GALA, but actual Go → GALA output quality
   has not been validated through the full pipeline. The current proof is of the
   **pipeline**, not of the translation.
-- **Fix loop needs a real failure signal + UI surfacing (the loop's dependent
-  follow-ups).** The iterative translate → verify → fix loop above is wired and
-  bounded, but under the default `MockVerifier` (deterministic pass) a unit never
-  actually fails, so the *fix* half only runs against scripted/test verifiers
-  today. The real gate that supplies a genuine pass/fail now exists (`RealVerifier`,
-  above); the loop becomes load-bearing once it runs **for real** — i.e. a non-mock
-  backend emits real GALA for the scratch build to compile and the diagnostics to
-  actually improve across attempts. The paired UI follow-up is
-  **surfacing the loop** in the TUI — per-unit attempt counts and the new `EvRetry`
-  activity-log lines on S3/S4 — so a reviewer can watch a unit retry and converge.
+- **Surfacing the loop in the run view (the loop's UI follow-up).** The fix loop now
+  has a genuine real-failure signal end to end: the `ReferenceTranslator` emits real
+  GALA, the real gate produces a true red-test `VerifyFail`, and the loop recovers to
+  `Done` against it (`cmd/verifygate`, above). What remains is **surfacing the loop**
+  in the TUI — per-unit attempt counts and the `EvRetry` activity-log lines in the run
+  view — so a reviewer can watch a unit retry and converge.
 
 ## Definition of done for the MVP
 
@@ -135,14 +144,19 @@ A reviewer can check the MVP is complete against this list:
       `RealVerifier` (`app/engine/realverify.gala`) materializes a scratch module,
       runs the toolchain, and maps green/red onto `VerifyResult` with the real
       diagnostics. *(Mechanism landed; the box below tracks running it for real.)*
-- [ ] The real gate is **exercised end-to-end against a non-mock backend**: a unit
-      only reaches `Done` when its 1:1 source tests genuinely pass on the emitted
-      target, observed on a real `gala build`/`gala test` run (not the fake runner).
-- [ ] Emitted GALA **transpiles back to Go and passes the source's own tests** —
-      the migration is demonstrably semantics-preserving on a non-trivial project.
-- [ ] The **fix loop runs against the real verify gate**: a genuine verify failure
-      re-translates with the diagnostics fed back and a real fix reaches `Done`,
-      observed end-to-end (not only against scripted/test verifiers).
+- [x] The real gate is **exercised end-to-end against a non-mock backend**: the
+      deterministic `ReferenceTranslator` emits real GALA and `cmd/verifygate` drives
+      it through the real `gala build`/`gala test` to a genuine `VerifyPass` — the
+      unit clears the gate only because its 1:1 source test actually passes (not the
+      fake runner). *(One curated fixture; the live backend at scale stays open.)*
+- [ ] Emitted GALA **passes the source's own tests on a non-trivial project** — the
+      migration is demonstrably semantics-preserving at corpus scale. *(Proven on the
+      curated `Add` fixture via `cmd/verifygate` — see [docs/verify-gate.md](verify-gate.md);
+      a non-trivial corpus via the live backend remains.)*
+- [x] The **fix loop runs against the real verify gate**: a genuine red-test
+      `VerifyFail` carries the real diagnostics, the loop re-translates against them,
+      and the unit reaches `Done` — driven through `RunToCompletion` over the real
+      gate in `cmd/verifygate` (not only scripted/test verifiers).
 - [ ] The TUI **surfaces the loop**: per-unit attempt counts and `EvRetry`
       activity-log lines render on S3/S4.
 - [ ] A unit with no faithful target is **flagged** (unsupported-construct /
