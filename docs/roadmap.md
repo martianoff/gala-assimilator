@@ -106,12 +106,21 @@ language or backend never crosses the seam.
   signals are projected through the run view's own model (`ProjectRun`,
   `app/runview/runview.gala`); the engine's "unverified" tag is owned in one place
   (`IsUnverifiedFlag`, `app/engine/verify.gala`).
+- **Disk-backed resume across a process restart.** On startup the app probes the
+  project's checkpoint off disk, classifies it, and offers **Resume** vs. **Start
+  fresh** (`RunApp` → `ClassifyLoad` → the launch-screen offer; auto-save persists
+  the run as it advances). The frontier guarantee is proven literally: a run is saved
+  mid-flight, a *fresh* engine value loads only the on-disk bytes and resumes, and the
+  previously-`Done` units are never re-translated (asserted with an aborting runner —
+  any re-translation would surface as `Failed` — plus unchanged emitted text/attempt
+  counts and zero new progress events), while the unfinished frontier runs to
+  completion. `LoadCheckpoint` maps a missing file to a clean start and a truncated /
+  empty / corrupt file to `Corrupt` (never a crash), so the launch screen always has a
+  clean signal. Engine proof in `app/engine/resume_test.gala`; the UI Resume /
+  Start-fresh / corrupt-fallback paths in `app/ui/checkpoint_test.gala`.
 
 ## In progress / gaps
 
-- **Disk-backed resume UI.** Checkpoint/restore exists as engine state; the
-  launch-screen **Resume vs. Start fresh** choice — reading a checkpoint off disk at
-  startup — is not yet wired through the UI.
 - **Per-package commits during a live migration.** The offline demo above proves
   the multi-package arc end to end and integrates per-package output to disk
   (`docs/demo.md`); what remains is committing per package *as it completes* during a
@@ -169,9 +178,12 @@ A reviewer can check the MVP is complete against this list:
       unverified unit (⚠) on its row *and* in the activity log, so neither is ever
       visually identical to a clean pass; the gate's "unverified" tag is owned in one
       place (`IsUnverifiedFlag`, `app/engine/verify.gala`).
-- [ ] **Checkpoint/restore works across a process restart** through the UI: an
-      interrupted run resumes from the dependency frontier and never re-translates
-      finished units.
+- [x] **Checkpoint/restore works across a process restart** through the UI: the app
+      probes the on-disk checkpoint at startup and offers Resume vs. Start fresh; a
+      resumed run continues from the dependency frontier and never re-translates
+      finished units (proven across a literal disk round-trip with a fresh engine in
+      `app/engine/resume_test.gala`), with corrupt/missing checkpoints falling back to
+      a clean start.
 - [x] A **multi-package 0 → 100% demo** is reproducible from documented commands —
       `TestMultiPackageEndToEnd` + the [docs/demo.md](demo.md) runbook drive real
       scan → loop → per-package integrate offline. *(Per-package **commits** during a
@@ -179,8 +191,8 @@ A reviewer can check the MVP is complete against this list:
 - [x] A **live-backend smoke** drives the real `claude` CLI end to end — `cmd/smoke`
       scans a fixture, runs the loop to its fixpoint, and exits non-zero unless every
       unit reached `Done` ([docs/smoke.md](smoke.md)); kept out of the offline suite.
-- [ ] The **S1–S6 screens** remain green under the UI harness
+- [x] **All screens** (launch through review) remain green under the UI harness
       ([testing-ui.md](testing-ui.md)) — mouse + keyboard, wide + narrow.
-- [ ] `gala test` is green across the workspace and the layering invariant holds
+- [x] `gala test` is green across the workspace and the layering invariant holds
       (engine imports no `gala_tui`/`app/ui`; UI touches the engine only through
       `EnginePort`).
