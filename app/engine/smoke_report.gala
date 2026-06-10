@@ -1,0 +1,106 @@
+package engine
+
+// SmokeReport — a pure RunState -> human-readable text projection for the live
+// smoke entrypoint (cmd/smoke). It renders the same public domain values the UI
+// consumes (UnitRun / UnitStatus / EngineEvent), so the smoke cmd stays a thin IO
+// shell: select a backend, scan/plan/run, print this report, set the exit code.
+//
+// It belongs in the engine (not the cmd) for two reasons: the sealed-type matching
+// stays consolidated here rather than re-done in a `package main` file, and the
+// projection is then exercisable OFFLINE against MockEngine (smoke_report_test.gala)
+// without ever spawning the live `claude` CLI. Pure data -> string: no IO, no
+// gala_tui, no app/ui, no acp.* — the same transport-neutral discipline as the rest
+// of the engine.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    strings "martianoff/gala/strings"
+)
+
+// SmokeReport renders a finished run as a concise report: a header (backend + unit
+// count), one block per unit (final status, attempts, and the emitted GALA for a
+// unit that reached Done), the phase-transition log, and a summary line.
+func SmokeReport(backend string, state RunState) string {
+    val total       = state.Units.Length()
+    val done        = CountByDone(state)
+    val header      = s"=== gala-assimilator live smoke ===\nbackend: ${backend}\nunits:   ${total}"
+    val unitsBlock  = state.Units.Map((u UnitRun) => unitReport(u)).MkString("\n")
+    val transitions = "phase transitions:\n" + indentLines(transitionLines(state.Log))
+    val summary     = s"result: ${done}/${total} units done — " + completeWord(state)
+    return header + "\n\n" + unitsBlock + "\n\n" + transitions + "\n\n" + summary
+}
+
+// SmokeSucceeded is the smoke's pass/fail signal and the cmd's exit code: a NON-empty
+// run in which EVERY unit reached Done. A run that reaches its fixpoint with a unit
+// Blocked (a clarification), Failed (an abort / verify exhaustion), or Skipped is NOT
+// a success — it is surfaced in the report and the cmd exits non-zero, so a live
+// translation that stalls is never reported as a green run.
+func SmokeSucceeded(state RunState) bool =
+    state.Units.Length() > 0 && CountByDone(state) == state.Units.Length()
+
+// unitReport is one unit's block: its id, final status, attempt count, and — when it
+// reached Done — the GALA the backend emitted for it.
+func unitReport(u UnitRun) string {
+    val head = s"  ${u.Unit.Value}  [${statusText(u.Status)}]  attempts=${u.Attempts}"
+    return emittedGala(u.Status) match {
+        case Some(target) => head + "\n" + emittedBlock(target)
+        case None()       => head
+    }
+}
+
+// emittedBlock renders a Done unit's emitted GALA, indented under a small banner.
+func emittedBlock(target string) string =
+    "    --- emitted GALA ---\n" + indentLines(target)
+
+// statusText labels a unit's terminal status; Failed carries its reason so an abort
+// (e.g. a missing `claude` CLI) or verify exhaustion is visible, not swallowed.
+func statusText(s UnitStatus) string = s match {
+    case Queued()      => "queued"
+    case Translating() => "translating"
+    case Verifying()   => "verifying"
+    case Done(_)       => "done"
+    case Blocked(q)    => "blocked: " + q.Question
+    case Skipped()     => "skipped"
+    case Failed(r)     => "failed: " + r
+}
+
+// emittedGala is the emitted target text of a Done unit (None for any other status).
+func emittedGala(s UnitStatus) Option[string] = s match {
+    case Done(r)       => Some[string](r.TargetText)
+    case Queued()      => None[string]()
+    case Translating() => None[string]()
+    case Verifying()   => None[string]()
+    case Blocked(_)    => None[string]()
+    case Skipped()     => None[string]()
+    case Failed(_)     => None[string]()
+}
+
+// transitionLines renders the run's event log: each status transition, progress
+// note, and fix-loop retry, one line apiece — the "phase transitions" the smoke
+// reports. An empty log renders as a single placeholder line.
+func transitionLines(log Array[EngineEvent]) string {
+    if log.IsEmpty() { return "(none)" }
+    return log.Map((e EngineEvent) => eventText(e)).MkString("\n")
+}
+
+func eventText(e EngineEvent) string = e match {
+    case EvProgress(unit, ev)           => unit.Value + "  " + phaseText(ev.Phase) + ": " + ev.Note
+    case EvStatus(unit, st)             => unit.Value + "  -> " + statusText(st)
+    case EvRetry(unit, attempt, reason) => s"${unit.Value}  retry ${attempt}: ${reason}"
+}
+
+func phaseText(p ProgressPhase) string = p match {
+    case PhaseReading()   => "reading"
+    case PhaseEmitting()  => "emitting"
+    case PhaseVerifying() => "verifying"
+}
+
+// completeWord summarizes the run's outcome for the report footer.
+func completeWord(state RunState) string =
+    if (SmokeSucceeded(state)) "COMPLETE" else "INCOMPLETE (see unit states above)"
+
+// indentLines prefixes every line of a block with four spaces, so a multi-line value
+// (the emitted GALA, the transition log) reads as an indented sub-section.
+func indentLines(block string) string =
+    strings.Split(block, "\n").Map((l string) => "    " + l).MkString("\n")
