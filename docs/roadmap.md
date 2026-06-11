@@ -33,12 +33,12 @@ language or backend never crosses the seam.
   types). Proven in `app/engine/loop_test.gala`: fail-then-pass → `Done` at attempt
   2; never-passes → `Failed` at the cap with diagnostics; the run reaches the
   completion fixpoint.
-- **S1–S6 screens, mouse + keyboard, responsive.** The interview (S1), plan (S2),
-  dashboard (S3), diff/review (S4), blocker (S5), and summary/resume (S6) screens
-  are tested through real input and at wide/narrow widths. See
-  [testing-ui.md](testing-ui.md) for the harness; the mouse/keyboard parity is
-  pinned in `app/ui/s1_interaction_test.gala`, `s3_test.gala`, `s4_test.gala`,
-  and `s5_test.gala`.
+- **All screens, mouse + keyboard, responsive.** The setup/interview, plan review,
+  run dashboard, unit/diff review, blocker, and summary/resume screens are tested
+  through real input and at wide/narrow widths. See [testing-ui.md](testing-ui.md)
+  for the harness; the mouse/keyboard parity is pinned in the per-screen UI tests
+  (`app/ui/s1_interaction_test.gala`, `s3_test.gala`, `s4_test.gala`,
+  `s5_test.gala` — filenames retain the legacy numeric prefix).
 - **Verify gate on 1:1 source tests.** The correctness signal is the *source's
   own* tests, replicated 1:1 (`UnitKind` `SourceTest`). Agent-added tests
   (`AddedTest`) are excluded before they can reach the verifier, so an agent can
@@ -61,8 +61,9 @@ language or backend never crosses the seam.
   (`ClaudeEngineRealVerify` / `SelectBackend "claude-verify"`). End-to-end
   validation is the remaining step — see below.
 - **Blocker park / answer.** A unit that needs clarification parks as `Blocked`;
-  the user answers it on S5 and the unit re-queues and continues. Driven through
-  the real run machinery in `app/ui/s5_test.gala` via `ScriptedBlockerEngine`.
+  the user answers it on the blocker screen and the unit re-queues and continues.
+  Driven through the real run machinery in `app/ui/s5_test.gala` via
+  `ScriptedBlockerEngine`.
 - **Checkpoint / restore.** Run state is pure data and is checkpointed after each
   transition; a migration can be stopped and restored. (`app/engine/persist.gala`,
   `app/ui/checkpoint.gala`.)

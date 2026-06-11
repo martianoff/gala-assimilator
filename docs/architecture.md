@@ -12,7 +12,7 @@ engine internals. The first supported pair is **Go → GALA**.
 ```
 cmd/gala_assimilator   runnable entrypoint — picks a backend, launches the TUI (gala_tui RunWithMouse)
         │
-app/ui                 gala_tui Elm app: Model / Update / View, screens (S1–S6), widgets
+app/ui                 gala_tui Elm app: Model / Update / View, screens, widgets
         │  (consumes the engine ONLY through app/engine's public EnginePort)
 app/runview            UI-side projection of engine RunState → plain view structs
         │  (gala_tui-free; isolates engine sealed-type matching — see "Seam notes")
@@ -76,10 +76,12 @@ Screens are routed with `ScreenStack`. Every control is reachable by **both mous
 and keyboard**, the layout is responsive (with a minimum-size notice), and each
 screen ships render + interaction tests.
 
-Screens: **S1** Setup/Interview · **S2** Scan & Plan review · **S3** Assimilation
-dashboard (split board: unit tree + live agent log + progress) · **S4** Unit/diff
-review (diff + agent rationale + verify) · **S5** Blocker/clarification · **S6**
-Report (+ resume entry).
+Screens (in order): **Setup / Interview** (pick source project + agent backend) ·
+**Plan review** (scan & package/unit plan) · **Run dashboard** (split board: unit
+tree + live agent log + progress, 0 → 100 %) · **Unit / diff review** (diff + agent
+rationale + verify) · **Blocker / clarification** · **Summary** (report + resume
+entry). At launch, a checkpoint on disk adds a **Resume vs. Start fresh** prompt
+ahead of Setup.
 
 ## Seam notes (GALA toolchain)
 

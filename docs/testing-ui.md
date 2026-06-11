@@ -59,12 +59,12 @@ func TestS3NarrowStacksBoard(t T) T {
 
 `midRunModel` (in the same file) shows the idiom for getting a model into a
 specific state for a snapshot: build a real Mock run, then advance it with
-`StepAll` before rendering (see [Driving a full run](#driving-a-full-run-scanplanruntick)
+`StepAll` before rendering (see [Driving a full run](#driving-a-full-run-scan--plan--run--tick)
 below).
 
-S4 snapshots assert the diff body, the rationale, the verify badge, and the action
-bar all render — at two widths (`s4_test.gala`, `TestS4WideRendersDiffRationaleVerify`
-and `TestS4NarrowRendersStacked`).
+Unit / diff-view snapshots assert the diff body, the rationale, the verify badge,
+and the action bar all render — at two widths (`s4_test.gala`,
+`TestS4WideRendersDiffRationaleVerify` and `TestS4NarrowRendersStacked`).
 
 ## Interaction tests
 
@@ -135,7 +135,7 @@ moment layout shifts. Instead we locate the target by its rendered text:
 3. `.Click(x + 1, y)` — the `+1` lands the click inside the control rather than on
    its leading glyph/edge.
 
-The real S1 "skip" example (`s1_interaction_test.gala`,
+The real setup-screen "skip" example (`s1_interaction_test.gala`,
 `TestMouseSelectsSkipPolicy`) — selecting the Skip policy with the mouse, no
 keyboard touched:
 
@@ -255,10 +255,10 @@ func doneOf(m Model) int = m.Run match {
 
 `StepAll` starts from a `Program`'s initial model; to continue a sequence from an
 existing model, `update_test.gala` provides `StepAll2(m, msgs)`, which rebuilds a
-`Program` around the given model. The S4 reducer tests use it to drive
+`Program` around the given model. The unit/diff-view reducer tests use it to drive
 accept/skip from a mid-run model (`s4_test.gala`).
 
-## Driving a blocker to completion (S5)
+## Driving a blocker to completion
 
 The `MockEngine` always succeeds, so blocker handling can't be tested through it.
 `s5_test.gala` swaps in `engine.ScriptedBlockerEngine("Is x nullable?")` via a
