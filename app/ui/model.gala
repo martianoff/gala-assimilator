@@ -27,6 +27,7 @@ func RouteS3() string = "S3"   // Assimilation dashboard
 func RouteS4() string = "S4"   // Unit / diff review
 func RouteS5() string = "S5"   // Blocker / clarification
 func RouteS6() string = "S6"   // Run report (+ resume affordance)
+func RouteS7() string = "S7"   // Directory browser (source-project picker)
 
 // S1 focus pane ids — order defines the Tab ring.
 func PaneBrowse() string      = "browse"
@@ -56,11 +57,31 @@ func s1Panes() Array[string] =
 
 // Minimum viewport the full layout needs; below this a resize notice shows.
 func MinCols() int = 60
-func MinRows() int = 14
+func MinRows() int = 16
 
 // Above this width S1 combines retry+backend onto one row; S3 keeps the split
 // board side-by-side. Below it, both stack.
 func WideCols() int = 86
+
+// BrowseEntry is one row in the directory picker: a child directory (or the ".."
+// parent), the absolute path it navigates to / commits, and a marker when the
+// directory looks like a project root (carries a go.mod / package.json / Cargo.toml).
+struct BrowseEntry(
+    Name     string,
+    Path     string,
+    IsParent bool,
+    Marker   string,
+)
+
+// BrowseState is the live directory picker (S7): the directory being listed, its
+// entries (".." first, then child directories), the cursor, and a loading flag
+// that's true between opening the screen and the async listing landing.
+struct BrowseState(
+    Dir     string,
+    Entries Array[BrowseEntry],
+    Cursor  int,
+    Loading bool,
+)
 
 struct Model(
     Screens ScreenStack,
@@ -92,6 +113,8 @@ struct Model(
     LogScroll  int,   // lines scrolled up from the tail (0 = following latest)
     // S5 clarification answer buffer (the unit under review/answer is TreeCursor)
     AnswerText string,
+    // S7 directory picker (None unless the browser is open)
+    Browse Option[BrowseState],
     // checkpoint / resume
     Persist     bool,                         // auto-save the run during ticks (app: on; tests: off)
     ResumeOffer Option[runview.LoadSummary],  // a checkpoint found at launch (S0 prompt)
@@ -136,6 +159,7 @@ func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model
         TreeCursor = 0,
         LogScroll  = 0,
         AnswerText = "",
+        Browse      = None[BrowseState](),
         Persist     = false,
         ResumeOffer = None[runview.LoadSummary](),
         LastSaveOk  = true,

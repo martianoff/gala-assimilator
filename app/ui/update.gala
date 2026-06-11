@@ -39,13 +39,20 @@ sealed type Msg {
     case MNoOp()
 
     // S1 direct (mouse), each also moves focus to that control
-    case MBrowse()
+    case MBrowse()                             // open the directory picker (S7)
     case MCycleTarget()
     case MSetUnsupported(P UnsupportedPolicy)
     case MStepRetry(Dir int)
     case MSetBackend(B AgentBackend)
     case MCycleAmbiguity()
     case MScanRequested()
+
+    // S7 directory picker
+    case MBrowseLoaded(State BrowseState)      // async listing landed
+    case MBrowseClick(Idx int)                 // mouse: highlight a row
+    case MBrowseOpen()                         // descend into the highlighted dir
+    case MBrowseSelect()                       // commit the highlighted dir as source
+    case MSourceDetected(Info SourceInfo)      // async real detection landed
 
     // S2 / S3 direct (mouse)
     case MStartRun()
@@ -85,8 +92,8 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MFocusNext()  => (focusNext(m), NoCmd[Msg]())
     case MFocusPrev()  => (focusPrev(m), NoCmd[Msg]())
     case MActivate()   => activate(m)
-    case MStepLeft()   => (step(m, -1), NoCmd[Msg]())
-    case MStepRight()  => (step(m, 1), NoCmd[Msg]())
+    case MStepLeft()   => stepLeft(m)
+    case MStepRight()  => stepRight(m)
     case MNavUp()      => (nav(m, -1), NoCmd[Msg]())
     case MNavDown()    => (nav(m, 1), NoCmd[Msg]())
     case MScrollUp()   => (scrollLog(m, 1), NoCmd[Msg]())
@@ -94,7 +101,7 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MKeyChar(c)   => keyChar(m, c)
     case MKeyBackspace() => (keyBackspace(m), NoCmd[Msg]())
 
-    case MBrowse()          => (browse(focusOn(m, PaneBrowse())), NoCmd[Msg]())
+    case MBrowse()          => openBrowse(m)
     case MCycleTarget()     => (cycleTarget(focusOn(m, PaneTarget()), 1), NoCmd[Msg]())
     case MSetUnsupported(p) => {
         val mf = focusOn(m, PaneUnsupported())
@@ -107,6 +114,12 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     }
     case MCycleAmbiguity()  => (cycleAmbiguity(focusOn(m, PaneAmbiguity()), 1), NoCmd[Msg]())
     case MScanRequested()   => startScan(focusOn(m, PaneScan()))
+
+    case MBrowseLoaded(st)     => (browseLoaded(m, st), NoCmd[Msg]())
+    case MBrowseClick(i)       => (browseHighlight(m, i), NoCmd[Msg]())
+    case MBrowseOpen()         => browseOpen(m)
+    case MBrowseSelect()       => browseSelect(m)
+    case MSourceDetected(info) => (m.Copy(Source = info), NoCmd[Msg]())
 
     case MStartRun()   => startRun(m)
     case MSelectUnit(i) => (selectUnit(m, i), NoCmd[Msg]())
@@ -163,6 +176,7 @@ func activate(m Model) Tuple[Model, Cmd[Msg]] {
     }
     if (r == RouteS3()) { return openUnit(m) }
     if (r == RouteS5()) { return submitAnswer(m) }
+    if (r == RouteS7()) { return browseOpen(m) }
     if (r == RouteS6()) { return (m, loadCmd(m.Port, m.SourceDir)) }   // resume from disk
     return noCmd(m)
 }
@@ -285,6 +299,7 @@ func keyChar(m Model, c rune) Tuple[Model, Cmd[Msg]] {
     val r = m.Screens.Current()
     if (r == RouteS5()) { return (typeAnswer(m, c), NoCmd[Msg]()) }
     if (c == 'q') { return (m, QuitCmd[Msg]()) }
+    if (r == RouteS7() && c == 's') { return browseSelect(m) }
     if (r == RouteS4()) { return reviewKey(m, c) }
     if (r == RouteS3() && c == 'p') { return (m.Copy(Screens = m.Screens.Push(RouteS6())), NoCmd[Msg]()) }
     if (r == RouteS6() && c == 'r') { return (m, loadCmd(m.Port, m.SourceDir)) }   // resume from disk
@@ -310,7 +325,7 @@ func keyBackspace(m Model) Model {
 // s1Activate runs the focused S1 control's primary action.
 func s1Activate(m Model) Tuple[Model, Cmd[Msg]] {
     val pane = m.Focus.Current()
-    if (pane == PaneBrowse())      { return noCmd(browse(m)) }
+    if (pane == PaneBrowse())      { return openBrowse(m) }
     if (pane == PaneTarget())      { return noCmd(cycleTarget(m, 1)) }
     if (pane == PaneUnsupported()) { return noCmd(moveUnsupported(m, 1)) }
     if (pane == PaneRetry())       { return noCmd(stepRetry(m, 1)) }
@@ -318,6 +333,19 @@ func s1Activate(m Model) Tuple[Model, Cmd[Msg]] {
     if (pane == PaneAmbiguity())   { return noCmd(cycleAmbiguity(m, 1)) }
     if (pane == PaneScan())        { return startScan(m) }
     return noCmd(m)
+}
+
+// stepLeft / stepRight dispatch the horizontal arrows: in the S7 picker they
+// navigate the tree (← parent, → descend, both issuing a listing Cmd); elsewhere
+// they fall through to the pure S1 cycler step.
+func stepLeft(m Model) Tuple[Model, Cmd[Msg]] {
+    if (m.Screens.Current() == RouteS7()) { return browseParent(m) }
+    return (step(m, -1), NoCmd[Msg]())
+}
+
+func stepRight(m Model) Tuple[Model, Cmd[Msg]] {
+    if (m.Screens.Current() == RouteS7()) { return browseOpen(m) }
+    return (step(m, 1), NoCmd[Msg]())
 }
 
 // step is ArrowLeft/Right — S1 cyclers only.
@@ -332,17 +360,23 @@ func step(m Model, dir int) Model {
     return m
 }
 
-// nav is ArrowUp/Down — S3 only: move the tree cursor or scroll the log.
+// nav is ArrowUp/Down — S3 tree/log, or the S7 picker cursor.
 func nav(m Model, dir int) Model {
-    if (m.Screens.Current() != RouteS3()) { return m }
+    val r = m.Screens.Current()
+    if (r == RouteS7()) { return browseMove(m, dir) }
+    if (r != RouteS3()) { return m }
     if (m.S3Focus == PaneLog()) { return scrollLog(m, -dir) }
     val n = unitCount(m)
     val hi = if (n > 0) n - 1 else 0
     return m.Copy(TreeCursor = clampInt(m.TreeCursor + dir, 0, hi))
 }
 
-func scrollLog(m Model, amount int) Model =
-    m.Copy(LogScroll = clampInt(m.LogScroll + amount, 0, logLen(m)))
+// scrollLog drives the S3 log tail, or the S7 picker cursor when the browser
+// owns the screen (wheel up moves the cursor up).
+func scrollLog(m Model, amount int) Model {
+    if (m.Screens.Current() == RouteS7()) { return browseMove(m, -amount) }
+    return m.Copy(LogScroll = clampInt(m.LogScroll + amount, 0, logLen(m)))
+}
 
 func selectUnit(m Model, i int) Model {
     val n = unitCount(m)
@@ -383,13 +417,6 @@ func toggleBackend(m Model, dir int) Model {
     return m.Copy(Backend = opts.Get(clampIdx(cur + dir, opts.Length())))
 }
 
-func browse(m Model) Model {
-    val dirs = browseDirs()
-    val cur = indexOfDir(dirs, m.SourceDir)
-    val nextDir = dirs.Get(clampIdx(cur + 1, dirs.Length()))
-    return m.Copy(SourceDir = nextDir, Source = detectSource(nextDir))
-}
-
 // ----- engine flow: scan → plan → run → tick --------------------------------
 
 // startScan builds the engine port from the S1 backend selection, then probes
@@ -405,18 +432,24 @@ func startScan(m Model) Tuple[Model, Cmd[Msg]] {
     return (m.Copy(Port = port, Scanning = true), cmd)
 }
 
-func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) Model =
-    m.Copy(
+// scanPlanned routes to the S2 plan summary. An empty plan (the scanned folder
+// had no migratable units) is a dead end, so focus the back button rather than a
+// start action the view doesn't even offer.
+func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) Model {
+    val focus = if (plan.Items.IsEmpty()) PaneBack() else PaneStart()
+    return m.Copy(
         Scanning  = false,
         Workspace = Some(ws),
         Plan      = Some(plan),
-        S2Focus   = PaneStart(),
+        S2Focus   = focus,
         Screens   = m.Screens.Push(RouteS2()),
     )
+}
 
 // startRun materializes the run and routes to S3, kicking the first tick.
 func startRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
     case Some(plan) => {
+        if (plan.Items.IsEmpty()) { return noCmd(m) }   // nothing to migrate — no empty run
         val port = m.Port
         val cmd = Async[engine.RunState, Msg](
             () => port.Run(plan),
@@ -483,16 +516,6 @@ func back(m Model) Tuple[Model, Cmd[Msg]] {
 }
 
 // ----- index lookups ---------------------------------------------------------
-
-func indexOfDir(dirs Array[string], dir string) int {
-    var i = 0
-    val n = dirs.Length()
-    for i < n {
-        if (dirs.Get(i) == dir) { return i }
-        i = i + 1
-    }
-    return 0
-}
 
 func indexOfUnsupported(opts Array[UnsupportedPolicy], p UnsupportedPolicy) int {
     var i = 0

@@ -5,6 +5,7 @@ import (
     "github.com/martianoff/gala-assimilator/app/engine"
     "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
+    str "martianoff/gala/strings"
     . "martianoff/gala/test"
 )
 
@@ -75,10 +76,78 @@ func TestSetBackendClaude(t T) T {
     return IsTrue(t, BackendEq(m1.Backend, ClaudeBackend()))
 }
 
-func TestBrowseCyclesSourceDirAndRedetects(t T) T {
-    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MBrowse()))
-    val t1 = Eq(t, m1.SourceDir, "/workdir/sample-lib")
+// Browse now opens the S7 directory picker (in a loading state) and emits the
+// async listing Cmd, instead of cycling hardcoded paths.
+func TestBrowseOpensPicker(t T) T {
+    val (m1, cmds) = StepAll(prog(), ArrayOf[Msg](MBrowse()))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS7())
+    val t2 = IsTrue(t1, cmds.NonEmpty())         // an Async listing Cmd was emitted
+    return m1.Browse match {
+        case Some(b) => IsTrue(t2, b.Loading)
+        case None()  => IsTrue(t2, false)
+    }
+}
+
+// browseFixture is a deterministic listing (no filesystem IO) with the cursor on
+// a project-marked child directory.
+func browseFixture() BrowseState =
+    BrowseState(
+        Dir     = "/workdir",
+        Entries = ArrayOf[BrowseEntry](
+            BrowseEntry(Name = "..",         Path = "/",                  IsParent = true,  Marker = ""),
+            BrowseEntry(Name = "myproject",  Path = "/workdir/myproject", IsParent = false, Marker = "go.mod"),
+            BrowseEntry(Name = "sample-lib", Path = "/workdir/sample",    IsParent = false, Marker = ""),
+        ),
+        Cursor  = 1,
+        Loading = false,
+    )
+
+// A loaded listing is adopted and rendered in the picker.
+func TestBrowseLoadedShowsEntries(t T) T {
+    val msgs = ArrayOf[Msg](MBrowse(), MBrowseLoaded(State = browseFixture()))
+    val (m1, _) = StepAll(prog(), msgs)
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    val t1 = IsTrue(t, out.Contains("myproject"))
+    return IsTrue(t1, out.Contains("go.mod"))
+}
+
+// Selecting the highlighted directory commits it as the source and returns to S1.
+func TestBrowseSelectSetsSourceAndPops(t T) T {
+    val msgs = ArrayOf[Msg](MBrowse(), MBrowseLoaded(State = browseFixture()), MBrowseSelect())
+    val (m1, _) = StepAll(prog(), msgs)
+    val t1 = Eq(t, m1.SourceDir, "/workdir/myproject")
+    return Eq(t1, m1.Screens.Current(), RouteS1())
+}
+
+// The async detection result lands on the S1 readout.
+func TestSourceDetectedUpdatesReadout(t T) T {
+    val info = SourceInfo(Lang = "Rust", Marker = "Cargo.toml found", FileCnt = 7, Detected = true)
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MSourceDetected(Info = info)))
+    val t1 = Eq(t, m1.Source.Lang, "Rust")
     return IsTrue(t1, m1.Source.Detected)
+}
+
+// ----- empty / non-project source -------------------------------------------
+
+func emptyPlan() engine.MigrationPlan = engine.MigrationPlan(Items = EmptyArray[engine.PlanItem]())
+
+// Scanning a folder with no migratable units lands on S2 but focuses Back (a dead
+// end), and the plan summary shows the explanatory empty state — not a start action.
+func TestEmptyPlanRoutesToS2BackState(t T) T {
+    val ws = engine.MockEngine().Scan(engine.ScanRequest(Root = "/x"))
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MScanPlanned(Workspace = ws, Plan = emptyPlan())))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS2())
+    val t2 = Eq(t1, m1.S2Focus, PaneBack())
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    return IsTrue(t2, out.Contains("No migratable units"))
+}
+
+// Starting a run with an empty plan is a no-op: it never enters S3.
+func TestEmptyPlanStartIsGuarded(t T) T {
+    val ws = engine.MockEngine().Scan(engine.ScanRequest(Root = "/x"))
+    val msgs = ArrayOf[Msg](MScanPlanned(Workspace = ws, Plan = emptyPlan()), MStartRun())
+    val (m1, _) = StepAll(prog(), msgs)
+    return IsFalse(t, m1.Screens.Current() == RouteS3())
 }
 
 // ----- engine flow: scan → plan → run → tick --------------------------------
