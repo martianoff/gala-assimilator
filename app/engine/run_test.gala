@@ -1,0 +1,66 @@
+package engine
+
+// Tests for the engine's acp-backed run machinery: the deterministic MockTranslator
+// round-trip, every terminus / cancel exercised THROUGH the acp AgentRunner port
+// via ScriptedRunner, and the bridge extractors (acp_bridge.gala) that destructure
+// the generic outcome. Pattern-matching acp's sealed cases is the bridge's job, so
+// these tests dispatch via acp.RunOutcomeTag / acp.CancelOutcomeTag and the
+// outcome* extractors rather than matching the qualified cases directly.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    acp "github.com/martianoff/gala-acp"
+)
+
+func runTask() TaskId = TaskId(Value = "task-1")
+
+func sampleResult() Result =
+    Result(Task = runTask(), TargetText = "x", Rationale = "id", Flags = EmptyArray[UnsupportedFlag]())
+
+func sampleClarification() Clarification =
+    Clarification(Task = runTask(), Question = "is x nullable?")
+
+// acp.RunOutcomeTag projects each engine terminus to its stable token.
+func TestRunOutcomeExhaustive(t T) T {
+    val t1 = Eq(t, acp.RunOutcomeTag(resultOutcome(sampleResult())), "result")
+    val t2 = Eq(t1, acp.RunOutcomeTag(clarifyOutcome(sampleClarification())), "clarification")
+    return Eq(t2, acp.RunOutcomeTag(abortOutcome("boom")), "aborted")
+}
+
+// The MockTranslator streams reading->emitting->verifying then terminates in a
+// Result carrying the assignment's TaskId.
+func TestMockTranslatorRoundTrip(t T) T {
+    val runner = MockTranslator()
+    val tx = runner.Submit(sampleAssignment())
+    val t1 = Eq(t, tx.Steps.Length(), 3)
+    val t2 = Eq(t1, stepNotes(tx.Steps).Get(0).Phase, "reading")
+    return outcomeResult(tx.Final) match {
+        case Some(r) => Eq(t2, r.Task.Value, "task-1")
+        case None()  => Fail(t2, "mock should terminate in a Result")
+    }
+}
+
+// Every terminus produced THROUGH the port via ScriptedRunner.
+func TestScriptedRunnerTermini(t T) T {
+    val clarRunner = ScriptedRunner(clarifyOutcome(sampleClarification()), cancelledAck())
+    val t1 = outcomeClarification(clarRunner.Submit(sampleAssignment()).Final) match {
+        case Some(c) => Eq(t, c.Question, "is x nullable?")
+        case None()  => Fail(t, "expected a clarification terminus")
+    }
+    val abortRunner = ScriptedRunner(abortOutcome("agent crashed"), cancelledAck())
+    val t2 = outcomeAbort(abortRunner.Submit(sampleAssignment()).Final) match {
+        case Some(reason) => Eq(t1, reason, "agent crashed")
+        case None()       => Fail(t1, "expected an abort terminus")
+    }
+    // progress prefix still present on a non-result terminus
+    return GreaterOrEq(t2, abortRunner.Submit(sampleAssignment()).Steps.Length(), 1)
+}
+
+// Both CancelOutcome cases reachable through the port (acp.CancelOutcomeTag).
+func TestRunnerCancelBothCases(t T) T {
+    val t1 = Eq(t, acp.CancelOutcomeTag(MockTranslator().Cancel("task-1")), "cancelled")
+    val notRunning = ScriptedRunner(abortOutcome("n/a"), notRunningAck())
+    return Eq(t1, acp.CancelOutcomeTag(notRunning.Cancel("task-1")), "not_running")
+}

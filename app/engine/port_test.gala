@@ -1,0 +1,162 @@
+package engine
+
+// Tests for the engine PUBLIC PORT + its deterministic mock: a full offline run
+// streaming progress and terminal outcomes, the act-on-unit and answer-blocker
+// transitions, and a pure-data checkpoint round-trip.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+)
+
+func scanned(eng EnginePort) RunState =
+    eng.Run(eng.Plan(eng.Scan(ScanRequest(Root = "."))))
+
+func countProgress(log Array[EngineEvent]) int =
+    log.Count((e EngineEvent) => e match {
+        case EvProgress(_, _)  => true
+        case EvStatus(_, _)    => false
+        case EvRetry(_, _, _)  => false
+    })
+
+func firstUnitId(s RunState) UnitId = s.Units.Get(0).Unit
+
+// ----------------------------------------------------------------------------
+// Happy path: a few units march to Done, streaming progress + status events.
+// ----------------------------------------------------------------------------
+
+func TestMockRunReachesDone(t T) T {
+    val eng = MockEngine()
+    val s0 = scanned(eng)
+    // the stub workspace has 4 units across 2 packages, all start Queued.
+    val t1 = Eq(t, s0.Units.Length(), 4)
+    val t2 = Eq(t1, CountByDone(s0), 0)
+
+    val finished = RunToCompletion(eng, s0)
+    val t3 = Eq(t2, CountByDone(finished), 4)
+    // streamed progress actually happened (sourced from the transcript).
+    val t4 = GreaterOrEq(t3, countProgress(eng.Events(finished)), 1)
+    // the run is a fixpoint once everything is Done.
+    return Eq(t4, eng.Advance(finished).Log.Length(), finished.Log.Length())
+}
+
+// The first events of the run move unit one Queued -> Translating -> Verifying.
+func TestMockRunStreamsPhaseTransitions(t T) T {
+    val eng = MockEngine()
+    val s0 = scanned(eng)
+    val s1 = eng.Advance(s0)
+    return s1.Log.Get(0) match {
+        case EvStatus(_, status) => status match {
+            case Translating() => IsTrue(t, true)
+            case _             => Fail(t, "first transition should be Translating")
+        }
+        case EvProgress(_, _) => Fail(t, "first event should be a status transition")
+        case EvRetry(_, _, _) => Fail(t, "first event should be a status transition")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Terminal outcomes through the port: Clarification -> Blocked, Abort -> Failed.
+// ----------------------------------------------------------------------------
+
+func TestClarificationBlocksUnit(t T) T {
+    val eng = MockEngineWith(ScriptedRunner(clarifyOutcome(sampleClarification()), cancelledAck()))
+    val finished = RunToCompletion(eng, scanned(eng))
+    // a clarifying runner blocks every unit; none reach Done.
+    val t1 = Eq(t, CountByDone(finished), 0)
+    return finished.Units.Get(0).Status match {
+        case Blocked(c) => Eq(t1, c.Question, "is x nullable?")
+        case _          => Fail(t1, "unit should be Blocked awaiting an answer")
+    }
+}
+
+func TestAbortFailsUnit(t T) T {
+    val eng = MockEngineWith(ScriptedRunner(abortOutcome("agent crashed"), cancelledAck()))
+    val finished = RunToCompletion(eng, scanned(eng))
+    return finished.Units.Get(0).Status match {
+        case Failed(reason) => Eq(t, reason, "agent crashed")
+        case _              => Fail(t, "unit should be Failed on abort")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Answer-blocker: resolving a clarification re-queues the unit with the answer
+// threaded onto its assignment (the clarification-resolution loop).
+// ----------------------------------------------------------------------------
+
+func TestAnswerBlockerResolves(t T) T {
+    val eng = MockEngineWith(ScriptedRunner(clarifyOutcome(sampleClarification()), cancelledAck()))
+    val blocked = RunToCompletion(eng, scanned(eng))
+    val id = firstUnitId(blocked)
+    val answered = eng.AnswerBlocker(blocked, id, Answer(Task = TaskId(Value = id.Value), Response = "yes"))
+    return answered.Units.Find((u UnitRun) => u.Unit.Value == id.Value) match {
+        case Some(u) => {
+            val tq = u.Status match {
+                case Queued() => IsTrue(t, true)
+                case _        => Fail(t, "answered unit should be re-Queued")
+            }
+            return Eq(tq, u.Assignment.Answers.Length(), 1)
+        }
+        case None() => Fail(t, "unit must still exist after answering")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Act on unit: skip / retry / accept.
+// ----------------------------------------------------------------------------
+
+func TestActSkip(t T) T {
+    val eng = MockEngine()
+    val id = firstUnitId(scanned(eng))
+    val s = eng.ActOnUnit(scanned(eng), id, ActSkip())
+    return s.Units.Get(0).Status match {
+        case Skipped() => IsTrue(t, true)
+        case _         => Fail(t, "unit should be Skipped")
+    }
+}
+
+func TestActAcceptKeepsDone(t T) T {
+    val eng = MockEngine()
+    val finished = RunToCompletion(eng, scanned(eng))
+    val id = firstUnitId(finished)
+    val s = eng.ActOnUnit(finished, id, ActAccept())
+    return s.Units.Get(0).Status match {
+        case Done(_) => IsTrue(t, true)
+        case _       => Fail(t, "accepting a Done unit keeps it Done")
+    }
+}
+
+func TestActRetryThreadsPriorFailure(t T) T {
+    val eng = MockEngineWith(ScriptedRunner(abortOutcome("boom"), cancelledAck()))
+    val failed = RunToCompletion(eng, scanned(eng))
+    val id = firstUnitId(failed)
+    val retried = eng.ActOnUnit(failed, id, ActRetry())
+    return retried.Units.Find((u UnitRun) => u.Unit.Value == id.Value) match {
+        case Some(u) => {
+            val tq = u.Status match {
+                case Queued() => IsTrue(t, true)
+                case _        => Fail(t, "retried unit should be re-Queued")
+            }
+            return u.Assignment.PriorFailure match {
+                case Some(pf) => Eq(tq, pf.Summary, "boom")
+                case None()   => Fail(tq, "retry must thread a PriorFailure from the failure")
+            }
+        }
+        case None() => Fail(t, "unit must still exist after retry")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Checkpoint round-trips as pure data; resuming continues to completion.
+// ----------------------------------------------------------------------------
+
+func TestCheckpointRoundTrip(t T) T {
+    val eng = MockEngine()
+    val mid = eng.Advance(eng.Advance(scanned(eng)))
+    val resumed = eng.Resume(eng.Checkpoint(mid))
+    val t1 = Eq(t, resumed.Units.Length(), mid.Units.Length())
+    val t2 = Eq(t1, resumed.Log.Length(), mid.Log.Length())
+    // resuming loses nothing: the run still completes from the checkpoint.
+    return Eq(t2, CountByDone(RunToCompletion(eng, resumed)), 4)
+}

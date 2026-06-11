@@ -1,0 +1,70 @@
+package main
+
+// cmd/smoke — the LIVE-backend runtime smoke. It is the one place the live Claude
+// translator is driven against the real `claude` CLI end to end: select the live
+// backend, scan a tiny bundled Go fixture, run the translate -> verify -> fix loop to
+// its fixpoint, print a report, and exit non-zero unless every unit reached Done.
+//
+// WHY A cmd, NOT A TEST: this needs `claude` on PATH and valid credentials, so it can
+// never live in `gala test` (the whole suite is offline against MockEngine). As a
+// `cmd` it builds with `gala build ./...` but only does live work when actually run —
+// the suite never invokes it, so `gala test` / `gala build ./...` stay green offline.
+// See docs/smoke.md for how to run it and the `claude` / `claude-verify` selector.
+//
+// Honest surfacing: the report shows each unit's terminal status, so a clarification
+// (Blocked), an abort, or a missing `claude` CLI (the live transport fails to open)
+// renders as a Failed/Blocked unit and a non-zero exit — never a fake green run. The
+// rendering and the success predicate are engine-side (SmokeReport / SmokeSucceeded);
+// this file is a thin IO shell that adds no acp matching of its own.
+
+import (
+    "os"
+    "fmt"
+    . "martianoff/gala/std"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    "github.com/martianoff/gala-assimilator/app/engine"
+)
+
+// The bundled fixture: a one-function Go package (module root). Tiny on purpose —
+// the smoke proves the live loop FINISHES on real input, not test parity. Materialized
+// to a fresh temp dir at run time (the built binary has no testdata staged), so the
+// smoke is self-contained and runnable from anywhere.
+val smokeGoMod = "module example.com/smokeproj\n\ngo 1.21\n"
+val smokeAdd   = "package smokeproj\n\n// Add returns the sum of two integers.\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"
+
+// SmokeBackendEnv selects the live backend: unset / "claude" drives ClaudeEngine();
+// "claude-verify" drives ClaudeEngineRealVerify() (the real `gala` toolchain gate).
+val SmokeBackendEnv = "SMOKE_BACKEND"
+
+func main() {
+    val backend = selectBackendName()
+    val port    = engine.SelectBackend(backend)
+    val root    = materializeFixture()
+    val ws      = port.Scan(engine.ScanRequest(Root = root))
+    val plan    = port.Plan(ws)
+    val final   = engine.RunToCompletion(port, port.Run(plan))
+    fmt.Println(engine.SmokeReport(backend, final))
+    fs.RemoveAll(root)
+    if !engine.SmokeSucceeded(final) {
+        os.Exit(1)
+    }
+}
+
+// selectBackendName reads the live-backend selector from the environment, defaulting
+// to "claude". Only the two LIVE backends are honored — "claude-verify" opts into the
+// real toolchain gate, anything else falls back to the plain live translator — so the
+// smoke can never quietly run against an offline mock.
+func selectBackendName() string {
+    if os.Getenv(SmokeBackendEnv) == "claude-verify" { return "claude-verify" }
+    return "claude"
+}
+
+// materializeFixture writes the bundled fixture to a fresh temp dir (real IO) and
+// returns its root. 0o755 dirs (493), 0o644 files (420).
+func materializeFixture() string {
+    val root = fs.MkdirTemp("", "gala_smokeproj").GetOrElse(".")
+    fs.WriteFileString(path.Join(root, "go.mod"), smokeGoMod, 420)
+    fs.WriteFileString(path.Join(root, "add.go"), smokeAdd, 420)
+    return root
+}

@@ -1,0 +1,48 @@
+package engine
+
+// Offline coverage for the live smoke's report projection. These run the report over
+// the DETERMINISTIC engines (MockEngine / ScriptedBlockerEngine) — never the live
+// `claude` CLI — so cmd/smoke's rendering and pass/fail predicate are exercised inside
+// `gala test` without any live backend. The cmd itself is excluded from the suite (it
+// needs real credentials); this proves the engine-side machinery it leans on.
+
+import (
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    strings "martianoff/gala/strings"
+)
+
+// A run where every unit reaches Done renders as COMPLETE and SmokeSucceeded holds.
+func TestSmokeReportComplete(t T) T {
+    val port  = MockEngine()
+    val final = RunToCompletion(port, port.Run(port.Plan(port.Scan(ScanRequest(Root = ".")))))
+    val rep   = SmokeReport("claude", final)
+    val t1 = IsTrue(t,  SmokeSucceeded(final))
+    val t2 = IsTrue(t1, strings.Contains(rep, "backend: claude"))
+    val t3 = IsTrue(t2, strings.Contains(rep, "COMPLETE"))
+    val t4 = IsTrue(t3, strings.Contains(rep, "-> done"))
+    return IsTrue(t4, !strings.Contains(rep, "INCOMPLETE"))
+}
+
+// A run that stalls on a clarification is NOT a success: the unit renders blocked and
+// the report reads INCOMPLETE, so a stalled live translation can never look green.
+func TestSmokeReportSurfacesBlocked(t T) T {
+    val port  = ScriptedBlockerEngine("which dialect?")
+    val final = RunToCompletion(port, port.Run(port.Plan(port.Scan(ScanRequest(Root = ".")))))
+    val rep   = SmokeReport("claude", final)
+    val t1 = IsTrue(t,  !SmokeSucceeded(final))
+    val t2 = IsTrue(t1, strings.Contains(rep, "blocked: which dialect?"))
+    return IsTrue(t2, strings.Contains(rep, "INCOMPLETE"))
+}
+
+// The fix loop is visible in the report: a unit that fails verify once then passes
+// reaches Done with attempts=2 and an emitted-GALA block.
+func TestSmokeReportShowsRetryAndEmitted(t T) T {
+    val port  = RetryingMockEngine()
+    val final = RunToCompletion(port, port.Run(port.Plan(port.Scan(ScanRequest(Root = ".")))))
+    val rep   = SmokeReport("claude", final)
+    val t1 = IsTrue(t,  SmokeSucceeded(final))
+    val t2 = IsTrue(t1, strings.Contains(rep, "attempts=2"))
+    val t3 = IsTrue(t2, strings.Contains(rep, "--- emitted GALA ---"))
+    return IsTrue(t3, strings.Contains(rep, "// fixed translation"))
+}

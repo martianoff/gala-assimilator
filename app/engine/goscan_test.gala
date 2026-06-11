@@ -1,0 +1,142 @@
+package engine
+
+// Proof that the engine runs on REAL Go source: these tests perform real
+// filesystem IO over a real Go project, then plan + run it to completion through
+// the GoEngine port (no stub).
+//
+// GALA test-harness limitation (reported): `gala test` transpiles the package
+// into a temporary build workspace (~/.gala/build/<hash>/gen/...) that contains
+// only the generated `.go` files and runs the test binary FROM there — it does
+// NOT stage `testdata/` (or any non-source asset), and the working directory is
+// the build dir, not the package source dir. So a `testdata/simpleproj` relative
+// path is unreachable at test time. To keep the proof hermetic and CWD-independent
+// we MATERIALIZE an identical real Go project into a fresh temp dir and scan that.
+// The checked-in `testdata/simpleproj/` mirror (same four files) is the human-
+// readable reference fixture and a runnable target for the built binary.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// The fixture, mirrored 1:1 from testdata/simpleproj/. Two packages (module root
+// `main` + `mathx`), a cross-package import (main -> mathx), and a source test.
+val goModSrc     = "module example.com/simpleproj\n\ngo 1.21\n"
+val mainSrc      = "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/simpleproj/mathx\"\n)\n\nfunc main() {\n\tfmt.Println(mathx.Add(2, 3))\n}\n"
+val addSrc       = "package mathx\n\n// Add returns the sum of two integers.\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"
+val addTestSrc   = "package mathx\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(2, 3) != 5 {\n\t\tt.Fatalf(\"Add(2, 3) = %d, want 5\", Add(2, 3))\n\t}\n}\n"
+
+// materializeFixture writes the four fixture files to a fresh temp dir (real IO)
+// and returns its root. 0o755 dirs (493), 0o644 files (420).
+func materializeFixture() string {
+    val root = fs.MkdirTemp("", "gala_simpleproj").GetOrElse("")
+    fs.MkdirAll(path.Join(root, "mathx"), 493)
+    fs.WriteFileString(path.Join(root, "go.mod"), goModSrc, 420)
+    fs.WriteFileString(path.Join(root, "main.go"), mainSrc, 420)
+    fs.WriteFileString(path.Join(root, "mathx", "add.go"), addSrc, 420)
+    fs.WriteFileString(path.Join(root, "mathx", "add_test.go"), addTestSrc, 420)
+    return root
+}
+
+val fixtureRoot = materializeFixture()
+
+// ----------------------------------------------------------------------------
+// Scan: packages, units, kinds, cross-edge, real source text
+// ----------------------------------------------------------------------------
+
+// Two packages are discovered: the module root (".", holding main.go) and "mathx".
+func TestScanRealPackages(t T) T {
+    val m = ScanGoWorkspace(fixtureRoot)
+    val t1 = Eq(t, m.Packages.Length(), 2)
+    val t2 = Eq(t1, m.PackageMap.Size(), 2)
+    return m.PackageMap.Get("mathx") match {
+        case Some(p) => Eq(t2, p.ModulePath, "example.com/simpleproj/mathx")
+        case None()  => Fail(t2, "expected a discovered 'mathx' package")
+    }
+}
+
+// The root package carries main.go honoring the go.mod module path.
+func TestScanRootPackage(t T) T {
+    val m = ScanGoWorkspace(fixtureRoot)
+    return m.PackageMap.Get(".") match {
+        case Some(p) => {
+            val t1 = Eq(t, p.ModulePath, "example.com/simpleproj")
+            return Eq(t1, p.Units.Length(), 1)
+        }
+        case None() => Fail(t, "expected the module-root package keyed '.'")
+    }
+}
+
+// mathx has exactly the two units, classified correctly: add (SourceUnit) and
+// add_test (SourceTest), and real file content is populated for the source unit.
+func TestScanUnitKindsAndSource(t T) T {
+    val m = ScanGoWorkspace(fixtureRoot)
+    return m.PackageMap.Get("mathx") match {
+        case Some(p) => {
+            val t1   = Eq(t, p.Units.Length(), 2)
+            val add  = findUnit(p, "mathx/add")
+            val test = findUnit(p, "mathx/add_test")
+            val t2 = add match {
+                case Some(u) => {
+                    val a = Eq(t1, kindTag(u.Kind), "source")
+                    return Eq(a, strings.Contains(u.Source, "func Add"), true)
+                }
+                case None() => Fail(t1, "expected unit mathx/add")
+            }
+            return test match {
+                case Some(u) => Eq(t2, kindTag(u.Kind), "source_test")
+                case None()  => Fail(t2, "expected unit mathx/add_test")
+            }
+        }
+        case None() => Fail(t, "expected a discovered 'mathx' package")
+    }
+}
+
+// The cross-package edge is recovered from main.go's import of mathx: . -> mathx.
+func TestScanCrossEdge(t T) T {
+    val m  = ScanGoWorkspace(fixtureRoot)
+    val t1 = Eq(t, m.CrossEdges.Length(), 1)
+    val e  = m.CrossEdges.Head()
+    val t2 = Eq(t1, e.From, ".")
+    return Eq(t2, e.To, "mathx")
+}
+
+// SourceTestCount counts the 1:1 source tests only — exactly one (mathx/add_test).
+func TestScanSourceTestParity(t T) T =
+    Eq(t, SourceTestCount(ScanGoWorkspace(fixtureRoot)), 1)
+
+// ----------------------------------------------------------------------------
+// Plan + run: real source flows into the plan; the run goes 0 -> 100%
+// ----------------------------------------------------------------------------
+
+// The plan carries each unit's REAL file content, not a synthesized placeholder.
+func TestPlanCarriesRealSource(t T) T {
+    val port = GoEngine()
+    val plan = port.Plan(port.Scan(ScanRequest(Root = fixtureRoot)))
+    return plan.Items.Find((it PlanItem) => it.Unit.Value == "mathx/add") match {
+        case Some(it) => Eq(t, strings.Contains(it.Source.SourceText, "func Add"), true)
+        case None()   => Fail(t, "expected a plan item for mathx/add")
+    }
+}
+
+// Full pipeline on real input: scan -> plan -> run -> RunToCompletion drives every
+// unit from Queued (0% done) to Done (100% done) via the MockTranslator.
+func TestRealProjectRunsToCompletion(t T) T {
+    val port  = GoEngine()
+    val plan  = port.Plan(port.Scan(ScanRequest(Root = fixtureRoot)))
+    val start = port.Run(plan)
+    val total = plan.Items.Length()
+
+    val t1 = Eq(t, CountByDone(start), 0)        // 0% done before advancing
+    val final = RunToCompletion(port, start)
+    val t2 = Eq(t1, total, 3)                    // main + add + add_test
+    return Eq(t2, CountByDone(final), total)     // 100% reach Done
+}
+
+// findUnit looks a unit up within a package by its id value.
+func findUnit(p Package, id string) Option[Unit] =
+    p.Units.Find((u Unit) => u.Id.Value == id)

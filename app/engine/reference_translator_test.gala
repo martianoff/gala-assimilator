@@ -1,0 +1,51 @@
+package engine
+
+// GOLDEN tests for the reference translator (reference_translator.gala). These are
+// fully OFFLINE — they assert the translator emits exactly the expected GALA for the
+// curated fixture; NO `gala` toolchain is spawned here, so the default suite stays
+// green, deterministic, and free of the nested-`gala test` workspace-contention bug.
+// The real-toolchain proofs (a true VerifyPass / VerifyFail / fix-loop recovery) live
+// in the runnable cmd/verifygate harness, out of this suite on purpose.
+//
+// The expected GALA is written out literally below: if the reference translation
+// drifts from the golden output, these tests fail.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+)
+
+// The golden GALA, written independently of reference_translator.gala so a drift in
+// the translator is caught here rather than the test silently agreeing with itself.
+val expectedGoldenTarget = "package mathx\n\nfunc Add(a int, b int) int = a + b\n"
+val expectedWrongTarget  = "package mathx\n\nfunc Add(a int, b int) int = a - b\n"
+
+// The reference translator emits exactly the golden GALA for the fixture unit.
+func TestReferenceTranslatorEmitsGoldenGala(t T) T {
+    val tx = ReferenceTranslator().Submit(referenceAssignment())
+    return outcomeResult(tx.Final) match {
+        case Some(r) => Eq(t, r.TargetText, expectedGoldenTarget)
+        case None()  => Fail(t, "reference translator must emit a translation Result")
+    }
+}
+
+// The fix-loop translator emits the WRONG target on a fresh attempt and the GOLDEN
+// target once a PriorFailure (the fed-back diagnostics) is present — pinned offline
+// so the red->green recovery the harness drives can't silently change shape.
+func TestReferenceFixLoopTranslatorBrokenThenFixed(t T) T {
+    val runner  = referenceFixLoopTranslator()
+    val firstTx = runner.Submit(referenceAssignment())
+    val t1 = outcomeResult(firstTx.Final) match {
+        case Some(r) => Eq(t, r.TargetText, expectedWrongTarget)
+        case None()  => Fail(t, "fix-loop translator must emit a Result on the first attempt")
+    }
+    val asn      = referenceAssignment()
+    val retryAsn = asn.Copy(PriorFailure = Some[PriorFailure](
+        PriorFailure(Summary = "gala test failed: want 5", Flags = EmptyArray[UnsupportedFlag]())))
+    val retryTx  = runner.Submit(retryAsn)
+    return outcomeResult(retryTx.Final) match {
+        case Some(r) => Eq(t1, r.TargetText, expectedGoldenTarget)
+        case None()  => Fail(t1, "fix-loop translator must emit a Result on retry")
+    }
+}

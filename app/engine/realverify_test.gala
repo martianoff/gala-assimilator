@@ -1,0 +1,106 @@
+package engine
+
+// Tests for the REAL verify gate's mapping (realverify.gala), driven entirely
+// through an INJECTED FAKE toolchain runner — NO real `gala` process is spawned, so
+// the suite stays offline, deterministic, and fast, and never risks the nested-
+// `gala test` workspace-contention bug. The materialize step does real (cheap,
+// isolated, auto-removed) temp-dir IO; only the toolchain exec is faked.
+//
+// The three mappings: green -> pass; a compile error -> fail carrying the build
+// diagnostics; a red test -> fail carrying the test output. Plus one through-the-
+// port check that the diagnostics actually reach the fix loop (the unit's Failed
+// reason, which retryOrFail threads into the next attempt's PriorFailure). Shared
+// helpers (scanned) live in port_test.gala.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    strings "martianoff/gala/strings"
+)
+
+// fakeRunner is a deterministic ToolchainRunner: it answers the `build` invocation
+// with (buildOk, buildOut) and the `test` invocation with (testOk, testOut),
+// keying off the first arg — so a test pins each stage's outcome without exec.
+func fakeRunner(buildOk bool, buildOut string, testOk bool, testOut string) ToolchainRunner =
+    ToolchainRunner(Run = (dir string, args Array[string]) => isBuildArgs(args) match {
+        case true  => ToolchainResult(Ok = buildOk, Output = buildOut)
+        case false => ToolchainResult(Ok = testOk, Output = testOut)
+    })
+
+func isBuildArgs(args Array[string]) bool =
+    !args.IsEmpty() && args.Get(0) == "build"
+
+func sampleVerifyReq() VerifyRequest =
+    VerifyRequest(
+        Unit       = UnitId(Value = "core/value"),
+        TargetText = "package core\n\nfunc Value() int = 42\n",
+        SourceTests = ArrayOf[SourceTestRef](
+            SourceTestRef(
+                Unit   = UnitId(Value = "core/value_test"),
+                Path   = "core/value_test.go",
+                Source = "package core",
+            )),
+    )
+
+// ----------------------------------------------------------------------------
+// Green -> pass.
+// ----------------------------------------------------------------------------
+
+func TestRealVerifyGreenPasses(t T) T {
+    val v = RealVerifier(fakeRunner(true, "", true, ""))
+    return v.Verify(sampleVerifyReq()) match {
+        case VerifyPass()           => IsTrue(t, true)
+        case VerifyFail(_, why)     => Fail(t, "a green toolchain must pass, got fail: " + why)
+        case VerifyUnsupported(why) => Fail(t, "a green toolchain must pass, got unsupported: " + why)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Compile error -> fail carrying the build diagnostics.
+// ----------------------------------------------------------------------------
+
+func TestRealVerifyCompileErrorFailsWithDiagnostics(t T) T {
+    val diag = "value.gala:3:1: undefined: Frobnicate"
+    val v = RealVerifier(fakeRunner(false, diag, true, ""))
+    return v.Verify(sampleVerifyReq()) match {
+        case VerifyFail(_, why) => {
+            val t1 = IsTrue(t, strings.Contains(why, "undefined: Frobnicate")) // real stderr propagated
+            return IsTrue(t1, strings.Contains(why, "gala build failed"))      // attributed to the build stage
+        }
+        case _ => Fail(t, "a compile error must gate to VerifyFail")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Test failure -> fail carrying the test output.
+// ----------------------------------------------------------------------------
+
+func TestRealVerifyTestFailureFailsWithOutput(t T) T {
+    val diag = "--- FAIL: TestValue (0.00s)\n    want 42, got 41"
+    val v = RealVerifier(fakeRunner(true, "", false, diag))
+    return v.Verify(sampleVerifyReq()) match {
+        case VerifyFail(_, why) => {
+            val t1 = IsTrue(t, strings.Contains(why, "want 42, got 41"))  // real test output propagated
+            return IsTrue(t1, strings.Contains(why, "gala test failed"))  // attributed to the test stage
+        }
+        case _ => Fail(t, "a failing test must gate to VerifyFail")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The diagnostics reach the fix loop: a real-gate failure settles the unit Failed
+// carrying the toolchain output (which retryOrFail feeds into PriorFailure). Driven
+// through the run machinery with a fake runner — still fully offline.
+// ----------------------------------------------------------------------------
+
+func TestRealVerifyDiagnosticsReachFixLoop(t T) T {
+    val diag = "assertion mismatch in core/value_test"
+    val eng = MockEngineWithVerifier(MockTranslator(), RealVerifier(fakeRunner(true, "", false, diag)))
+    val finished = RunToCompletion(eng, scanned(eng))
+    val t1 = Eq(t, CountByDone(finished), 0)
+    return finished.Units.Get(0).Status match {
+        case Failed(reason) => IsTrue(t1, strings.Contains(reason, "assertion mismatch in core/value_test"))
+        case _              => Fail(t1, "a real-gate failure must settle the unit Failed with the diagnostics")
+    }
+}

@@ -1,0 +1,148 @@
+package engine
+
+// The engine's agent-run machinery is gala-acp's GENERIC run contract
+// (github.com/martianoff/gala-acp), instantiated with this engine's domain
+// payloads. acp.AgentRunner[A,R,C] / acp.RunTranscript / acp.RunOutcome /
+// acp.RunStep give us the stream-as-data transcript plus its sealed terminus; we
+// plug in:
+//
+//   A = TaskAssignment   — the unit handed to the translator
+//   R = Result           — emitted target text + rationale + flags
+//   C = Clarification    — a question that ends the run
+//
+// These acp.* types are an ENGINE-INTERNAL detail: they never cross EnginePort.
+// finishUnit (port.gala) adapts an acp transcript into the engine's public
+// EngineEvent / UnitStatus at the boundary, and acp's string-keyed ProgressEvent
+// is mapped to the engine's sealed-phase ProgressUpdate there (phaseFromTag).
+// All acp pattern-matching is isolated in acp_bridge.gala — GALA cannot match a
+// package-qualified case, so exactly one file dot-imports acp to destructure it.
+//
+// Two deterministic, OFFLINE runners are built over the acp generics here:
+//   - MockTranslator  — streams Reading->Emitting->Verifying, ends in a Result.
+//     The engine's default backend; needs no network or credentials, so it is
+//     what `gala test` and the offline UI run against.
+//   - ScriptedRunner  — pins any terminus / cancel so each RunOutcome /
+//     CancelOutcome case is exercised THROUGH the port.
+// The real Claude backend (live `claude` subprocess) lives in
+// claude_translator.gala.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    acp "github.com/martianoff/gala-acp"
+)
+
+// MockTranslator is the deterministic OFFLINE translator: its Submit streams a
+// faithful Reading->Emitting->Verifying progress prefix and ends in an
+// OutcomeResult with placeholder target text; its Cancel reports Cancelled.
+func MockTranslator() acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => translatorTranscript(a),
+        Cancel = (_ string) => acp.Cancelled(),
+    )
+
+// ScriptedRunner pins the terminus a Submit produces and the CancelOutcome a
+// Cancel returns, so every RunOutcome / CancelOutcome case can be exercised
+// THROUGH THE PORT. The progress prefix is the same Reading->Emitting->Verifying
+// shape the mock streams.
+func ScriptedRunner(
+    outcome acp.RunOutcome[Result, Clarification],
+    cancel acp.CancelOutcome,
+) acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => acp.RunTranscript[Result, Clarification](
+            Steps = mockSteps(a.Task),
+            Final = outcome,
+        ),
+        Cancel = (_ string) => cancel,
+    )
+
+func translatorTranscript(a TaskAssignment) acp.RunTranscript[Result, Clarification] =
+    acp.RunTranscript[Result, Clarification](
+        Steps = mockSteps(a.Task),
+        Final = resultOutcome(Result(
+            Task       = a.Task,
+            TargetText = "// mock translation",
+            Rationale  = "deterministic offline mock output",
+            Flags      = EmptyArray[UnsupportedFlag](),
+        )),
+    )
+
+// mockSteps is the Reading->Emitting->Verifying progress prefix, keyed by the
+// task id. The phase is acp's opaque string tag; the engine boundary maps it back
+// to the sealed ProgressPhase (phaseFromTag).
+func mockSteps(task TaskId) Array[acp.RunStep] =
+    ArrayOf[acp.RunStep](
+        acp.ProgressStep(task.Value, "reading", "reading source unit"),
+        acp.ProgressStep(task.Value, "emitting", "emitting target text"),
+        acp.ProgressStep(task.Value, "verifying", "verifying output"),
+    )
+
+// ----------------------------------------------------------------------------
+// Engine-domain terminus / cancel constructors
+// ----------------------------------------------------------------------------
+// These wrap the acp generic case constructors so the rest of the engine — and
+// the tests — build run termini without naming acp's type parameters at every
+// call site.
+
+func resultOutcome(r Result) acp.RunOutcome[Result, Clarification] =
+    acp.OutcomeResult[Result, Clarification](Value = r)
+
+func clarifyOutcome(c Clarification) acp.RunOutcome[Result, Clarification] =
+    acp.OutcomeClarification[Result, Clarification](Value = c)
+
+func abortOutcome(reason string) acp.RunOutcome[Result, Clarification] =
+    acp.OutcomeAborted[Result, Clarification](Reason = reason)
+
+func cancelledAck() acp.CancelOutcome = acp.Cancelled()
+
+func notRunningAck() acp.CancelOutcome = acp.NotRunning()
+
+// ScriptedBlockerEngine is a deterministic EnginePort whose every unit run
+// terminates in a clarification, so the first unit reaches Blocked through the
+// real Advance/finish path. It lets the UI exercise the blocker/answer flow in
+// tests WITHOUT touching the acp run contract (the acp.* terminus constructors
+// stay engine-internal). Pass the question the blocked unit should ask.
+func ScriptedBlockerEngine(question string) EnginePort =
+    MockEngineWith(ScriptedRunner(
+        clarifyOutcome(Clarification(Task = TaskId(Value = "scripted"), Question = question)),
+        cancelledAck(),
+    ))
+
+// RetryingMockEngine is a deterministic EnginePort that exercises the per-unit fix
+// loop: every unit's FIRST attempt fails verification and its retry passes, so each
+// unit reaches Done after exactly one re-translate (Attempts = 2) and the run emits
+// an EvRetry per unit before reaching the completion fixpoint. Like
+// ScriptedBlockerEngine, it lets the UI drive the loop in tests WITHOUT touching the
+// acp run contract. The translator improves on retry (the fed-back PriorFailure
+// flips its output) and the verifier accepts only that improved output.
+func RetryingMockEngine() EnginePort =
+    MockEngineWithVerifier(improvingRunner(), improvedOnlyVerifier())
+
+// improvingRunner emits "// first attempt" on the initial submit and
+// "// fixed translation" once the loop threads a PriorFailure onto the assignment —
+// a backend that actually uses the fed-back diagnostics.
+func improvingRunner() acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => acp.RunTranscript[Result, Clarification](
+            Steps = mockSteps(a.Task),
+            Final = resultOutcome(retryImprovedResult(a)),
+        ),
+        Cancel = (_ string) => cancelledAck(),
+    )
+
+func retryImprovedResult(a TaskAssignment) Result {
+    val text = a.PriorFailure match {
+        case Some(_) => "// fixed translation"
+        case None()  => "// first attempt"
+    }
+    return Result(Task = a.Task, TargetText = text, Rationale = "improving mock", Flags = EmptyArray[UnsupportedFlag]())
+}
+
+// improvedOnlyVerifier passes ONLY the improved output, so the first attempt fails
+// and the retry passes — the fix loop turns exactly once per unit.
+func improvedOnlyVerifier() Verifier =
+    Verifier(Verify = (req VerifyRequest) => (req.TargetText == "// fixed translation") match {
+        case true  => VerifyPass()
+        case false => VerifyFail(Failing = ArrayOf[UnitId](req.Unit), Reason = "needs the fix")
+    })

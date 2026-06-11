@@ -1,0 +1,42 @@
+package engine
+
+// Tests for the workspace model + Go-scanner stub.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+)
+
+func TestScanStubShape(t T) T {
+    val m = ScanGoWorkspaceStub()
+    val t1 = Eq(t, m.Packages.Length(), 2)
+    return Eq(t1, m.CrossEdges.Length(), 1)
+}
+
+// The PackageMap is derived from Packages and must resolve every package id.
+func TestPackageMapDerived(t T) T {
+    val m = ScanGoWorkspaceStub()
+    val t1 = Eq(t, m.PackageMap.Size(), 2)
+    return m.PackageMap.Get("core") match {
+        case Some(p) => Eq(t1, p.ModulePath, "example.com/proj/core")
+        case None()  => Fail(t1, "PackageMap must contain the core package")
+    }
+}
+
+// SourceTestCount counts SourceTest units ONLY — the 1:1 parity metric. The stub
+// has exactly one SourceTest (core/value_test) and one AddedTest (excluded).
+func TestSourceTestParityCount(t T) T =
+    Eq(t, SourceTestCount(ScanGoWorkspaceStub()), 1)
+
+func kindTag(k UnitKind) string = k match {
+    case SourceUnit() => "source"
+    case SourceTest() => "source_test"
+    case AddedTest()  => "added_test"
+}
+
+func TestUnitKindExhaustive(t T) T {
+    val t1 = Eq(t, kindTag(SourceUnit()), "source")
+    val t2 = Eq(t1, kindTag(SourceTest()), "source_test")
+    return Eq(t2, kindTag(AddedTest()), "added_test")
+}

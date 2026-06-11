@@ -1,0 +1,137 @@
+package engine
+
+// The language/workspace model — the engine's structural view of the project
+// being migrated, independent of any source or target language.
+//
+// These shapes (WorkspaceModel / Package / Unit + dependency edges) are produced
+// two ways behind the same types: `ScanGoWorkspaceStub` returns a fixed fixture
+// (kept for the offline UI tests), and `ScanGoWorkspace` (goscan.gala) discovers a
+// real Go project from disk. Neither path leaks engine internals to the UI.
+
+import (
+    . "martianoff/gala/collection_immutable"
+)
+
+// ----------------------------------------------------------------------------
+// Identifiers
+// ----------------------------------------------------------------------------
+
+// UnitId identifies one per-file translation unit for its whole lifecycle. It is
+// shared by the workspace model (which discovers units) and the domain ACP
+// (which assigns them) — one identity, one type.
+struct UnitId(Value string)
+
+// PackageId identifies one source package within the workspace.
+struct PackageId(Value string)
+
+// ----------------------------------------------------------------------------
+// Units, packages, the workspace
+// ----------------------------------------------------------------------------
+
+// UnitKind classifies a unit so test-count parity can be measured correctly. The
+// product rule is "tests are counted via 1:1-replicated source tests only": a
+// SourceTest mirrors an original source test one-for-one and COUNTS toward
+// parity; an AddedTest is scaffolding the migration introduced and does NOT.
+sealed type UnitKind {
+    case SourceUnit() // ordinary (non-test) source file
+    case SourceTest() // a test replicated 1:1 from source — counts toward parity
+    case AddedTest()  // a test added by the migration — excluded from parity
+}
+
+// Unit is one per-file translation unit: a stable id, its source-relative path,
+// what kind of unit it is, and the unit's real source text. Source is "" for the
+// fixture stub (it carries no real file content); the real `ScanGoWorkspace`
+// frontend populates it from disk so it can flow into the plan.
+struct Unit(
+    Id     UnitId,
+    Path   string,
+    Kind   UnitKind,
+    Source string,
+)
+
+// DepEdge is a directed dependency between two nodes, keyed by their id Value
+// strings (unit->unit inside a package, package->package across the workspace).
+struct DepEdge(
+    From string,
+    To   string,
+)
+
+// Package is a group of units sharing a Go module path, plus the intra-package
+// dependency edges between those units.
+struct Package(
+    Id         PackageId,
+    ModulePath string,
+    Units      Array[Unit],
+    Edges      Array[DepEdge],
+)
+
+// WorkspaceModel is the whole scanned project: its packages, the cross-package
+// dependency edges, and a PackageMap (PackageId.Value -> Package) for O(1)
+// lookup without rescanning the array.
+struct WorkspaceModel(
+    Packages   Array[Package],
+    CrossEdges Array[DepEdge],
+    PackageMap HashMap[string, Package],
+)
+
+// NewWorkspaceModel assembles a WorkspaceModel and derives its PackageMap from
+// the package list, so the map can never drift out of sync with Packages.
+func NewWorkspaceModel(packages Array[Package], crossEdges Array[DepEdge]) WorkspaceModel =
+    WorkspaceModel(
+        Packages   = packages,
+        CrossEdges = crossEdges,
+        PackageMap = buildPackageMap(packages),
+    )
+
+func buildPackageMap(packages Array[Package]) HashMap[string, Package] =
+    packages.FoldLeft[HashMap[string, Package]](
+        EmptyHashMap[string, Package](),
+        (acc HashMap[string, Package], p Package) => acc.Put(p.Id.Value, p),
+    )
+
+// SourceTestCount counts only SourceTest units across the workspace — the parity
+// metric the product rule cares about (added tests are excluded).
+func SourceTestCount(model WorkspaceModel) int =
+    model.Packages.FoldLeft[int](
+        0,
+        (acc int, p Package) => acc + p.Units.Count((u Unit) => u.Kind match {
+            case SourceTest() => true
+            case SourceUnit() => false
+            case AddedTest()  => false
+        }),
+    )
+
+// ----------------------------------------------------------------------------
+// Go-scanner stub
+// ----------------------------------------------------------------------------
+
+// ScanGoWorkspaceStub returns a small fixed WorkspaceModel standing in for a real
+// go/parser scan. Tiny but structurally complete: two packages, intra-package and
+// cross-package edges, and one unit of each UnitKind so the source-test parity
+// flag is exercised end-to-end.
+func ScanGoWorkspaceStub() WorkspaceModel {
+    val core = Package(
+        Id         = PackageId(Value = "core"),
+        ModulePath = "example.com/proj/core",
+        Units      = ArrayOf[Unit](
+            Unit(Id = UnitId(Value = "core/value"),      Path = "core/value.go",      Kind = SourceUnit(), Source = ""),
+            Unit(Id = UnitId(Value = "core/value_test"), Path = "core/value_test.go", Kind = SourceTest(), Source = ""),
+        ),
+        Edges = ArrayOf[DepEdge](
+            DepEdge(From = "core/value_test", To = "core/value"),
+        ),
+    )
+    val app = Package(
+        Id         = PackageId(Value = "app"),
+        ModulePath = "example.com/proj/app",
+        Units      = ArrayOf[Unit](
+            Unit(Id = UnitId(Value = "app/main"),      Path = "app/main.go",      Kind = SourceUnit(), Source = ""),
+            Unit(Id = UnitId(Value = "app/main_test"), Path = "app/main_test.go", Kind = AddedTest(), Source = ""),
+        ),
+        Edges = EmptyArray[DepEdge](),
+    )
+    return NewWorkspaceModel(
+        ArrayOf[Package](core, app),
+        ArrayOf[DepEdge](DepEdge(From = "app", To = "core")),
+    )
+}

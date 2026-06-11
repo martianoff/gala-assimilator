@@ -1,0 +1,368 @@
+package runview
+
+import (
+    . "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    str "martianoff/gala/strings"
+)
+
+// strContains is a small assertion helper for substring checks on projected lines.
+func strContains(s string, sub string) bool = str.S(s).Contains(sub)
+
+// ============================================================================
+// Direct projection tests for app/runview. These construct engine RunStates by
+// hand (public value types only) and assert the UI-facing projections, instead
+// of relying on the UI exercising them transitively.
+// ============================================================================
+
+// ----- fixtures -------------------------------------------------------------
+
+func mkUnit(id string, src string, status UnitStatus) UnitRun =
+    UnitRun(
+        Unit = UnitId(Value = id),
+        Assignment = TaskAssignment(
+            Task         = TaskId(Value = id),
+            Unit         = UnitId(Value = id),
+            Source       = SourceContext(SourceText = src, Dependencies = EmptyArray[DependencySnippet]()),
+            Target       = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+            PriorFailure = None[PriorFailure](),
+            Answers      = EmptyArray[Answer](),
+        ),
+        Status = status,
+    )
+
+func doneStatus(text string, rationale string, flags Array[UnsupportedFlag]) UnitStatus =
+    Done(Output = Result(Task = TaskId(Value = "t"), TargetText = text, Rationale = rationale, Flags = flags))
+
+func blockedStatus(q string) UnitStatus =
+    Blocked(Question = Clarification(Task = TaskId(Value = "t"), Question = q))
+
+func rsOf(units Array[UnitRun]) RunState =
+    RunState(Units = units, Log = EmptyArray[EngineEvent]())
+
+func noFlags() Array[UnsupportedFlag] = EmptyArray[UnsupportedFlag]()
+
+// mkSourceTest builds a SourceTest unit: one whose own id appears in its carried
+// SourceTestRefs (the parity-counting shape ProjectRun keys off). Plain mkUnit
+// units carry no SourceTests, so they are non-test source units.
+func mkSourceTest(id string, status UnitStatus) UnitRun {
+    val base = mkUnit(id, "x", status)
+    return base.Copy(SourceTests = ArrayOf[SourceTestRef](
+        SourceTestRef(Unit = UnitId(Value = id), Path = id + ".go", Source = "")))
+}
+
+// mkAttempted builds a unit that has spent `attempts` translate→verify cycles.
+func mkAttempted(id string, status UnitStatus, attempts int) UnitRun {
+    val base = mkUnit(id, "x", status)
+    return base.Copy(Attempts = attempts)
+}
+
+// ----- UnitAt + UnitDetailVM ------------------------------------------------
+
+func TestUnitAtOutOfRange(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](mkUnit("a", "x", Queued())))
+    val lo = UnitAt(rs, -1)
+    val hi = UnitAt(rs, 5)
+    val t1 = IsTrue(t, lo.IsEmpty())
+    return IsTrue(t1, hi.IsEmpty())
+}
+
+func TestProjectDoneUnit(t T) T {
+    val flags = ArrayOf[UnsupportedFlag](UnsupportedFlag(Construct = "generics", Reason = "no equivalent"))
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("core/value", "src-a\nsrc-b", doneStatus("out-a\nout-b", "because reasons", flags))))
+    return UnitAt(rs, 0) match {
+        case Some(vm) => {
+            val t1 = IsTrue(t,  vm.HasResult)
+            val t2 = IsFalse(t1, vm.Blocked)
+            val t3 = Eq(t2, vm.Status, "done")
+            val t4 = Eq(t3, vm.Id, "core/value")
+            val t5 = Eq(t4, vm.SourceLines.Length(), 2)
+            val t6 = Eq(t5, vm.SourceLines.Get(0), "src-a")
+            val t7 = Eq(t6, vm.TargetLines.Get(1), "out-b")
+            val t8 = Eq(t7, vm.Rationale, "because reasons")
+            return IsTrue(t8, vm.Flags.Exists((f) => f == "generics — no equivalent"))
+        }
+        case None() => IsTrue(t, false)
+    }
+}
+
+func TestProjectBlockedUnit(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("core/value", "src-a", blockedStatus("Is x nullable?"))))
+    return UnitAt(rs, 0) match {
+        case Some(vm) => {
+            val t1 = IsTrue(t,  vm.Blocked)
+            val t2 = IsFalse(t1, vm.HasResult)
+            val t3 = Eq(t2, vm.Status, "blocked")
+            val t4 = Eq(t3, vm.Question, "Is x nullable?")
+            return IsTrue(t4, vm.TargetLines.IsEmpty())
+        }
+        case None() => IsTrue(t, false)
+    }
+}
+
+func TestProjectFailedUnit(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](mkUnit("app/main", "src", Failed(Reason = "boom"))))
+    return UnitAt(rs, 0) match {
+        case Some(vm) => {
+            val t1 = Eq(t, vm.Status, "failed: boom")
+            val t2 = IsFalse(t1, vm.HasResult)
+            return IsFalse(t2, vm.Blocked)
+        }
+        case None() => IsTrue(t, false)
+    }
+}
+
+// ----- blocker projections --------------------------------------------------
+
+func TestFirstBlockedFindsIt(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", blockedStatus("q?")),
+        mkUnit("c", "x", Queued())))
+    return FirstBlocked(rs) match {
+        case Some(i) => Eq(t, i, 1)
+        case None()  => IsTrue(t, false)
+    }
+}
+
+func TestFirstBlockedNoneWhenClear(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Queued())))
+    return IsTrue(t, FirstBlocked(rs).IsEmpty())
+}
+
+func TestIsBlockedAt(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", blockedStatus("q?"))))
+    val t1 = IsFalse(t,  IsBlockedAt(rs, 0))
+    val t2 = IsTrue(t1,  IsBlockedAt(rs, 1))
+    return IsFalse(t2, IsBlockedAt(rs, 9))   // out of range
+}
+
+func TestBlockedCount(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", blockedStatus("q1")),
+        mkUnit("b", "x", Queued()),
+        mkUnit("c", "x", blockedStatus("q2"))))
+    return Eq(t, BlockedCount(rs), 2)
+}
+
+// ----- run + plan projections (direct, not just transitive) -----------------
+
+func TestProjectRunCountsAndPct(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Queued()),
+        mkUnit("c", "x", Verifying()),
+        mkUnit("d", "x", blockedStatus("q?"))))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.Total, 4)
+    val t2 = Eq(t1, vm.Done, 1)
+    val t3 = Eq(t2, vm.Pct, 25)
+    val t4 = Eq(t3, vm.Counts.Queued, 1)
+    val t5 = Eq(t4, vm.Counts.Active, 1)        // Verifying counts as active
+    return Eq(t5, vm.Counts.Blocked, 1)
+}
+
+// ----- tests-passing parity metric ------------------------------------------
+
+// No SourceTest units → both figures are zero (added/ordinary units never count).
+func TestProjectRunTestsZero(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("a/main", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b/util", "x", Queued())))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.TestsTotal, 0)
+    return Eq(t1, vm.TestsPassing, 0)
+}
+
+// Two source tests, one Done → 1 of 2 passing; the ordinary unit is excluded.
+func TestProjectRunTestsSomePassing(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkSourceTest("a/value_test", doneStatus("o", "r", noFlags())),
+        mkSourceTest("b/calc_test",  Verifying()),
+        mkUnit("a/value", "x", doneStatus("o", "r", noFlags()))))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.TestsTotal, 2)
+    return Eq(t1, vm.TestsPassing, 1)
+}
+
+// Both source tests Done → all passing.
+func TestProjectRunTestsAllPassing(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkSourceTest("a/value_test", doneStatus("o", "r", noFlags())),
+        mkSourceTest("b/calc_test",  doneStatus("o", "r", noFlags()))))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.TestsTotal, 2)
+    return Eq(t1, vm.TestsPassing, 2)
+}
+
+// Stage tracks the run's high-level position: queued work → run, only the gate
+// left → verify, nothing actionable → report.
+func TestProjectRunStage(t T) T {
+    val running = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", Queued()),
+        mkUnit("b", "x", Verifying())))
+    val verifying = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Verifying())))
+    val reported = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags()))))
+    val t1 = Eq(t,  ProjectRun(running).Stage,   StageRun())
+    val t2 = Eq(t1, ProjectRun(verifying).Stage, StageVerify())
+    return Eq(t2, ProjectRun(reported).Stage, StageReport())
+}
+
+// ----- fix-loop: per-unit attempts + run-level complete/iterating -----------
+
+// Attempts project onto each row so the UI can badge a retried unit.
+func TestProjectRunUnitAttempts(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkAttempted("a/clean", doneStatus("o", "r", noFlags()), 1),
+        mkAttempted("b/retried", Failed(Reason = "boom"), 3)))
+    val vm = ProjectRun(rs)
+    val t1 = Eq(t,  vm.Rows.Get(0).Attempts, 1)
+    return Eq(t1, vm.Rows.Get(1).Attempts, 3)
+}
+
+// ----- correctness flags: per-unit markers + activity-log lines -------------
+
+func unverifiedFlags() Array[UnsupportedFlag] =
+    ArrayOf[UnsupportedFlag](UnsupportedFlag(
+        Construct = "unverified", Reason = "no 1:1 source test covers this unit"))
+
+func genericsFlags() Array[UnsupportedFlag] =
+    ArrayOf[UnsupportedFlag](UnsupportedFlag(
+        Construct = "generics", Reason = "no faithful target"))
+
+// A Done unit that passed with no source-test coverage projects Unverified (not
+// Flagged): the row is marked unverified, never identical to a clean pass.
+func TestProjectRunRowUnverified(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("app/main", "x", doneStatus("o", "r", unverifiedFlags()))))
+    val row = ProjectRun(rs).Rows.Get(0)
+    val t1 = IsTrue(t,  row.Unverified)
+    return IsFalse(t1, row.Flagged)
+}
+
+// A Done unit that raised an unsupported-construct flag projects Flagged (not
+// Unverified): a construct with no faithful target is surfaced on the row.
+func TestProjectRunRowFlagged(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("core/value", "x", doneStatus("o", "r", genericsFlags()))))
+    val row = ProjectRun(rs).Rows.Get(0)
+    val t1 = IsTrue(t,  row.Flagged)
+    return IsFalse(t1, row.Unverified)
+}
+
+// A non-Done unit carries neither marker (flags only exist on a translation Result).
+func TestProjectRunRowNoFlagsWhenNotDone(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](mkUnit("a", "x", Verifying())))
+    val row = ProjectRun(rs).Rows.Get(0)
+    val t1 = IsFalse(t,  row.Flagged)
+    return IsFalse(t1, row.Unverified)
+}
+
+// Each flag on a Done unit becomes an activity-log line — an unsupported flag and
+// an unverified flag each leave a distinct, visible trace.
+func TestProjectRunFlagLogLines(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("core/value", "x", doneStatus("o", "r", genericsFlags())),
+        mkUnit("app/main",   "x", doneStatus("o", "r", unverifiedFlags()))))
+    val log = ProjectRun(rs).Log
+    val t1 = IsTrue(t,  log.Exists((ln) => strContains(ln, "flagged generics")))
+    return IsTrue(t1, log.Exists((ln) => strContains(ln, "unverified")))
+}
+
+// The retry log line carries the attempt number and a trimmed, single-line reason:
+// a long multi-line verify diagnostic is collapsed and capped, never dumped whole.
+func TestProjectRunRetryLineTrimmed(t T) T {
+    val long = "first diagnostic line\nsecond line with much more detail that should be cut TAILTOKEN"
+    val rs = RunState(
+        Units = ArrayOf[UnitRun](mkUnit("core/value", "x", Translating())),
+        Log   = ArrayOf[EngineEvent](EvRetry(Unit = UnitId(Value = "core/value"), Attempt = 3, Reason = long)))
+    val line = ProjectRun(rs).Log.Get(0)
+    val t1 = IsTrue(t,  strContains(line, "retry 3"))   // the attempt number
+    val t2 = IsTrue(t1, strContains(line, "…"))          // trimmed marker
+    val t3 = IsFalse(t2, strContains(line, "TAILTOKEN")) // the long tail is cut
+    return IsFalse(t3, strContains(line, "\n"))          // collapsed to one line
+}
+
+// An incomplete run (a transient unit remains) is still iterating → Complete false.
+func TestProjectRunIterating(t T) T {
+    val running = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Translating())))
+    return IsFalse(t, ProjectRun(running).Complete)
+}
+
+// An all-terminal run (Done / Failed / Skipped) has reached a fixpoint → Complete.
+func TestProjectRunComplete(t T) T {
+    val settled = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Failed(Reason = "boom")),
+        mkUnit("c", "x", Skipped())))
+    return IsTrue(t, ProjectRun(settled).Complete)
+}
+
+func TestAnyActionable(t T) T {
+    val live = rsOf(ArrayOf[UnitRun](mkUnit("a", "x", Queued())))
+    val settled = rsOf(ArrayOf[UnitRun](mkUnit("a", "x", doneStatus("o", "r", noFlags()))))
+    val t1 = IsTrue(t, AnyActionable(live))
+    return IsFalse(t1, AnyActionable(settled))
+}
+
+func TestProjectPlan(t T) T {
+    val plan = MigrationPlan(Items = ArrayOf[PlanItem](
+        planItem("core/value"),
+        planItem("app/main")))
+    val ws = NewWorkspaceModel(
+        ArrayOf[Package](Package(
+            Id = PackageId(Value = "core"), ModulePath = "m/core",
+            Units = EmptyArray[Unit](), Edges = EmptyArray[DepEdge]())),
+        EmptyArray[DepEdge]())
+    val pv = ProjectPlan(ws, plan)
+    val t1 = Eq(t,  pv.Packages, 1)
+    val t2 = Eq(t1, pv.Units, 2)
+    return IsTrue(t2, pv.Items.Exists((id) => id == "core/value"))
+}
+
+// ----- ClassifyLoad ---------------------------------------------------------
+
+func TestClassifyLoaded(t T) T {
+    val units = ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("o", "r", noFlags())),
+        mkUnit("b", "x", Queued()))
+    val cp = Checkpoint(Units = units, Log = EmptyArray[EngineEvent]())
+    val s = ClassifyLoad(Loaded(Value = cp))
+    val t1 = Eq(t,  s.Kind, "loaded")
+    val t2 = Eq(t1, s.Done, 1)
+    val t3 = Eq(t2, s.Total, 2)
+    return IsTrue(t3, s.Cp.IsDefined())
+}
+
+func TestClassifyMissing(t T) T {
+    val s = ClassifyLoad(Missing())
+    val t1 = Eq(t, s.Kind, "missing")
+    return IsTrue(t1, s.Cp.IsEmpty())
+}
+
+func TestClassifyCorrupt(t T) T {
+    val s = ClassifyLoad(Corrupt(Reason = "bad json"))
+    val t1 = Eq(t, s.Kind, "corrupt")
+    val t2 = Eq(t1, s.Reason, "bad json")
+    return IsTrue(t2, s.Cp.IsEmpty())
+}
+
+func planItem(id string) PlanItem =
+    PlanItem(
+        Unit   = UnitId(Value = id),
+        Source = SourceContext(SourceText = "", Dependencies = EmptyArray[DependencySnippet]()),
+        Target = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+    )

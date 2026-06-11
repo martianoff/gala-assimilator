@@ -1,0 +1,87 @@
+package engine
+
+// GoEngine — the EnginePort wired to the REAL Go frontend. Its Scan reads an
+// actual project from disk (ScanGoWorkspace, goscan.gala) and its Plan feeds each
+// unit's REAL file content into the plan. Everything else (Run / Advance / act /
+// answer / checkpoint) reuses the exact pure machinery MockEngine uses — only the
+// front of the pipeline changes.
+//
+// Backend: GoEngine defaults to the deterministic MockTranslator (offline, no
+// credentials), so it scans and runs real Go input without a network. To drive
+// real translation, build the same frontend over the live Claude backend —
+// `ClaudeEngine()` (claude_translator.gala) is exactly GoEngineWithVerifier with
+// ClaudeTranslator() as the runner. Swapping the backend is a runner substitution
+// behind GoEngineWithVerifier; the scan -> plan -> run -> gate pipeline is unchanged.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    acp "github.com/martianoff/gala-acp"
+)
+
+// GoEngine is the default real-frontend engine, driven by the MockTranslator and
+// the deterministic MockVerifier (neither real backend is available yet — see the
+// file header and verify.gala).
+func GoEngine() EnginePort = GoEngineWith(MockTranslator())
+
+// GoEngineWith builds the real-frontend engine over a caller-supplied translator
+// (with the default MockVerifier), so a future real backend (or a ScriptedRunner
+// in tests) drops in unchanged.
+func GoEngineWith(runner acp.AgentRunner[TaskAssignment, Result, Clarification]) EnginePort = GoEngineWithVerifier(runner, MockVerifier())
+
+// GoEngineWithVerifier builds the real-frontend engine over a caller-supplied
+// runner AND verifier — the seam where a real `gala test` verifier replaces the
+// mock once translation emits real GALA, with no change to the scan -> plan -> run
+// -> gate pipeline. Uses the default per-unit fix-loop cap; GoEngineWithVerifierCap
+// sets a custom one.
+func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier) EnginePort =
+    GoEngineWithVerifierCap(runner, verifier, DefaultMaxAttempts())
+
+// GoEngineWithVerifierCap is GoEngineWithVerifier with a configurable per-unit
+// attempt cap on the translate -> verify -> fix loop.
+func GoEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort = EnginePort(
+    Scan          = (req ScanRequest) => ScanGoWorkspace(req.Root),
+    Plan          = (m WorkspaceModel) => goPlanFor(m),
+    Run           = (p MigrationPlan) => runFor(p),
+    Advance       = (s RunState) => advance(runner, verifier, maxAttempts, s),
+    Events        = (s RunState) => s.Log,
+    ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
+    AnswerBlocker  = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
+    Checkpoint     = (s RunState) => Checkpoint(Units = s.Units, Log = s.Log),
+    Resume         = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
+    SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
+    LoadCheckpoint = (path string) => loadCheckpoint(path),
+    Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
+)
+
+// goPlanFor builds the plan from a scanned workspace, threading each unit's REAL
+// source text (and a best-effort dependency list parsed from its imports) into the
+// SourceContext the translator will receive. This is the one place the mock and
+// real planners differ: the mock synthesizes "// source: <path>", this carries the
+// file content discovered on disk.
+func goPlanFor(model WorkspaceModel) MigrationPlan =
+    MigrationPlan(Items = model.Packages.FlatMap((p Package) => goPlanItemsForPackage(p)))
+
+// goPlanItemsForPackage builds one PlanItem per unit carrying its REAL source text,
+// and attaches the package's 1:1 source tests (computed once via sourceTestRefs —
+// AddedTest excluded) as each unit's verify-gate input.
+func goPlanItemsForPackage(p Package) Array[PlanItem] {
+    val tests = sourceTestRefs(p)
+    return p.Units.Map((u Unit) => PlanItem(
+        Unit        = u.Id,
+        Source      = SourceContext(
+            SourceText   = u.Source,
+            Dependencies = unitDependencies(u),
+        ),
+        Target      = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+        SourceTests = tests,
+    ))
+}
+
+// unitDependencies is the best-effort dependency context for a unit: one
+// DependencySnippet per imported path recovered from its source. Text is left
+// empty — this slice surfaces WHICH symbols the unit depends on; resolving each to
+// its definition is future work, not faked here.
+func unitDependencies(u Unit) Array[DependencySnippet] =
+    parseImports(u.Source).Map((imp string) =>
+        DependencySnippet(Name = imp, Text = ""))

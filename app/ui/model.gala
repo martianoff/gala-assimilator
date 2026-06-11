@@ -1,0 +1,176 @@
+package ui
+
+import (
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ============================================================================
+// Model — the single immutable app state.
+//
+// Routing is a ScreenStack of route tokens: S1 (interview) → S2 (plan summary)
+// → S3 (assimilation dashboard). The engine is consumed ONLY through its public
+// port (engine.EnginePort); the live run is carried as plain engine value types
+// (WorkspaceModel / MigrationPlan / RunState) — no engine internals.
+//
+// S1 keyboard focus is a FocusRing; S2/S3 each track their own small focus +
+// cursor/scroll state so mouse and keyboard reach the same actions everywhere.
+// ============================================================================
+
+// Route tokens for the ScreenStack.
+func RouteS0() string = "S0"   // Resume / corrupt-checkpoint launch prompt
+func RouteS1() string = "S1"   // Setup / Interview
+func RouteS2() string = "S2"   // Plan summary
+func RouteS3() string = "S3"   // Assimilation dashboard
+func RouteS4() string = "S4"   // Unit / diff review
+func RouteS5() string = "S5"   // Blocker / clarification
+func RouteS6() string = "S6"   // Run report (+ resume affordance)
+
+// S1 focus pane ids — order defines the Tab ring.
+func PaneBrowse() string      = "browse"
+func PaneTarget() string      = "target"
+func PaneUnsupported() string = "unsupported"
+func PaneRetry() string       = "retry"
+func PaneBackend() string     = "backend"
+func PaneAmbiguity() string   = "ambiguity"
+func PaneScan() string        = "scan"
+
+// S2 / S3 focus pane ids.
+func PaneStart() string = "start"  // S2 start-run button
+func PaneBack() string  = "back"   // S2 back button
+func PaneTree() string  = "tree"   // S3 unit tree
+func PaneLog() string   = "log"    // S3 activity log
+
+func s1Panes() Array[string] =
+    ArrayOf[string](
+        PaneBrowse(),
+        PaneTarget(),
+        PaneUnsupported(),
+        PaneRetry(),
+        PaneBackend(),
+        PaneAmbiguity(),
+        PaneScan(),
+    )
+
+// Minimum viewport the full layout needs; below this a resize notice shows.
+func MinCols() int = 60
+func MinRows() int = 14
+
+// Above this width S1 combines retry+backend onto one row; S3 keeps the split
+// board side-by-side. Below it, both stack.
+func WideCols() int = 86
+
+struct Model(
+    Screens ScreenStack,
+    Focus   FocusRing,
+    // MakePort builds an engine port from a backend name ("mock"/"go"/"claude").
+    // The S1 selection decides which name is passed when a scan starts; the
+    // resulting port (Port) then drives the whole run.
+    MakePort func(string) engine.EnginePort,
+    Port     engine.EnginePort,
+    Cols     int,
+    Rows     int,
+    // S1 interview
+    SourceDir    string,
+    Source       SourceInfo,
+    TargetIdx    int,
+    Unsupported  UnsupportedPolicy,
+    Retry        int,
+    Backend      AgentBackend,
+    AmbiguityIdx int,
+    Scanning     bool,
+    // engine run state (plain value types from the public port)
+    Workspace Option[engine.WorkspaceModel],
+    Plan      Option[engine.MigrationPlan],
+    Run       Option[engine.RunState],
+    // S2 / S3 navigation
+    S2Focus    string,
+    S3Focus    string,
+    TreeCursor int,
+    LogScroll  int,   // lines scrolled up from the tail (0 = following latest)
+    // S5 clarification answer buffer (the unit under review/answer is TreeCursor)
+    AnswerText string,
+    // checkpoint / resume
+    Persist     bool,                         // auto-save the run during ticks (app: on; tests: off)
+    ResumeOffer Option[runview.LoadSummary],  // a checkpoint found at launch (S0 prompt)
+    LastSaveOk  bool,                         // last auto-save result (S3 indicator)
+)
+
+// browseDirs is the small set of sample project paths the Browse control cycles.
+func browseDirs() Array[string] =
+    ArrayOf[string](
+        "/workdir/myproject",
+        "/workdir/sample-lib",
+        "/workdir/legacy-app",
+    )
+
+// NewModel builds the initial state for the given engine-port factory and
+// viewport. The default backend is Go (the real scanner), matching the app's
+// prior hardcoded GoEngine; the active Port is built from that and rebuilt from
+// the S1 selection when a scan starts.
+func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model {
+    val dir = browseDirs().Get(0)
+    val defaultBackend = GoBackend()
+    return Model(
+        Screens  = NewScreenStack(RouteS1()),
+        Focus    = NewFocusRing(s1Panes()),
+        MakePort = makePort,
+        Port     = makePort(BackendName(defaultBackend)),
+        Cols     = cols,
+        Rows     = rows,
+        SourceDir    = dir,
+        Source       = detectSource(dir),
+        TargetIdx    = 0,
+        Unsupported  = FlagContinue(),
+        Retry        = 3,
+        Backend      = defaultBackend,
+        AmbiguityIdx = 0,
+        Scanning     = false,
+        Workspace = None[engine.WorkspaceModel](),
+        Plan      = None[engine.MigrationPlan](),
+        Run       = None[engine.RunState](),
+        S2Focus    = PaneStart(),
+        S3Focus    = PaneTree(),
+        TreeCursor = 0,
+        LogScroll  = 0,
+        AnswerText = "",
+        Persist     = false,
+        ResumeOffer = None[runview.LoadSummary](),
+        LastSaveOk  = true,
+    )
+}
+
+// DefaultSourceDir is the project the launch resume-probe checks.
+func DefaultSourceDir() string = browseDirs().Get(0)
+
+// NewModelResume seeds the model from a launch checkpoint probe. A "loaded" or
+// "corrupt" summary opens the S0 prompt on top of S1 (so Start fresh falls back
+// to S1); "missing" is just a normal S1 start. `persist` enables auto-save during
+// the run (the app passes true; tests pass false to stay IO-free).
+func NewModelResume(
+    makePort func(string) engine.EnginePort,
+    offer runview.LoadSummary,
+    persist bool,
+    cols int,
+    rows int,
+) Model {
+    val base = NewModel(makePort, cols, rows)
+    if (offer.Kind == "missing") {
+        return base.Copy(Persist = persist)
+    }
+    return base.Copy(
+        Persist     = persist,
+        ResumeOffer = Some(offer),
+        Screens     = base.Screens.Push(RouteS0()),
+    )
+}
+
+// TargetLang is the currently-selected target language label.
+func (m Model) TargetLang() string =
+    TargetLangOptions().Get(clampIdx(m.TargetIdx, TargetLangOptions().Length()))
+
+// Ambiguity is the currently-selected ambiguity-default label.
+func (m Model) Ambiguity() string =
+    AmbiguityOptions().Get(clampIdx(m.AmbiguityIdx, AmbiguityOptions().Length()))

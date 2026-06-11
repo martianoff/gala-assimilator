@@ -1,0 +1,418 @@
+package runview
+
+import (
+    . "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    str "martianoff/gala/strings"
+)
+
+// ============================================================================
+// Engine → UI projection.
+//
+// This package dot-imports the engine so it can pattern-match the engine's
+// sealed types (UnitStatus, EngineEvent, ProgressPhase) — GALA only matches
+// sealed cases under a dot-import. It deliberately does NOT import gala_tui:
+// the UI package's gala_tui dependency transitively pulls in `state`, whose
+// `Done` shadows the engine's `Done` case during analysis. Isolating this
+// projection in its own gala_tui-free package keeps `Done` unambiguous.
+//
+// The UI consumes only the plain VM structs and functions below; it never
+// pattern-matches engine internals itself.
+// ============================================================================
+
+// PlanVM is S2's plan summary.
+struct PlanVM(
+    Packages int,
+    Units    int,
+    Items    Array[string],
+)
+
+// UnitRowVM is one row of the run view's unit tree. Attempts is how many
+// translate→verify cycles the unit has spent (UnitRun.Attempts): 1 on a clean
+// first pass, >1 once the fix loop has re-translated it — the UI surfaces that as a
+// per-row badge.
+//
+// Flagged / Unverified are the correctness markers that keep the product invariant
+// visible: a unit that reached Done but raised an unsupported-construct flag
+// (Flagged) or passed the gate with NO 1:1 source-test coverage (Unverified) must
+// never look identical to a clean pass. Both are derived from the Done result's
+// flags; a non-Done unit carries neither.
+struct UnitRowVM(
+    Pkg        string,
+    Id         string,
+    Glyph      string,
+    Status     string,
+    Attempts   int,
+    Flagged    bool,
+    Unverified bool,
+)
+
+// StatusCounts is the per-status tally shown beside S3's progress bar.
+struct StatusCounts(
+    Queued  int,
+    Active  int,   // Translating + Verifying
+    Done    int,
+    Blocked int,
+    Skipped int,
+    Failed  int,
+)
+
+// RunVM is S3's whole render model: progress + tree rows + activity log lines.
+//
+// TestsTotal / TestsPassing surface the product's parity metric: only the 1:1
+// replicated SourceTest units count (AddedTest scaffolding is excluded), and a
+// source test "passes" exactly when its unit reached Done (cleared the verify
+// gate). Stage is the migration's high-level pipeline position within a run —
+// "run" while units are still queued/translating, "verify" once only the gate
+// remains, "report" when nothing is actionable. The UI maps these to the
+// Scan→Plan→Run→Verify→Report breadcrumb; it never matches engine state itself.
+// Complete mirrors the engine's IsComplete: the run has reached a fixpoint (no
+// unit is still in a transient phase) so the fix loop has stopped turning. While
+// false the UI shows the loop "iterating…"; true flips it to a settled "complete".
+struct RunVM(
+    Total        int,
+    Done         int,
+    Pct          int,
+    Counts       StatusCounts,
+    Rows         Array[UnitRowVM],
+    Log          Array[string],
+    TestsTotal   int,
+    TestsPassing int,
+    Stage        string,
+    Complete     bool,
+)
+
+// Run-stage tokens (the engine-neutral names the UI breadcrumb maps to labels).
+func StageRun() string    = "run"
+func StageVerify() string = "verify"
+func StageReport() string = "report"
+
+// ----- plan projection ------------------------------------------------------
+
+func ProjectPlan(ws WorkspaceModel, plan MigrationPlan) PlanVM =
+    PlanVM(
+        Packages = ws.Packages.Length(),
+        Units    = plan.Items.Length(),
+        Items    = plan.Items.Map((it PlanItem) => it.Unit.Value),
+    )
+
+// ----- run projection -------------------------------------------------------
+
+func ProjectRun(rs RunState) RunVM {
+    val total = rs.Units.Length()
+    val done = countWhere(rs, isDone)
+    val pct = if (total == 0) 0 else (done * 100) / total
+    val sourceTests = rs.Units.Filter((u UnitRun) => isSourceTestUnit(u))
+    return RunVM(
+        Total        = total,
+        Done         = done,
+        Pct          = pct,
+        Counts       = statusCounts(rs),
+        Rows         = rs.Units.Map((u UnitRun) => unitRow(u)),
+        Log          = rs.Log.Map((e EngineEvent) => logLine(e)).AppendAll(flagLogLinesAll(rs)),
+        TestsTotal   = sourceTests.Length(),
+        TestsPassing = sourceTests.Count((u UnitRun) => isDone(u.Status)),
+        Stage        = runStage(rs),
+        Complete     = IsComplete(rs),
+    )
+}
+
+// isSourceTestUnit reports whether a unit is one of the 1:1-replicated source
+// tests that gate parity. A unit carries its package's SourceTestRefs (only
+// SourceTest units — AddedTest is excluded upstream by sourceTestRefs), so a unit
+// IS a source test exactly when its own id appears among them. This derives the
+// metric from the run's pure data without the engine's UnitKind reaching the UI.
+func isSourceTestUnit(u UnitRun) bool =
+    u.SourceTests.Exists((ref SourceTestRef) => ref.Unit.Value == u.Unit.Value)
+
+// runStage is the migration's high-level position within a live run. With nothing
+// actionable left the run has settled → "report"; while any unit is still queued
+// or translating there is translation work → "run"; once only the verify gate
+// remains (the only actionable units are Verifying) → "verify".
+func runStage(rs RunState) string {
+    if (rs.Units.IsEmpty()) { return StageRun() }
+    if (!AnyActionable(rs)) { return StageReport() }
+    if (rs.Units.Exists((u UnitRun) => isPreVerify(u.Status))) { return StageRun() }
+    return StageVerify()
+}
+
+func isPreVerify(s UnitStatus) bool = s match {
+    case Queued()      => true
+    case Translating() => true
+    case _             => false
+}
+
+// AnyActionable reports whether the run still has a drivable unit (the tick
+// loop uses it to decide whether to keep ticking).
+func AnyActionable(rs RunState) bool =
+    rs.Units.Exists((u UnitRun) => isActionable(u.Status))
+
+func statusCounts(rs RunState) StatusCounts =
+    StatusCounts(
+        Queued  = countWhere(rs, isQueued),
+        Active  = countWhere(rs, isActive),
+        Done    = countWhere(rs, isDone),
+        Blocked = countWhere(rs, isBlocked),
+        Skipped = countWhere(rs, isSkipped),
+        Failed  = countWhere(rs, isFailed),
+    )
+
+func countWhere(rs RunState, pred func(UnitStatus) bool) int =
+    rs.Units.Count((u UnitRun) => pred(u.Status))
+
+func unitRow(u UnitRun) UnitRowVM =
+    UnitRowVM(
+        Pkg        = pkgOf(u.Unit.Value),
+        Id         = u.Unit.Value,
+        Glyph      = glyph(u.Status),
+        Status     = statusLabel(u.Status),
+        Attempts   = u.Attempts,
+        Flagged    = unitFlagged(u),
+        Unverified = unitUnverified(u),
+    )
+
+// unitUnverified is true when the unit reached Done but carries the verify gate's
+// no-coverage flag (IsUnverified) — it passed only vacuously, with no 1:1 source
+// test behind it. unitFlagged is true when the Done result raised any OTHER
+// (unsupported-construct) flag: a construct with no faithful target the translator
+// surfaced rather than guessed. A non-Done unit is neither.
+func unitUnverified(u UnitRun) bool = u.Status match {
+    case Done(r) => IsUnverified(r)
+    case _       => false
+}
+
+// unitFlagged uses the engine's per-flag classifier (IsUnverifiedFlag) so the
+// gate's "unverified" tag stays defined in exactly one place (verify.gala).
+func unitFlagged(u UnitRun) bool = u.Status match {
+    case Done(r) => r.Flags.Exists((f UnsupportedFlag) => !IsUnverifiedFlag(f))
+    case _       => false
+}
+
+// flagLogLinesAll derives one activity-log line per flag carried by any Done unit.
+// Flags ride on the translation Result, not on the engine event stream, so they are
+// projected here and appended after the streamed events — a flagged or unverified
+// unit always leaves a visible trace in the activity log, never a silent pass.
+func flagLogLinesAll(rs RunState) Array[string] =
+    rs.Units.FlatMap((u UnitRun) => flagLogLines(u))
+
+func flagLogLines(u UnitRun) Array[string] = u.Status match {
+    case Done(r) => r.Flags.Map((f UnsupportedFlag) => flagLogLine(u.Unit.Value, f))
+    case _       => EmptyArray[string]()
+}
+
+func flagLogLine(id string, f UnsupportedFlag) string =
+    if (IsUnverifiedFlag(f))
+        s"${id}  ⚠ unverified — ${f.Reason}"
+    else
+        s"${id}  ⚑ flagged ${f.Construct} — ${f.Reason}"
+
+// ----- status predicates + labels (the engine pattern-match surface) --------
+
+func isActionable(s UnitStatus) bool = s match {
+    case Queued()      => true
+    case Translating() => true
+    case Verifying()   => true
+    case Done(_)       => false
+    case Blocked(_)    => false
+    case Skipped()     => false
+    case Failed(_)     => false
+}
+
+func isQueued(s UnitStatus) bool = s match {
+    case Queued() => true
+    case _        => false
+}
+
+func isActive(s UnitStatus) bool = s match {
+    case Translating() => true
+    case Verifying()   => true
+    case _             => false
+}
+
+func isDone(s UnitStatus) bool = s match {
+    case Done(_) => true
+    case _       => false
+}
+
+func isBlocked(s UnitStatus) bool = s match {
+    case Blocked(_) => true
+    case _          => false
+}
+
+func isSkipped(s UnitStatus) bool = s match {
+    case Skipped() => true
+    case _         => false
+}
+
+func isFailed(s UnitStatus) bool = s match {
+    case Failed(_) => true
+    case _         => false
+}
+
+func glyph(s UnitStatus) string = s match {
+    case Queued()      => "○"
+    case Translating() => "◐"
+    case Verifying()   => "◑"
+    case Done(_)       => "✓"
+    case Blocked(_)    => "?"
+    case Skipped()     => "⊘"
+    case Failed(_)     => "✗"
+}
+
+func statusLabel(s UnitStatus) string = s match {
+    case Queued()      => "queued"
+    case Translating() => "translating"
+    case Verifying()   => "verifying"
+    case Done(_)       => "done"
+    case Blocked(_)    => "blocked"
+    case Skipped()     => "skipped"
+    case Failed(r)     => "failed: " + r
+}
+
+func phaseLabel(p ProgressPhase) string = p match {
+    case PhaseReading()   => "reading"
+    case PhaseEmitting()  => "emitting"
+    case PhaseVerifying() => "verifying"
+}
+
+func logLine(e EngineEvent) string = e match {
+    case EvProgress(unit, ev)       => unit.Value + "  " + phaseLabel(ev.Phase) + ": " + ev.Note
+    case EvStatus(unit, st)         => unit.Value + "  → " + statusLabel(st)
+    case EvRetry(unit, attempt, reason) => runRetryLine(unit, attempt, reason)
+}
+
+// runRetryLine renders one turn of the fix loop: the unit, the attempt that just
+// failed, and a trimmed one-line reason. Verify diagnostics can be long and
+// multi-line (real toolchain output), so the reason is collapsed to a single line
+// and capped — enough for a reviewer to watch the loop converge without the log
+// drowning in a stack trace.
+func runRetryLine(unit UnitId, attempt int, reason string) string =
+    s"${unit.Value}  ↻ retry ${attempt}: ${trimReason(reason)}"
+
+func trimReason(reason string) string {
+    val oneLine = str.S(reason).ReplaceAll("\n", " ").Trim()
+    if (oneLine.Length() <= maxReasonLen()) { return oneLine.ToString() }
+    return oneLine.Take(maxReasonLen()).ToString() + "…"
+}
+
+// maxReasonLen caps the retry reason shown in the activity log so a long verify
+// diagnostic stays one readable line.
+func maxReasonLen() int = 60
+
+// pkgOf is the package prefix of a unit id ("core/value" → "core").
+func pkgOf(id string) string = str.S(id).Split("/").Get(0).ToString()
+
+// ============================================================================
+// S4 / S5 — per-unit detail projection (review diff + blocker clarification)
+// ============================================================================
+
+// UnitDetailVM is the focused unit projected for S4 (review) and S5 (blocker).
+struct UnitDetailVM(
+    Id          string,
+    Status      string,
+    SourceLines Array[string],   // source unit text, split into lines
+    TargetLines Array[string],   // emitted target text (empty until Done)
+    Rationale   string,
+    Flags       Array[string],   // "Construct — Reason"
+    HasResult   bool,            // true when the unit reached Done (has output)
+    Blocked     bool,            // true when awaiting a clarification answer
+    Question    string,          // the clarification question (when Blocked)
+)
+
+func lines(s string) Array[string] = str.S(s).Lines().Map((ln Str) => ln.ToString())
+
+// projectUnit turns one UnitRun into its review/blocker detail.
+func projectUnit(u UnitRun) UnitDetailVM {
+    val src = lines(u.Assignment.Source.SourceText)
+    return u.Status match {
+        case Done(r) => UnitDetailVM(
+            Id = u.Unit.Value, Status = "done",
+            SourceLines = src, TargetLines = lines(r.TargetText),
+            Rationale = r.Rationale, Flags = flagLines(r.Flags),
+            HasResult = true, Blocked = false, Question = "",
+        )
+        case Blocked(c) => UnitDetailVM(
+            Id = u.Unit.Value, Status = "blocked",
+            SourceLines = src, TargetLines = EmptyArray[string](),
+            Rationale = "", Flags = EmptyArray[string](),
+            HasResult = false, Blocked = true, Question = c.Question,
+        )
+        case Failed(reason) => detailNoOutput(u, src, "failed: " + reason)
+        case Queued()      => detailNoOutput(u, src, "queued")
+        case Translating() => detailNoOutput(u, src, "translating")
+        case Verifying()   => detailNoOutput(u, src, "verifying")
+        case Skipped()     => detailNoOutput(u, src, "skipped")
+    }
+}
+
+func detailNoOutput(u UnitRun, src Array[string], status string) UnitDetailVM =
+    UnitDetailVM(
+        Id = u.Unit.Value, Status = status,
+        SourceLines = src, TargetLines = EmptyArray[string](),
+        Rationale = "", Flags = EmptyArray[string](),
+        HasResult = false, Blocked = false, Question = "",
+    )
+
+func flagLines(flags Array[UnsupportedFlag]) Array[string] =
+    flags.Map((f UnsupportedFlag) => f.Construct + " — " + f.Reason)
+
+// UnitAt projects the unit at index idx, or None if out of range.
+func UnitAt(rs RunState, idx int) Option[UnitDetailVM] {
+    if (idx < 0 || idx >= rs.Units.Length()) { return None[UnitDetailVM]() }
+    return Some(projectUnit(rs.Units.Get(idx)))
+}
+
+// IsBlockedAt reports whether the unit at idx is awaiting a clarification.
+func IsBlockedAt(rs RunState, idx int) bool {
+    if (idx < 0 || idx >= rs.Units.Length()) { return false }
+    return isBlocked(rs.Units.Get(idx).Status)
+}
+
+// FirstBlocked is the index of the first blocked unit, if any.
+func FirstBlocked(rs RunState) Option[int] {
+    var i = 0
+    val n = rs.Units.Length()
+    for i < n {
+        if (isBlocked(rs.Units.Get(i).Status)) { return Some(i) }
+        i = i + 1
+    }
+    return None[int]()
+}
+
+// BlockedCount is how many units await a clarification answer.
+func BlockedCount(rs RunState) int = countWhere(rs, isBlocked)
+
+// ============================================================================
+// Checkpoint load → UI summary
+// ============================================================================
+
+// LoadSummary is a CheckpointLoad projected for the UI: a plain kind token plus
+// the done/total figures for the resume offer (when loaded), the reason (when
+// corrupt), and the checkpoint itself (opaque to the UI — handed back to
+// port.Resume on accept). The UI switches on Kind (a string), never matching
+// the engine's sealed CheckpointLoad.
+struct LoadSummary(
+    Kind   string,            // "loaded" | "missing" | "corrupt"
+    Done   int,
+    Total  int,
+    Reason string,
+    Cp     Option[Checkpoint],
+)
+
+func ClassifyLoad(load CheckpointLoad) LoadSummary = load match {
+    case Loaded(cp) => LoadSummary(
+        Kind   = "loaded",
+        Done   = doneInUnits(cp.Units),
+        Total  = cp.Units.Length(),
+        Reason = "",
+        Cp     = Some(cp),
+    )
+    case Missing()  => LoadSummary(
+        Kind = "missing", Done = 0, Total = 0, Reason = "", Cp = None[Checkpoint]())
+    case Corrupt(r) => LoadSummary(
+        Kind = "corrupt", Done = 0, Total = 0, Reason = r, Cp = None[Checkpoint]())
+}
+
+func doneInUnits(units Array[UnitRun]) int =
+    units.Count((u UnitRun) => isDone(u.Status))

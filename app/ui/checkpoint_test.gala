@@ -1,0 +1,141 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+    . "martianoff/gala/collection_immutable"
+    "martianoff/gala/fs"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// M5 save/restore — checkpoint round-trips through the UI. Real IO is confined
+// to a fresh temp dir; the resume itself (port.Resume) is pure, so the UI path
+// (classify load → S0 → MResumeAccept) is exercised deterministically.
+// ============================================================================
+
+func tempRoot() string = fs.MkdirTemp("", "gala_ui_ckpt").GetOrElse("")
+
+func advanceN(port engine.EnginePort, st engine.RunState, n int) engine.RunState {
+    var s = st
+    var i = 0
+    for i < n {
+        s = port.Advance(s)
+        i = i + 1
+    }
+    return s
+}
+
+func midRunState(port engine.EnginePort, n int) engine.RunState {
+    val st0 = port.Run(port.Plan(port.Scan(engine.ScanRequest(Root = "/x"))))
+    return advanceN(port, st0, n)
+}
+
+func TestCheckpointPathShape(t T) T {
+    val p = str.S(CheckpointPath("/workdir/proj"))
+    val t1 = IsTrue(t, p.Contains(".assimilator"))
+    return IsTrue(t1, p.Contains("state.json"))
+}
+
+// doSave (the function the auto-save Cmd runs) writes a loadable checkpoint.
+func TestDoSaveWritesLoadableCheckpoint(t T) T {
+    val root = tempRoot()
+    val port = engine.MockEngine()
+    val mid = midRunState(port, 6)
+    val saved = doSave(port, mid, root)
+    val t1 = IsTrue(t, saved)
+    return IsTrue(t1, fs.Exists(CheckpointPath(root)))
+}
+
+// Full UI round-trip: save during a run, "relaunch", Resume restores the same
+// done-count and lands on S3.
+func TestSaveThenResumeRestoresDoneCount(t T) T {
+    val root = tempRoot()
+    val port = engine.MockEngine()
+    val mid = midRunState(port, 6)
+    val d = engine.CountByDone(mid)
+    val saved = doSave(port, mid, root)
+    val t1 = IsTrue(t, saved)
+
+    // "Relaunch": classify what's on disk, seed the model (S0 offer).
+    val offer = runview.ClassifyLoad(port.LoadCheckpoint(CheckpointPath(root)))
+    val t2 = Eq(t1, offer.Kind, "loaded")
+    val t3 = Eq(t2, offer.Done, d)
+    val m0 = NewModelResume(mockFactory(), offer, false, 110, 30)
+    val t4 = Eq(t3, m0.Screens.Current(), RouteS0())
+
+    // Accept resume → S3 with the same done-count.
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MResumeAccept()))
+    val t5 = Eq(t4, m1.Screens.Current(), RouteS3())
+    return Eq(t5, doneOf(m1), d)
+}
+
+// With a saved checkpoint present, choosing Start fresh (instead of Resume)
+// dismisses the prompt and drops to the normal new-migration flow (S1), carrying
+// no stale run — the new scan will overwrite the old checkpoint when it saves.
+func TestResumeChoiceStartFreshGoesToNewFlow(t T) T {
+    val root = tempRoot()
+    val port = engine.MockEngine()
+    val mid = midRunState(port, 6)
+    doSave(port, mid, root)
+    val offer = runview.ClassifyLoad(port.LoadCheckpoint(CheckpointPath(root)))
+    val t1 = Eq(t, offer.Kind, "loaded")
+    val m0 = NewModelResume(mockFactory(), offer, false, 110, 30)
+    val t2 = Eq(t1, m0.Screens.Current(), RouteS0())     // resume prompt is up
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MStartFresh()))
+    val t3 = Eq(t2, m1.Screens.Current(), RouteS1())     // falls back to the normal flow
+    return IsTrue(t3, m1.Run.IsEmpty())                  // no stale run carried over
+}
+
+// No checkpoint → normal S1 start (no resume prompt).
+func TestMissingGoesToS1(t T) T {
+    val root = tempRoot()   // empty dir → no state.json
+    val port = engine.MockEngine()
+    val offer = runview.ClassifyLoad(port.LoadCheckpoint(CheckpointPath(root)))
+    val t1 = Eq(t, offer.Kind, "missing")
+    val m0 = NewModelResume(mockFactory(), offer, false, 110, 30)
+    return Eq(t1, m0.Screens.Current(), RouteS1())
+}
+
+// A present-but-garbage checkpoint surfaces a Corrupt notice (never silent), and
+// Start fresh falls back to S1.
+func TestCorruptShowsNoticeThenStartFresh(t T) T {
+    val root = tempRoot()
+    fs.MkdirAll(CheckpointDir(root), 493)
+    fs.WriteFileString(CheckpointPath(root), "{ this is not a checkpoint", 420)
+    val port = engine.MockEngine()
+    val offer = runview.ClassifyLoad(port.LoadCheckpoint(CheckpointPath(root)))
+    val t1 = Eq(t, offer.Kind, "corrupt")
+    val m0 = NewModelResume(mockFactory(), offer, false, 110, 30)
+    val t2 = Eq(t1, m0.Screens.Current(), RouteS0())
+    val out = str.S(Snapshot(view(m0), 110, 30))
+    val t3 = IsTrue(t2, out.Contains("unreadable"))
+    // Start fresh → S1.
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MStartFresh()))
+    return Eq(t3, m1.Screens.Current(), RouteS1())
+}
+
+// S3 → report (S6) shows the summary and a resume-from-checkpoint affordance.
+func TestReportScreenRendersResume(t T) T {
+    val m = midRunModel(110, 24, 40)   // completed run on S3
+    val (m1, _) = StepAll2(m, ArrayOf[Msg](MOpenReport()))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS6())
+    val out = str.S(Snapshot(view(m1), 110, 24))
+    val t2 = IsTrue(t1, out.Contains("Migration report"))
+    return IsTrue(t2, out.Contains("resume from checkpoint"))
+}
+
+// The S0 resume prompt shows the done/total figures.
+func TestResumePromptRenders(t T) T {
+    val root = tempRoot()
+    val port = engine.MockEngine()
+    val mid = midRunState(port, 6)
+    doSave(port, mid, root)
+    val offer = runview.ClassifyLoad(port.LoadCheckpoint(CheckpointPath(root)))
+    val m0 = NewModelResume(mockFactory(), offer, false, 110, 30)
+    val out = str.S(Snapshot(view(m0), 110, 30))
+    val t1 = IsTrue(t, out.Contains("Saved migration found"))
+    return IsTrue(t1, out.Contains("resume"))
+}

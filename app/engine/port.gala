@@ -1,0 +1,547 @@
+package engine
+
+// The engine's PUBLIC PORT — the only surface the UI is allowed to call. Like the
+// acp AgentRunner, it is a struct of function values (a GALA-idiomatic port): the
+// UI holds an EnginePort value, never reaches into engine internals, and a future
+// real engine swaps in behind the same struct.
+//
+// Operations (the brief's surface): scan -> plan -> run, stream events (Advance +
+// Events), act on a unit (retry / skip / accept), answer a blocker, and
+// checkpoint / resume. The port's types are PURE DATA: no gala_tui, no app/ui,
+// and no acp.* — the gala-acp generics the runner machinery is built on are
+// adapted to the engine's own EngineEvent / UnitStatus at the boundary
+// (finishUnit), never leaked through EnginePort. The UI wraps Advance/Events ticks
+// in its own Cmd[T]; the engine never blocks.
+//
+// MockEngine is the deterministic offline implementation: a few units march
+// Queued -> Translating -> Verifying -> Done, streaming progress events sourced
+// from a real acp transcript and terminating via the run's outcome. It exists so
+// the UI can integrate against something real before a live backend is selected.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    acp "github.com/martianoff/gala-acp"
+)
+
+// ----------------------------------------------------------------------------
+// Port-facing value types
+// ----------------------------------------------------------------------------
+
+// ScanRequest is the input to a scan: the project root to discover units under.
+struct ScanRequest(Root string)
+
+// PlanItem is one unit scheduled for migration, with the curated source context
+// and target conventions the translator will receive, plus the package's 1:1
+// source tests (SourceTest only — AddedTest excluded by sourceTestRefs) that the
+// verify gate runs against this unit's emitted translation.
+struct PlanItem(
+    Unit        UnitId,
+    Source      SourceContext,
+    Target      TargetConventions,
+    SourceTests Array[SourceTestRef],
+)
+
+// MigrationPlan is the ordered set of units to migrate.
+struct MigrationPlan(Items Array[PlanItem])
+
+// UnitStatus is where a unit sits in its lifecycle. The happy path is
+// Queued -> Translating -> Verifying -> Done; Blocked (awaiting a clarification
+// answer), Skipped, and Failed are the off-ramps. Done/Blocked/Failed carry the
+// payload the UI needs to render the terminus.
+sealed type UnitStatus {
+    case Queued()
+    case Translating()
+    case Verifying()
+    case Done(Output Result)
+    case Blocked(Question Clarification)
+    case Skipped()
+    case Failed(Reason string)
+}
+
+// UnitRun is the engine's per-unit state: the unit id, the assignment prepared
+// for it (which carries the re-submission Answers / PriorFailure), its current
+// status, the 1:1 source tests the verify gate runs against this unit (carried
+// from the plan so the gate needs no rescan; round-trips through Checkpoint), and
+// Attempts — how many translate->verify cycles this unit has spent.
+//
+// Attempts is the BOUND on the per-unit fix loop: every finishUnit (one submit +
+// gate) increments it, and a unit that keeps failing verification stops re-trying
+// once Attempts reaches the run's cap (see retryOrFail / DefaultMaxAttempts). It is
+// 0 for a freshly-planned unit and round-trips through Checkpoint so a resumed run
+// keeps the remaining budget. An operator re-queue (ActRetry / AnswerBlocker)
+// resets it to 0 — a manual intervention earns a fresh budget.
+struct UnitRun(
+    Unit        UnitId,
+    Assignment  TaskAssignment,
+    Status      UnitStatus,
+    SourceTests Array[SourceTestRef],
+    Attempts    int,
+)
+
+// EngineEvent is one thing the run streams to the UI: a progress note (sourced
+// from the run transcript), a status transition, or a fix-loop re-translate.
+// Sealed so the UI handles every kind it can render.
+//
+// EvRetry marks the per-unit fix loop turning: a verify FAILED and the unit is
+// being re-translated (Attempt = the attempt that just failed, Reason = the verify
+// diagnostics fed back into the next attempt). It is distinct from the
+// EvStatus(Translating) that accompanies it so the activity log can show "the loop
+// turning" rather than an ambiguous re-entry into Translating.
+sealed type EngineEvent {
+    case EvProgress(Unit UnitId, Event ProgressUpdate)
+    case EvStatus(Unit UnitId, Status UnitStatus)
+    case EvRetry(Unit UnitId, Attempt int, Reason string)
+}
+
+// RunState is the whole live run as pure data: per-unit state plus the ordered
+// event log (the stream-as-data the UI replays). No handles, no channels.
+struct RunState(
+    Units Array[UnitRun],
+    Log   Array[EngineEvent],
+)
+
+// UnitAction is an operator decision on a single unit. (Cases are `Act*`-prefixed
+// so they don't collide with VerdictOutcome.Accept in this one package.)
+sealed type UnitAction {
+    case ActRetry()  // re-queue (threading a PriorFailure if it had failed)
+    case ActSkip()   // abandon this unit
+    case ActAccept() // accept the current output as final
+}
+
+// Checkpoint is the persistable snapshot of a run — pure data that round-trips
+// through Resume with no loss. It is exactly the run's units and event log; no
+// live state to reconstruct.
+struct Checkpoint(
+    Units Array[UnitRun],
+    Log   Array[EngineEvent],
+)
+
+// StepResult is an internal helper: a unit's next state plus the events that
+// transition produced. (A struct, not a tuple — GALA tuples want explicit type
+// params and mis-emit for 3-arity; a named struct is clearer here.)
+struct StepResult(
+    Unit   UnitRun,
+    Events Array[EngineEvent],
+)
+
+// ----------------------------------------------------------------------------
+// The port
+// ----------------------------------------------------------------------------
+
+// EnginePort is the engine's whole public surface. The UI depends only on this.
+//
+// Checkpoint / Resume snapshot a run in memory; SaveCheckpoint / LoadCheckpoint
+// persist that snapshot to disk so a run survives quit / crash (M5). All types
+// crossing the port are pure domain values — no acp.*, no gala_tui.
+struct EnginePort(
+    Scan           func(ScanRequest) WorkspaceModel,
+    Plan           func(WorkspaceModel) MigrationPlan,
+    Run            func(MigrationPlan) RunState,
+    Advance        func(RunState) RunState,
+    Events         func(RunState) Array[EngineEvent],
+    ActOnUnit      func(RunState, UnitId, UnitAction) RunState,
+    AnswerBlocker  func(RunState, UnitId, Answer) RunState,
+    Checkpoint     func(RunState) Checkpoint,
+    Resume         func(Checkpoint) RunState,
+    SaveCheckpoint func(RunState, string) bool,
+    LoadCheckpoint func(string) CheckpointLoad,
+    Integrate      func(RunState, WorkspaceModel, string) IntegrateResult,
+)
+
+// ----------------------------------------------------------------------------
+// MockEngine — the deterministic offline implementation
+// ----------------------------------------------------------------------------
+
+// MockEngine is the default offline engine, driven by the MockTranslator and the
+// deterministic (always-pass) MockVerifier.
+func MockEngine() EnginePort = MockEngineWith(MockTranslator())
+
+// MockEngineWith builds the engine over a caller-supplied translator runner (with
+// the default MockVerifier), so tests can inject a ScriptedRunner that yields a
+// Clarification or an Abort and drive a unit to Blocked / Failed — every terminus
+// exercised THROUGH the real run machinery, not hand-built.
+func MockEngineWith(runner acp.AgentRunner[TaskAssignment, Result, Clarification]) EnginePort = MockEngineWithVerifier(runner, MockVerifier())
+
+// DefaultMaxAttempts caps the per-unit fix loop: a unit that keeps failing the
+// verify gate is re-translated (diagnostics fed back) at most this many times
+// before it settles as Failed. The RUN loops to a fixpoint over all units (the
+// "unlimited" part); a single UNIT is bounded by this cap so it can never spin
+// forever. Three is the conventional default — enough for the feedback loop to
+// converge, small enough to surface a genuinely stuck unit quickly.
+func DefaultMaxAttempts() int = 3
+
+// MockEngineWithVerifier builds the engine over a caller-supplied runner AND
+// verifier, so tests can inject a ScriptedVerifier (pass / fail / unsupported) and
+// drive the verify gate's every terminus THROUGH the run machinery. Uses the
+// default per-unit attempt cap; MockEngineWithVerifierCap sets a custom one.
+func MockEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier) EnginePort =
+    MockEngineWithVerifierCap(runner, verifier, DefaultMaxAttempts())
+
+// MockEngineWithVerifierCap is MockEngineWithVerifier with a configurable per-unit
+// attempt cap, so a test can exercise the fix loop's exhaustion at a small bound.
+func MockEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort = EnginePort(
+    Scan          = (_ ScanRequest) => ScanGoWorkspaceStub(),
+    Plan          = (m WorkspaceModel) => planFor(m),
+    Run           = (p MigrationPlan) => runFor(p),
+    Advance       = (s RunState) => advance(runner, verifier, maxAttempts, s),
+    Events        = (s RunState) => s.Log,
+    ActOnUnit     = (s RunState, id UnitId, a UnitAction) => actOnUnit(s, id, a),
+    AnswerBlocker  = (s RunState, id UnitId, ans Answer) => answerBlocker(s, id, ans),
+    Checkpoint     = (s RunState) => Checkpoint(Units = s.Units, Log = s.Log),
+    Resume         = (c Checkpoint) => RunState(Units = c.Units, Log = c.Log),
+    SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
+    LoadCheckpoint = (path string) => loadCheckpoint(path),
+    Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
+)
+
+// ----------------------------------------------------------------------------
+// scan / plan / run
+// ----------------------------------------------------------------------------
+
+func planFor(model WorkspaceModel) MigrationPlan =
+    MigrationPlan(Items = model.Packages.FlatMap((p Package) => planItemsForPackage(p)))
+
+// planItemsForPackage builds one PlanItem per unit, attaching the package's 1:1
+// source tests (computed once) so each unit carries its own verify-gate input.
+func planItemsForPackage(p Package) Array[PlanItem] {
+    val tests = sourceTestRefs(p)
+    return p.Units.Map((u Unit) => PlanItem(
+        Unit        = u.Id,
+        Source      = SourceContext(
+            SourceText   = "// source: " + u.Path,
+            Dependencies = EmptyArray[DependencySnippet](),
+        ),
+        Target      = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+        SourceTests = tests,
+    ))
+}
+
+func runFor(plan MigrationPlan) RunState =
+    RunState(
+        Units = plan.Items.Map((it PlanItem) => UnitRun(
+            Unit        = it.Unit,
+            Assignment  = TaskAssignment(
+                Task         = TaskId(Value = it.Unit.Value),
+                Unit         = it.Unit,
+                Source       = it.Source,
+                Target       = it.Target,
+                PriorFailure = None[PriorFailure](),
+                Answers      = EmptyArray[Answer](),
+            ),
+            Status      = Queued(),
+            SourceTests = it.SourceTests,
+            Attempts    = 0,
+        )),
+        Log = EmptyArray[EngineEvent](),
+    )
+
+// ----------------------------------------------------------------------------
+// Advance — one tick of the assimilation
+// ----------------------------------------------------------------------------
+
+// isActionable is true for the transient phases the engine can still drive.
+func isActionable(s UnitStatus) bool = s match {
+    case Queued()      => true
+    case Translating() => true
+    case Verifying()   => true
+    case Done(_)       => false
+    case Blocked(_)    => false
+    case Skipped()     => false
+    case Failed(_)     => false
+}
+
+// hasActionable reports whether any unit is still drivable.
+func hasActionable(s RunState) bool =
+    s.Units.Exists((u UnitRun) => isActionable(u.Status))
+
+func sameUnit(u UnitRun, id UnitId) bool = u.Unit.Value == id.Value
+
+// advance drives the first actionable unit one step forward, appending the events
+// that transition produced. A run with nothing actionable is a fixpoint.
+func advance(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int, state RunState) RunState =
+    state.Units.Find((u UnitRun) => isActionable(u.Status)) match {
+        case Some(u) => replaceAndLog(state, u.Unit, advanceUnit(runner, verifier, maxAttempts, u))
+        case None()  => state
+    }
+
+// advanceUnit moves ONE unit by one phase. The Verifying step submits the unit's
+// assignment to the runner, replays the transcript's progress steps as EvProgress
+// events, runs the VERIFY GATE over the produced output, and then settles ONE turn
+// of the translate->verify->fix loop (settleOutcome): a pass settles Done, but a
+// verify FAIL with budget left re-enters Translating with the diagnostics fed back
+// (a re-translation), so the Verifying phase actually drives the fix loop.
+func advanceUnit(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int, u UnitRun) StepResult = u.Status match {
+    case Queued() => StepResult(
+        Unit   = u.Copy(Status = Translating()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Translating())),
+    )
+    case Translating() => StepResult(
+        Unit   = u.Copy(Status = Verifying()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Verifying())),
+    )
+    case Verifying()   => finishUnit(runner, verifier, maxAttempts, u)
+    case Done(_)       => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+    case Blocked(_)    => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+    case Skipped()     => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+    case Failed(_)     => StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+}
+
+// finishUnit runs ONE translate+verify attempt: it submits the unit's assignment
+// (replaying the transcript's progress as EvProgress), counts the attempt, and
+// hands the terminus to settleOutcome, which decides Done / Blocked / Failed or a
+// re-translate. The progress prefix is always streamed; settleOutcome appends the
+// trailing status (and, on a re-translate, an EvRetry).
+func finishUnit(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int, u UnitRun) StepResult {
+    val transcript = runner.Submit(u.Assignment)
+    val progress = stepNotes(transcript.Steps).Map((n progressNote) =>
+        EvProgress(Unit = u.Unit, Event = ProgressUpdate(
+            Task  = TaskId(Value = n.Task),
+            Phase = phaseFromTag(n.Phase),
+            Note  = n.Note,
+        )))
+    val attempts = u.Attempts + 1
+    val settled = settleOutcome(verifier, maxAttempts, u, attempts, transcript.Final)
+    return StepResult(
+        Unit   = settled.Unit,
+        Events = progress.AppendAll(settled.Events),
+    )
+}
+
+// settleOutcome turns one attempt's terminus into the unit's next step. The ONLY
+// terminus that can reach Done is a produced Result that also clears the verify
+// gate (settleVerified). A clarification Blocks; an abort Fails — neither produced
+// output to verify, and neither re-translates (there is nothing to fix yet). Both
+// carry the bumped attempt count.
+func settleOutcome(verifier Verifier, maxAttempts int, u UnitRun, attempts int, o acp.RunOutcome[Result, Clarification]) StepResult =
+    outcomeResult(o) match {
+        case Some(r) => settleVerified(verifier, maxAttempts, u, attempts, r)
+        case None()  => outcomeClarification(o) match {
+            case Some(c) => terminalStep(u, attempts, Blocked(Question = c))
+            case None()  => terminalStep(u, attempts, Failed(Reason = outcomeAbort(o).GetOrElse("aborted")))
+        }
+    }
+
+// settleVerified runs the verify gate over the unit's 1:1-replicated source tests
+// (only; AddedTest units were excluded when the plan was built) and turns the
+// verdict into the next step. A pass admits the translation to Done — but a pass
+// with NO 1:1 source test behind it is only vacuous, so withCoverageFlag stamps
+// that result "unverified" rather than a clean Done. A FAIL enters the fix loop
+// (retryOrFail): re-translate with the diagnostics fed back if budget remains, else
+// settle Failed carrying the last diagnostics. A source test that can't be
+// faithfully verified is a structural problem re-translation can't fix, so it
+// surfaces as Failed (needs review) immediately — never a silent pass or drop.
+func settleVerified(verifier Verifier, maxAttempts int, u UnitRun, attempts int, r Result) StepResult {
+    val verdict = verifier.Verify(VerifyRequest(
+        Unit        = u.Unit,
+        TargetText  = r.TargetText,
+        SourceTests = u.SourceTests,
+    ))
+    return verdict match {
+        case VerifyPass()             => terminalStep(u, attempts, Done(Output = withCoverageFlag(r, u.SourceTests)))
+        case VerifyFail(failing, why) => retryOrFail(u, attempts, maxAttempts, verifyFailReason(failing, why))
+        case VerifyUnsupported(why)   => terminalStep(u, attempts, Failed(Reason = "needs review: untranslatable source test: " + why))
+    }
+}
+
+// retryOrFail is the per-unit fix loop's bound. With attempts still under the cap
+// it RE-TRANSLATES: it threads the verify diagnostics onto the assignment as a
+// PriorFailure (the "added context" the next attempt translates against), drops the
+// unit back to Translating, and emits an EvRetry (the loop turning) alongside the
+// EvStatus(Translating) that keeps the status stream intact. At the cap it settles
+// Failed, carrying the last diagnostics — a visible failure, never a silent
+// give-up. No-progress (the new diagnostics identical to the prior attempt's) is
+// surfaced in that exhaustion reason.
+func retryOrFail(u UnitRun, attempts int, maxAttempts int, reason string) StepResult {
+    if attempts >= maxAttempts {
+        return terminalStep(u, attempts, Failed(Reason = exhaustedReason(u, reason)))
+    }
+    val asn = u.Assignment
+    val retried = asn.Copy(PriorFailure = Some[PriorFailure](
+        PriorFailure(Summary = reason, Flags = EmptyArray[UnsupportedFlag]()),
+    ))
+    return StepResult(
+        Unit   = u.Copy(Assignment = retried, Status = Translating(), Attempts = attempts),
+        Events = ArrayOf[EngineEvent](
+            EvRetry(Unit = u.Unit, Attempt = attempts, Reason = reason),
+            EvStatus(Unit = u.Unit, Status = Translating()),
+        ),
+    )
+}
+
+// terminalStep settles the unit into a non-retrying status (Done / Blocked /
+// Failed), stamping the attempt count and logging the status transition.
+func terminalStep(u UnitRun, attempts int, status UnitStatus) StepResult =
+    StepResult(
+        Unit   = u.Copy(Status = status, Attempts = attempts),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = status)),
+    )
+
+// exhaustedReason is the Failed reason for a unit that used its whole fix budget.
+// It carries the last attempt's diagnostics and notes when no progress was made —
+// the new diagnostics matched the prior attempt's (a stuck loop), the "identical
+// diagnostics two attempts running" signal — so the operator sees the loop gave up
+// because it was not converging, not just because it ran out of turns.
+func exhaustedReason(u UnitRun, reason string) string {
+    val prior = priorSummary(u)
+    val base = "verify exhausted: " + reason
+    if prior != "" && prior == reason { return base + " (no further progress across attempts)" }
+    return base
+}
+
+// priorSummary is the previous attempt's diagnostics, threaded onto the assignment
+// as a PriorFailure by the last re-translate (empty before the first re-translate).
+func priorSummary(u UnitRun) string = u.Assignment.PriorFailure match {
+    case Some(pf) => pf.Summary
+    case None()   => ""
+}
+
+// verifyFailReason names the failing source test(s) so the operator sees exactly
+// which 1:1 tests rejected the translation.
+func verifyFailReason(failing Array[UnitId], why string) string {
+    val names = joinComma(failing.Map((id UnitId) => id.Value))
+    return "verify failed: source test(s) [" + names + "] did not pass: " + why
+}
+
+func joinComma(xs Array[string]) string =
+    xs.FoldLeft[string](
+        "",
+        (acc string, s string) => (acc == "") match {
+            case true  => s
+            case false => acc + ", " + s
+        },
+    )
+
+// ----------------------------------------------------------------------------
+// act on unit / answer blocker
+// ----------------------------------------------------------------------------
+
+func actOnUnit(state RunState, id UnitId, action UnitAction) RunState =
+    state.Units.Find((u UnitRun) => sameUnit(u, id)) match {
+        case Some(u) => replaceAndLog(state, id, applyAction(u, action))
+        case None()  => state
+    }
+
+func applyAction(u UnitRun, action UnitAction) StepResult = action match {
+    case ActRetry() => StepResult(
+        Unit   = u.Copy(Assignment = retryAssignment(u), Status = Queued(), Attempts = 0),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Queued())),
+    )
+    case ActSkip() => StepResult(
+        Unit   = u.Copy(Status = Skipped()),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Skipped())),
+    )
+    case ActAccept() => acceptUnit(u)
+}
+
+// retryAssignment threads a PriorFailure onto the assignment when the unit had
+// FAILED, mirroring the clarification loop's Answers threading — same stateless
+// re-submission shape.
+func retryAssignment(u UnitRun) TaskAssignment {
+    val asn = u.Assignment
+    return u.Status match {
+        case Failed(reason) => asn.Copy(PriorFailure = Some[PriorFailure](
+            PriorFailure(Summary = reason, Flags = EmptyArray[UnsupportedFlag]()),
+        ))
+        case Queued()      => asn
+        case Translating() => asn
+        case Verifying()   => asn
+        case Done(_)       => asn
+        case Blocked(_)    => asn
+        case Skipped()     => asn
+    }
+}
+
+// acceptUnit applies an operator ACCEPT. Accept is meaningful ONLY on a Done unit
+// (the translation already cleared the verify gate), where it is idempotent. On
+// ANY non-Done status it is a NO-OP: the unit keeps its real status and no event
+// is logged.
+//
+// It must NEVER fabricate a Done with empty output. Accepting a Queued / Failed /
+// Blocked unit into a clean, empty-TargetText "Done" is a silent operator-accepted
+// empty success: it brushes aside the no-silent-drift invariant that the whole
+// verify gate exists to protect. There is no produced output to accept on a
+// non-Done unit, so accept does nothing.
+func acceptUnit(u UnitRun) StepResult = u.Status match {
+    case Done(_)       => noOp(u)
+    case Queued()      => noOp(u)
+    case Translating() => noOp(u)
+    case Verifying()   => noOp(u)
+    case Blocked(_)    => noOp(u)
+    case Skipped()     => noOp(u)
+    case Failed(_)     => noOp(u)
+}
+
+// noOp leaves the unit and the log untouched — an operator action that has no
+// faithful effect on this status.
+func noOp(u UnitRun) StepResult = StepResult(Unit = u, Events = EmptyArray[EngineEvent]())
+
+// answerBlocker resolves a clarification: it threads the Answer onto the unit's
+// assignment and re-queues it — the clarification-resolution loop, executed as a
+// pure state transition.
+func answerBlocker(state RunState, id UnitId, ans Answer) RunState =
+    state.Units.Find((u UnitRun) => sameUnit(u, id)) match {
+        case Some(u) => replaceAndLog(state, id, applyAnswer(u, ans))
+        case None()  => state
+    }
+
+func applyAnswer(u UnitRun, ans Answer) StepResult {
+    val asn = u.Assignment
+    val answered = asn.Copy(Answers = asn.Answers.Append(ans))
+    return StepResult(
+        Unit   = u.Copy(Assignment = answered, Status = Queued(), Attempts = 0),
+        Events = ArrayOf[EngineEvent](EvStatus(Unit = u.Unit, Status = Queued())),
+    )
+}
+
+// ----------------------------------------------------------------------------
+// shared state update + a convenience driver
+// ----------------------------------------------------------------------------
+
+// replaceAndLog swaps the targeted unit for its stepped version and appends the
+// step's events — the single place RunState is rebuilt.
+func replaceAndLog(state RunState, id UnitId, step StepResult) RunState =
+    RunState(
+        Units = state.Units.Map((x UnitRun) => sameUnit(x, id) match {
+            case true  => step.Unit
+            case false => x
+        }),
+        Log = state.Log.AppendAll(step.Events),
+    )
+
+// IsComplete is the precise "assimilation complete" predicate: the run is at a
+// fixpoint — NO unit is still in a transient phase (Queued / Translating /
+// Verifying). Every unit has settled into a terminal status: Done, Skipped,
+// Failed, or Blocked. (Blocked is settled-pending-operator: the driver can make no
+// further progress on it until AnswerBlocker re-queues it.) Advance is a no-op once
+// IsComplete holds.
+func IsComplete(state RunState) bool = !hasActionable(state)
+
+// RunToCompletion advances a state until it IsComplete — the run loops to a
+// fixpoint over ALL units (the "unlimited" part). It terminates even though a unit
+// can step BACKWARD (Verifying -> Translating on a verify-fail re-translate),
+// because every finishUnit increments that unit's Attempts and the fix loop is
+// bounded by the cap (retryOrFail): each unit takes a bounded number of attempts,
+// and each attempt a bounded number of phases, so the whole run is bounded. A
+// convenience for the UI's "run all" and for tests — not part of the port surface.
+func RunToCompletion(port EnginePort, state RunState) RunState {
+    var s = state
+    var more = hasActionable(s)
+    for more {
+        s = port.Advance(s)
+        more = hasActionable(s)
+    }
+    return s
+}
+
+// CountByDone is a small projection helper: how many units reached Done.
+func CountByDone(state RunState) int =
+    state.Units.Count((u UnitRun) => u.Status match {
+        case Done(_)       => true
+        case Queued()      => false
+        case Translating() => false
+        case Verifying()   => false
+        case Blocked(_)    => false
+        case Skipped()     => false
+        case Failed(_)     => false
+    })

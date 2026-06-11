@@ -1,0 +1,69 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// S1 render / snapshot tests at two viewport widths + the below-minimum
+// resize notice. The reflow assertions are the real point: the same Model
+// renders retry+backend combined when wide and stacked when narrow.
+// ============================================================================
+
+func TestS1WideRendersEveryControl(t T) T {
+    val m = NewModel(mockFactory(), 110, 20)
+    val out = str.S(Snapshot(view(m), 110, 20))
+    val t1 = IsTrue(t,  out.Contains("Gala Assimilator — new migration"))
+    val t2 = IsTrue(t1, out.Contains("Source project"))
+    val t3 = IsTrue(t2, out.Contains("[ browse ]"))
+    val t4 = IsTrue(t3, out.Contains("Detected source"))
+    val t5 = IsTrue(t4, out.Contains("Go  (go.mod found, 50 files)"))
+    val t6 = IsTrue(t5, out.Contains("‹ GALA ▾ ›"))
+    val t7 = IsTrue(t6, out.Contains("(•) flag & continue"))
+    val t8 = IsTrue(t7, out.Contains("( ) skip"))
+    val t9 = IsTrue(t8, out.Contains("(•) Go"))   // Go is the default backend
+    val t10 = IsTrue(t9, out.Contains("‹ prefer immutable + Copy ▾ ›"))
+    return IsTrue(t10, out.Contains("[ scan project → ]"))
+}
+
+func TestS1NarrowRendersEveryControl(t T) T {
+    val m = NewModel(mockFactory(), 72, 20)
+    val out = str.S(Snapshot(view(m), 72, 20))
+    val t1 = IsTrue(t,  out.Contains("Gala Assimilator — new migration"))
+    val t2 = IsTrue(t1, out.Contains("Target language"))
+    val t3 = IsTrue(t2, out.Contains("(•) flag & continue"))
+    val t4 = IsTrue(t3, out.Contains("Retry budget"))
+    val t5 = IsTrue(t4, out.Contains("Agent backend"))
+    return IsTrue(t5, out.Contains("[ scan project → ]"))
+}
+
+// Wide: retry + backend share one row.
+func TestS1WideCombinesRetryAndBackend(t T) T {
+    val m = NewModel(mockFactory(), 110, 20)
+    val lines = str.S(Snapshot(view(m), 110, 20)).Lines()
+    val combined = lines.Exists((ln) => ln.Contains("Retry budget") && ln.Contains("Agent backend"))
+    return IsTrue(t, combined)
+}
+
+// Narrow: retry + backend are on separate rows (the layout reflowed).
+func TestS1NarrowStacksRetryAndBackend(t T) T {
+    val m = NewModel(mockFactory(), 72, 20)
+    val lines = str.S(Snapshot(view(m), 72, 20)).Lines()
+    val combined = lines.Exists((ln) => ln.Contains("Retry budget") && ln.Contains("Agent backend"))
+    val hasRetry = lines.Exists((ln) => ln.Contains("Retry budget"))
+    val hasBackend = lines.Exists((ln) => ln.Contains("Agent backend"))
+    val t1 = IsFalse(t, combined)
+    val t2 = IsTrue(t1, hasRetry)
+    return IsTrue(t2, hasBackend)
+}
+
+// Below the declared minimum the layout collapses to a resize notice.
+func TestBelowMinimumShowsResizeNotice(t T) T {
+    val m = NewModel(mockFactory(), 40, 8)
+    val out = str.S(Snapshot(view(m), 40, 8))
+    val t1 = IsTrue(t, out.Contains("Resize to"))
+    return IsFalse(t1, out.Contains("Target language"))
+}

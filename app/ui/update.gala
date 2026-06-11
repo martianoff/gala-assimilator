@@ -1,0 +1,558 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/time_utils"
+)
+
+// ============================================================================
+// Messages + the pure, non-blocking Update loop.
+//
+// The assimilation flow is: S1 "scan project →" issues an Async engine
+// Scan→Plan → S2 plan summary; S2 "start" issues an Async Run → S3 dashboard,
+// then a self-rescheduling AfterDelay tick calls engine.Advance one step at a
+// time, so the dashboard visibly climbs 0→100% without ever blocking Update.
+// Engine values flow as plain port data; all pattern-matching on engine sealed
+// types is isolated in runview.gala.
+// ============================================================================
+
+sealed type Msg {
+    // shared, keyboard-driven (routed per active screen)
+    case MFocusNext()
+    case MFocusPrev()
+    case MActivate()    // Enter / Space
+    case MStepLeft()    // ArrowLeft  (S1 cyclers)
+    case MStepRight()   // ArrowRight (S1 cyclers)
+    case MNavUp()       // ArrowUp    (S3 tree cursor / log scroll)
+    case MNavDown()     // ArrowDown
+    case MScrollUp()    // wheel up   (S3 log)
+    case MScrollDown()  // wheel down
+    case MKeyChar(C rune)   // a printable key — interpreted per screen
+    case MKeyBackspace()    // backspace — S5 answer editing
+    case MBack()        // Esc — pop a screen, or quit at root
+    case MQuit()
+    case MNoOp()
+
+    // S1 direct (mouse), each also moves focus to that control
+    case MBrowse()
+    case MCycleTarget()
+    case MSetUnsupported(P UnsupportedPolicy)
+    case MStepRetry(Dir int)
+    case MSetBackend(B AgentBackend)
+    case MCycleAmbiguity()
+    case MScanRequested()
+
+    // S2 / S3 direct (mouse)
+    case MStartRun()
+    case MSelectUnit(Idx int)
+    case MFocusPane(Pane string)
+    case MOpenUnit()      // S3 → open the focused unit (S4, or S5 if blocked)
+    case MOpenBlocker()   // S3 blocker badge → open the first blocked unit (S5)
+
+    // S4 review actions / S5 answer (mouse buttons; keys handled via MKeyChar)
+    case MReviewAccept()
+    case MReviewRetry()
+    case MReviewSkip()
+    case MReviewEdit()
+    case MAnswerSubmit()
+
+    // checkpoint / resume
+    case MResumeAccept()                       // S0: resume from the offered checkpoint
+    case MStartFresh()                         // S0: discard the offer, go to S1
+    case MOpenReport()                         // S3 → S6 report
+    case MResumeFromDisk()                     // S6: reload the checkpoint and resume
+    case MResumeLoaded(Load engine.CheckpointLoad)
+    case MCheckpointSaved(Ok bool)
+
+    // engine + runtime
+    case MScanPlanned(Workspace engine.WorkspaceModel, Plan engine.MigrationPlan)
+    case MRunStarted(State engine.RunState)
+    case MRunTick()
+    case MResized(W int, H int)
+}
+
+func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
+    case MQuit()        => (m, QuitCmd[Msg]())
+    case MNoOp()        => (m, NoCmd[Msg]())
+    case MResized(w, h) => (m.Copy(Cols = w, Rows = h), NoCmd[Msg]())
+    case MBack()        => back(m)
+
+    case MFocusNext()  => (focusNext(m), NoCmd[Msg]())
+    case MFocusPrev()  => (focusPrev(m), NoCmd[Msg]())
+    case MActivate()   => activate(m)
+    case MStepLeft()   => (step(m, -1), NoCmd[Msg]())
+    case MStepRight()  => (step(m, 1), NoCmd[Msg]())
+    case MNavUp()      => (nav(m, -1), NoCmd[Msg]())
+    case MNavDown()    => (nav(m, 1), NoCmd[Msg]())
+    case MScrollUp()   => (scrollLog(m, 1), NoCmd[Msg]())
+    case MScrollDown() => (scrollLog(m, -1), NoCmd[Msg]())
+    case MKeyChar(c)   => keyChar(m, c)
+    case MKeyBackspace() => (keyBackspace(m), NoCmd[Msg]())
+
+    case MBrowse()          => (browse(focusOn(m, PaneBrowse())), NoCmd[Msg]())
+    case MCycleTarget()     => (cycleTarget(focusOn(m, PaneTarget()), 1), NoCmd[Msg]())
+    case MSetUnsupported(p) => {
+        val mf = focusOn(m, PaneUnsupported())
+        return (mf.Copy(Unsupported = p), NoCmd[Msg]())
+    }
+    case MStepRetry(d)      => (stepRetry(focusOn(m, PaneRetry()), d), NoCmd[Msg]())
+    case MSetBackend(b)     => {
+        val mf = focusOn(m, PaneBackend())
+        return (mf.Copy(Backend = b), NoCmd[Msg]())
+    }
+    case MCycleAmbiguity()  => (cycleAmbiguity(focusOn(m, PaneAmbiguity()), 1), NoCmd[Msg]())
+    case MScanRequested()   => startScan(focusOn(m, PaneScan()))
+
+    case MStartRun()   => startRun(m)
+    case MSelectUnit(i) => (selectUnit(m, i), NoCmd[Msg]())
+    case MFocusPane(p)  => (focusPane(m, p), NoCmd[Msg]())
+    case MOpenUnit()    => openUnit(m)
+    case MOpenBlocker() => openBlocker(m)
+
+    case MReviewAccept() => applyReview(m, engine.ActAccept())
+    case MReviewRetry()  => applyReview(m, engine.ActRetry())
+    case MReviewSkip()   => applyReview(m, engine.ActSkip())
+    case MReviewEdit()   => (m, NoCmd[Msg]())   // edit-prompt: stub this round
+    case MAnswerSubmit() => submitAnswer(m)
+
+    case MResumeAccept()    => resumeAccept(m)
+    case MStartFresh()      => (m.Copy(Screens = m.Screens.Pop(), ResumeOffer = None[runview.LoadSummary]()), NoCmd[Msg]())
+    case MOpenReport()      => (m.Copy(Screens = m.Screens.Push(RouteS6())), NoCmd[Msg]())
+    case MResumeFromDisk()  => (m, loadCmd(m.Port, m.SourceDir))
+    case MResumeLoaded(load) => resumeLoaded(m, load)
+    case MCheckpointSaved(ok) => (m.Copy(LastSaveOk = ok), NoCmd[Msg]())
+
+    case MScanPlanned(ws, plan) => (scanPlanned(m, ws, plan), NoCmd[Msg]())
+    case MRunStarted(st)        => runStarted(m, st)
+    case MRunTick()             => runTick(m)
+}
+
+// ----- per-screen routing of shared keys ------------------------------------
+
+func focusNext(m Model) Model {
+    val r = m.Screens.Current()
+    if (r == RouteS1()) { return m.Copy(Focus = m.Focus.Next()) }
+    if (r == RouteS2()) { return m.Copy(S2Focus = otherS2(m.S2Focus)) }
+    if (r == RouteS3()) { return m.Copy(S3Focus = otherS3(m.S3Focus)) }
+    return m
+}
+
+func focusPrev(m Model) Model {
+    val r = m.Screens.Current()
+    if (r == RouteS1()) { return m.Copy(Focus = m.Focus.Prev()) }
+    if (r == RouteS2()) { return m.Copy(S2Focus = otherS2(m.S2Focus)) }
+    if (r == RouteS3()) { return m.Copy(S3Focus = otherS3(m.S3Focus)) }
+    return m
+}
+
+func otherS2(p string) string = if (p == PaneStart()) PaneBack() else PaneStart()
+func otherS3(p string) string = if (p == PaneTree()) PaneLog() else PaneTree()
+
+func activate(m Model) Tuple[Model, Cmd[Msg]] {
+    val r = m.Screens.Current()
+    if (r == RouteS0()) { return s0Activate(m) }
+    if (r == RouteS1()) { return s1Activate(m) }
+    if (r == RouteS2()) {
+        if (m.S2Focus == PaneStart()) { return startRun(m) }
+        return back(m)
+    }
+    if (r == RouteS3()) { return openUnit(m) }
+    if (r == RouteS5()) { return submitAnswer(m) }
+    if (r == RouteS6()) { return (m, loadCmd(m.Port, m.SourceDir)) }   // resume from disk
+    return noCmd(m)
+}
+
+// s0Activate: Enter resumes when a checkpoint loaded, else starts fresh.
+func s0Activate(m Model) Tuple[Model, Cmd[Msg]] = m.ResumeOffer match {
+    case Some(offer) => {
+        if (offer.Kind == "loaded") { return resumeAccept(m) }
+        return (m.Copy(Screens = m.Screens.Pop(), ResumeOffer = None[runview.LoadSummary]()), NoCmd[Msg]())
+    }
+    case None() => (m.Copy(Screens = m.Screens.Pop()), NoCmd[Msg]())
+}
+
+// ----- S4 / S5: open, review, answer ----------------------------------------
+
+// openUnit opens the focused unit: S5 if it's blocked, otherwise S4.
+func openUnit(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
+    case Some(rs) => {
+        val idx = m.TreeCursor
+        if (idx < 0 || idx >= rs.Units.Length()) { return noCmd(m) }
+        if (runview.IsBlockedAt(rs, idx)) {
+            return (m.Copy(AnswerText = "", Screens = m.Screens.Push(RouteS5())), NoCmd[Msg]())
+        }
+        return (m.Copy(Screens = m.Screens.Push(RouteS4())), NoCmd[Msg]())
+    }
+    case None() => noCmd(m)
+}
+
+// openBlocker jumps to the first blocked unit and opens S5 (the S3 badge).
+func openBlocker(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
+    case Some(rs) => runview.FirstBlocked(rs) match {
+        case Some(idx) => {
+            val m2 = m.Copy(TreeCursor = idx, AnswerText = "", Screens = m.Screens.Push(RouteS5()))
+            return (m2, NoCmd[Msg]())
+        }
+        case None() => noCmd(m)
+    }
+    case None() => noCmd(m)
+}
+
+// applyReview runs an operator decision on the reviewed unit through the port,
+// returns to S3, and resumes ticking if the action made a unit actionable again.
+func applyReview(m Model, action engine.UnitAction) Tuple[Model, Cmd[Msg]] = m.Run match {
+    case Some(rs) => reviewedUnitId(m) match {
+        case Some(id) => {
+            val next = m.Port.ActOnUnit(rs, id, action)
+            val m2 = m.Copy(Run = Some(next), Screens = m.Screens.Pop())
+            if (runview.AnyActionable(next)) { return (m2, tickCmd()) }
+            return (m2, NoCmd[Msg]())
+        }
+        case None() => noCmd(m)
+    }
+    case None() => noCmd(m)
+}
+
+// submitAnswer threads the typed answer back through the port (re-queueing the
+// unit via the Answers carrier), returns to S3, and resumes ticking.
+func submitAnswer(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
+    case Some(rs) => reviewedUnitId(m) match {
+        case Some(id) => {
+            val ans = engine.Answer(Task = engine.TaskId(Value = id.Value), Response = m.AnswerText)
+            val next = m.Port.AnswerBlocker(rs, id, ans)
+            val m2 = m.Copy(Run = Some(next), AnswerText = "", Screens = m.Screens.Pop())
+            if (runview.AnyActionable(next)) { return (m2, tickCmd()) }
+            return (m2, NoCmd[Msg]())
+        }
+        case None() => noCmd(m)
+    }
+    case None() => noCmd(m)
+}
+
+// ----- checkpoint resume ----------------------------------------------------
+
+// resumeAccept resumes from the launch offer's checkpoint (S0 → S3).
+func resumeAccept(m Model) Tuple[Model, Cmd[Msg]] = m.ResumeOffer match {
+    case Some(offer) => resumeWith(m, offer)
+    case None()      => noCmd(m)
+}
+
+// resumeLoaded handles a disk reload (S6 resume): resume on Loaded, else stay.
+func resumeLoaded(m Model, load engine.CheckpointLoad) Tuple[Model, Cmd[Msg]] {
+    val offer = runview.ClassifyLoad(load)
+    if (offer.Kind == "loaded") { return resumeWith(m, offer) }
+    return noCmd(m)
+}
+
+// resumeWith rebuilds the run from a checkpoint via the port and routes to S3,
+// continuing the assimilation from the frontier (resuming the tick loop).
+func resumeWith(m Model, offer runview.LoadSummary) Tuple[Model, Cmd[Msg]] = offer.Cp match {
+    case Some(cp) => {
+        val st = m.Port.Resume(cp)
+        val m2 = m.Copy(
+            Run         = Some(st),
+            ResumeOffer = None[runview.LoadSummary](),
+            S3Focus     = PaneTree(),
+            TreeCursor  = 0,
+            LogScroll   = 0,
+            Screens     = NewScreenStack(RouteS1()).Push(RouteS3()),
+        )
+        val cont = if (runview.AnyActionable(st)) tickCmd() else NoCmd[Msg]()
+        return (m2, withSave(m2, st, cont))
+    }
+    case None() => noCmd(m)
+}
+
+// reviewedUnitId is the engine UnitId of the unit currently under review (the
+// tree cursor). Field access only — no engine pattern-match here.
+func reviewedUnitId(m Model) Option[engine.UnitId] = m.Run match {
+    case Some(rs) => {
+        val idx = m.TreeCursor
+        if (idx < 0 || idx >= rs.Units.Length()) { return None[engine.UnitId]() }
+        return Some(rs.Units.Get(idx).Unit)
+    }
+    case None() => None[engine.UnitId]()
+}
+
+// keyChar interprets a printable key per screen: type into the S5 answer, run
+// an S4 action (a/r/s/e), or quit on 'q' elsewhere.
+func keyChar(m Model, c rune) Tuple[Model, Cmd[Msg]] {
+    val r = m.Screens.Current()
+    if (r == RouteS5()) { return (typeAnswer(m, c), NoCmd[Msg]()) }
+    if (c == 'q') { return (m, QuitCmd[Msg]()) }
+    if (r == RouteS4()) { return reviewKey(m, c) }
+    if (r == RouteS3() && c == 'p') { return (m.Copy(Screens = m.Screens.Push(RouteS6())), NoCmd[Msg]()) }
+    if (r == RouteS6() && c == 'r') { return (m, loadCmd(m.Port, m.SourceDir)) }   // resume from disk
+    return noCmd(m)
+}
+
+func reviewKey(m Model, c rune) Tuple[Model, Cmd[Msg]] {
+    if (c == 'a') { return applyReview(m, engine.ActAccept()) }
+    if (c == 'r') { return applyReview(m, engine.ActRetry()) }
+    if (c == 's') { return applyReview(m, engine.ActSkip()) }
+    if (c == 'e') { return (m, NoCmd[Msg]()) }   // edit-prompt: stub
+    return noCmd(m)
+}
+
+func typeAnswer(m Model, c rune) Model = m.Copy(AnswerText = m.AnswerText + string(c))
+
+func keyBackspace(m Model) Model {
+    if (m.Screens.Current() != RouteS5()) { return m }
+    if (RuneCount(m.AnswerText) == 0) { return m }
+    return m.Copy(AnswerText = str.S(m.AnswerText).DropRight(1).ToString())
+}
+
+// s1Activate runs the focused S1 control's primary action.
+func s1Activate(m Model) Tuple[Model, Cmd[Msg]] {
+    val pane = m.Focus.Current()
+    if (pane == PaneBrowse())      { return noCmd(browse(m)) }
+    if (pane == PaneTarget())      { return noCmd(cycleTarget(m, 1)) }
+    if (pane == PaneUnsupported()) { return noCmd(moveUnsupported(m, 1)) }
+    if (pane == PaneRetry())       { return noCmd(stepRetry(m, 1)) }
+    if (pane == PaneBackend())     { return noCmd(toggleBackend(m, 1)) }
+    if (pane == PaneAmbiguity())   { return noCmd(cycleAmbiguity(m, 1)) }
+    if (pane == PaneScan())        { return startScan(m) }
+    return noCmd(m)
+}
+
+// step is ArrowLeft/Right — S1 cyclers only.
+func step(m Model, dir int) Model {
+    if (m.Screens.Current() != RouteS1()) { return m }
+    val pane = m.Focus.Current()
+    if (pane == PaneTarget())      { return cycleTarget(m, dir) }
+    if (pane == PaneUnsupported()) { return moveUnsupported(m, dir) }
+    if (pane == PaneRetry())       { return stepRetry(m, dir) }
+    if (pane == PaneBackend())     { return toggleBackend(m, dir) }
+    if (pane == PaneAmbiguity())   { return cycleAmbiguity(m, dir) }
+    return m
+}
+
+// nav is ArrowUp/Down — S3 only: move the tree cursor or scroll the log.
+func nav(m Model, dir int) Model {
+    if (m.Screens.Current() != RouteS3()) { return m }
+    if (m.S3Focus == PaneLog()) { return scrollLog(m, -dir) }
+    val n = unitCount(m)
+    val hi = if (n > 0) n - 1 else 0
+    return m.Copy(TreeCursor = clampInt(m.TreeCursor + dir, 0, hi))
+}
+
+func scrollLog(m Model, amount int) Model =
+    m.Copy(LogScroll = clampInt(m.LogScroll + amount, 0, logLen(m)))
+
+func selectUnit(m Model, i int) Model {
+    val n = unitCount(m)
+    val hi = if (n > 0) n - 1 else 0
+    return m.Copy(S3Focus = PaneTree(), TreeCursor = clampInt(i, 0, hi))
+}
+
+func focusPane(m Model, p string) Model {
+    if (p == PaneStart() || p == PaneBack()) { return m.Copy(S2Focus = p) }
+    if (p == PaneTree() || p == PaneLog())   { return m.Copy(S3Focus = p) }
+    return m
+}
+
+func noCmd(m Model) Tuple[Model, Cmd[Msg]] = (m, NoCmd[Msg]())
+
+func focusOn(m Model, pane string) Model = m.Copy(Focus = m.Focus.FocusOn(pane))
+
+// ----- S1 pure control edits ------------------------------------------------
+
+func cycleTarget(m Model, dir int) Model =
+    m.Copy(TargetIdx = clampIdx(m.TargetIdx + dir, TargetLangOptions().Length()))
+
+func cycleAmbiguity(m Model, dir int) Model =
+    m.Copy(AmbiguityIdx = clampIdx(m.AmbiguityIdx + dir, AmbiguityOptions().Length()))
+
+func stepRetry(m Model, dir int) Model =
+    m.Copy(Retry = clampInt(m.Retry + dir, RetryMin(), RetryMax()))
+
+func moveUnsupported(m Model, dir int) Model {
+    val opts = UnsupportedOptions()
+    val cur = indexOfUnsupported(opts, m.Unsupported)
+    return m.Copy(Unsupported = opts.Get(clampIdx(cur + dir, opts.Length())))
+}
+
+func toggleBackend(m Model, dir int) Model {
+    val opts = BackendOptions()
+    val cur = indexOfBackend(opts, m.Backend)
+    return m.Copy(Backend = opts.Get(clampIdx(cur + dir, opts.Length())))
+}
+
+func browse(m Model) Model {
+    val dirs = browseDirs()
+    val cur = indexOfDir(dirs, m.SourceDir)
+    val nextDir = dirs.Get(clampIdx(cur + 1, dirs.Length()))
+    return m.Copy(SourceDir = nextDir, Source = detectSource(nextDir))
+}
+
+// ----- engine flow: scan → plan → run → tick --------------------------------
+
+// startScan builds the engine port from the S1 backend selection, then probes
+// the project through it (Scan→Plan) off the loop. The selected port is stored
+// so the rest of the run (Run/Advance/ActOnUnit/AnswerBlocker) uses it too.
+func startScan(m Model) Tuple[Model, Cmd[Msg]] {
+    val port = m.MakePort(BackendName(m.Backend))
+    val root = m.SourceDir
+    val cmd = Async[engine.WorkspaceModel, Msg](
+        () => port.Scan(engine.ScanRequest(Root = root)),
+        (ws) => MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
+    )
+    return (m.Copy(Port = port, Scanning = true), cmd)
+}
+
+func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) Model =
+    m.Copy(
+        Scanning  = false,
+        Workspace = Some(ws),
+        Plan      = Some(plan),
+        S2Focus   = PaneStart(),
+        Screens   = m.Screens.Push(RouteS2()),
+    )
+
+// startRun materializes the run and routes to S3, kicking the first tick.
+func startRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
+    case Some(plan) => {
+        val port = m.Port
+        val cmd = Async[engine.RunState, Msg](
+            () => port.Run(plan),
+            (st) => MRunStarted(State = st),
+        )
+        return (m, cmd)
+    }
+    case None() => noCmd(m)
+}
+
+func runStarted(m Model, st engine.RunState) Tuple[Model, Cmd[Msg]] {
+    val m2 = m.Copy(
+        Run        = Some(st),
+        S3Focus    = PaneTree(),
+        TreeCursor = 0,
+        LogScroll  = 0,
+        Screens    = m.Screens.Push(RouteS3()),
+    )
+    return (m2, tickCmd())
+}
+
+// runTick advances one engine step; re-schedules itself while work remains, and
+// (when persisting) auto-checkpoints the changed state off the loop, so a long
+// run is continuously saved.
+func runTick(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
+    case Some(st) => {
+        if (runview.AnyActionable(st)) {
+            val next = m.Port.Advance(st)
+            val m2 = m.Copy(Run = Some(next))
+            val cont = if (runview.AnyActionable(next)) tickCmd() else NoCmd[Msg]()
+            return (m2, withSave(m2, next, cont))
+        }
+        return (m, NoCmd[Msg]())
+    }
+    case None() => (m, NoCmd[Msg]())
+}
+
+// withSave batches an auto-checkpoint Cmd before `base` when persistence is on.
+// Off (tests) it returns `base` unchanged, so no IO is issued.
+func withSave(m Model, state engine.RunState, base Cmd[Msg]) Cmd[Msg] =
+    if (m.Persist) Batch[Msg](saveCmd(m.Port, state, m.SourceDir), base) else base
+
+// tickCmd schedules the next tick off the Update loop (a Future the runtime
+// drains). In tests, MRunTick is sent directly instead.
+func tickCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(60)), () => MRunTick())
+
+func unitCount(m Model) int = m.Run match {
+    case Some(rs) => rs.Units.Length()
+    case None()   => 0
+}
+
+func logLen(m Model) int = m.Run match {
+    case Some(rs) => rs.Log.Length()
+    case None()   => 0
+}
+
+// ----- navigation ------------------------------------------------------------
+
+func back(m Model) Tuple[Model, Cmd[Msg]] {
+    if (m.Screens.CanGoBack()) {
+        return (m.Copy(Screens = m.Screens.Pop()), NoCmd[Msg]())
+    }
+    return (m, QuitCmd[Msg]())
+}
+
+// ----- index lookups ---------------------------------------------------------
+
+func indexOfDir(dirs Array[string], dir string) int {
+    var i = 0
+    val n = dirs.Length()
+    for i < n {
+        if (dirs.Get(i) == dir) { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+func indexOfUnsupported(opts Array[UnsupportedPolicy], p UnsupportedPolicy) int {
+    var i = 0
+    val n = opts.Length()
+    for i < n {
+        if (UnsupportedEq(opts.Get(i), p)) { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+func indexOfBackend(opts Array[AgentBackend], b AgentBackend) int {
+    var i = 0
+    val n = opts.Length()
+    for i < n {
+        if (BackendEq(opts.Get(i), b)) { return i }
+        i = i + 1
+    }
+    return 0
+}
+
+// ----- input adapters --------------------------------------------------------
+
+// keyToMsg maps raw keys to intent messages; update interprets the ambiguous
+// ones (chars, Enter) per active screen. Only Ctrl-C quits unconditionally —
+// 'q' is a quit everywhere EXCEPT the S5 answer field, where it types (handled
+// in keyChar). Space becomes a char so it types into the answer too.
+func keyToMsg(ev KeyEvent) Msg {
+    if (KeyMatches(ev, "ctrl+c")) { return MQuit() }
+    if (KeyMatches(ev, "shift+tab")) { return MFocusPrev() }
+    return ev.Key match {
+        case Tab()        => MFocusNext()
+        case Enter()      => MActivate()
+        case Space()      => MKeyChar(C = ' ')
+        case ArrowLeft()  => MStepLeft()
+        case ArrowRight() => MStepRight()
+        case Up()         => MNavUp()
+        case Down()       => MNavDown()
+        case Esc()        => MBack()
+        case Backspace()  => MKeyBackspace()
+        case Char(c)      => MKeyChar(C = c)
+        case _            => MNoOp()
+    }
+}
+
+// inputToMsg unifies key / mouse / resize. Widget clicks are routed by the
+// framework's HitRegistry before this runs; here mouse events are wheel scrolls
+// (→ log scroll) or unregistered clicks (→ no-op). Resize feeds the layout.
+func inputToMsg(ev InputEvent) Msg = ev match {
+    case KeyInput(k)       => keyToMsg(k)
+    case MouseInput(me)    => mouseToMsg(me)
+    case ResizeInput(w, h) => MResized(W = w, H = h)
+    case UnknownInput()    => MNoOp()
+}
+
+func mouseToMsg(me MouseEvent) Msg = me.Btn match {
+    case MouseScrollUp()   => MScrollUp()
+    case MouseScrollDown() => MScrollDown()
+    case MouseLeft()       => MNoOp()
+    case MouseMiddle()     => MNoOp()
+    case MouseRight()      => MNoOp()
+    case MouseButtonNone() => MNoOp()
+}

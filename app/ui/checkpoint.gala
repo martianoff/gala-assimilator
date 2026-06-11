@@ -1,0 +1,46 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// ============================================================================
+// Checkpoint paths + the save effect.
+//
+// The checkpoint lives at a stable per-project location: <source-root>/
+// .assimilator/state.json. The UI never blocks on IO — saving is wrapped in an
+// Async Cmd (saveCmd) the runtime drains; doSave is the pure-ish effect it runs
+// (ensure the dir, then SaveCheckpoint through the engine port).
+// ============================================================================
+
+// CheckpointDir is the per-project state directory.
+func CheckpointDir(root string) string = path.Join(root, ".assimilator")
+
+// CheckpointPath is the stable per-project checkpoint file.
+func CheckpointPath(root string) string = path.Join(CheckpointDir(root), "state.json")
+
+// doSave ensures the state dir exists, then persists the run via the port.
+// Returns the port's success flag (false on any IO failure — never throws).
+func doSave(port engine.EnginePort, state engine.RunState, root string) bool {
+    fs.MkdirAll(CheckpointDir(root), 493)   // 0755; ignore result — SaveCheckpoint reports failure
+    return port.SaveCheckpoint(state, CheckpointPath(root))
+}
+
+// saveCmd persists the run off the Update loop; the result surfaces as
+// MCheckpointSaved so the UI can show a save indicator.
+func saveCmd(port engine.EnginePort, state engine.RunState, root string) Cmd[Msg] =
+    Async[bool, Msg](
+        () => doSave(port, state, root),
+        (ok) => MCheckpointSaved(Ok = ok),
+    )
+
+// loadCmd reads the checkpoint off the loop; the result surfaces as
+// MResumeLoaded (used by the S6 resume affordance).
+func loadCmd(port engine.EnginePort, root string) Cmd[Msg] =
+    Async[engine.CheckpointLoad, Msg](
+        () => port.LoadCheckpoint(CheckpointPath(root)),
+        (load) => MResumeLoaded(Load = load),
+    )

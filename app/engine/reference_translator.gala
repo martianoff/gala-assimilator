@@ -1,0 +1,262 @@
+package engine
+
+// ReferenceTranslator — a deterministic, OFFLINE translator that emits REAL,
+// compilable, semantics-preserving GALA for one curated fixture (not the
+// placeholder "// mock translation" the MockTranslator emits). It is the
+// hand-written GOLDEN translation wired behind the very same AgentRunner seam a
+// live backend uses, so its output flows through RunToCompletion -> Integrate and
+// the REAL verify gate (RealVerifier) unchanged.
+//
+// Why it exists: the real toolchain gate (realverify.gala) had never actually run
+// `gala build`/`gala test` over a translation, because the default MockTranslator's
+// placeholder cannot compile. This translator closes that honestly — its output
+// genuinely builds and its 1:1 source test genuinely passes, so the real gate can
+// be exercised for a true VerifyPass, a real diagnostic-carrying VerifyFail, and a
+// real fix-loop recovery (see RunReferenceVerifyGate + cmd/verifygate).
+//
+// The fixture is the product-invariant fixture CLAUDE.md asks for: a translation
+// proven semantics-preserving by building and running its replicated source test.
+//
+// Engine layering (CLAUDE.md / architecture.md): the acp run-contract types stay
+// behind run.gala's constructors and acp_bridge.gala — this file constructs an
+// AgentRunner via those helpers and never re-pattern-matches an acp sealed type.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    strings "martianoff/gala/strings"
+    acp "github.com/martianoff/gala-acp"
+)
+
+// ----------------------------------------------------------------------------
+// The curated round-trip fixture
+// ----------------------------------------------------------------------------
+
+// ReferenceFixture is the curated, semantics-preserving round-trip fixture: a tiny
+// Go unit (Add) being migrated, its KNOWN-GOOD GALA translation (the golden output),
+// and its 1:1 source test expressed in GALA — chosen so emitting the GALA, building
+// it, and running the translated test genuinely passes through the real toolchain.
+struct ReferenceFixture(
+    Unit       UnitId,
+    GoSource   string,
+    GalaTarget string,
+    TestUnit   UnitId,
+    GalaTest   string,
+)
+
+// referenceFixture is the single source of truth for the fixture's data.
+func referenceFixture() ReferenceFixture =
+    ReferenceFixture(
+        Unit       = UnitId(Value = "mathx/add"),
+        GoSource   = referenceGoSource(),
+        GalaTarget = referenceGalaTarget(),
+        TestUnit   = UnitId(Value = "mathx/add_test"),
+        GalaTest   = referenceGalaTest(),
+    )
+
+// referenceGoSource is the Go unit under migration: a trivial integer add.
+func referenceGoSource() string =
+    "package mathx\n\n// Add returns the sum of two integers.\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"
+
+// referenceGalaTarget is the GOLDEN translation: real, compilable, semantics-
+// preserving GALA for referenceGoSource. The golden test pins this exactly, so any
+// drift in the reference translation fails the suite.
+func referenceGalaTarget() string =
+    "package mathx\n\nfunc Add(a int, b int) int = a + b\n"
+
+// referenceWrongTarget is a deliberately INCORRECT translation (subtraction). It
+// compiles, so `gala build` is green, but its 1:1 test rejects it — the real gate
+// then produces genuine red-test diagnostics that drive the fix loop.
+func referenceWrongTarget() string =
+    "package mathx\n\nfunc Add(a int, b int) int = a - b\n"
+
+// referenceGalaTest is the 1:1 source test in GALA: it imports the GALA test
+// framework and asserts Add(2, 3) == 5, so a wrong Add fails it for real.
+func referenceGalaTest() string =
+    "package mathx\n\nimport (\n    . \"martianoff/gala/test\"\n)\n\nfunc TestAdd(t T) T = Eq(t, Add(2, 3), 5)\n"
+
+// referenceSourceContext is the translator input for the fixture unit: its Go
+// source with no extra dependency context. Shared by the assignment and the plan.
+func referenceSourceContext() SourceContext =
+    SourceContext(SourceText = referenceGoSource(), Dependencies = EmptyArray[DependencySnippet]())
+
+// referenceTargetConventions is the fixture's target-language convention (GALA),
+// shared by the assignment and the plan.
+func referenceTargetConventions() TargetConventions =
+    TargetConventions(Language = "GALA", Notes = EmptyArray[string]())
+
+// referenceSourceTests is the gate input: the fixture's single GALA 1:1 source test.
+func referenceSourceTests() Array[SourceTestRef] {
+    val fx = referenceFixture()
+    return ArrayOf[SourceTestRef](SourceTestRef(
+        Unit   = fx.TestUnit,
+        Path   = "mathx/add_test.gala",
+        Source = fx.GalaTest,
+    ))
+}
+
+// referenceAssignment is the TaskAssignment for the fixture unit on a fresh attempt
+// (no prior failure), the input the golden test submits to the reference translator.
+func referenceAssignment() TaskAssignment {
+    val fx = referenceFixture()
+    return TaskAssignment(
+        Task         = TaskId(Value = fx.Unit.Value),
+        Unit         = fx.Unit,
+        Source       = referenceSourceContext(),
+        Target       = referenceTargetConventions(),
+        PriorFailure = None[PriorFailure](),
+        Answers      = EmptyArray[Answer](),
+    )
+}
+
+// referenceVerifyRequest builds a real-gate request for the fixture: the given
+// emitted GALA target plus the fixture's GALA 1:1 source test.
+func referenceVerifyRequest(targetText string) VerifyRequest =
+    VerifyRequest(
+        Unit        = referenceFixture().Unit,
+        TargetText  = targetText,
+        SourceTests = referenceSourceTests(),
+    )
+
+// referenceFixLoopPlan is a one-unit plan for the fixture, carrying the GALA 1:1
+// source test as the unit's verify-gate input, so a run over it is gated by the
+// REAL toolchain and its fix loop re-translates against real diagnostics.
+func referenceFixLoopPlan() MigrationPlan {
+    val fx = referenceFixture()
+    return MigrationPlan(Items = ArrayOf[PlanItem](PlanItem(
+        Unit        = fx.Unit,
+        Source      = referenceSourceContext(),
+        Target      = referenceTargetConventions(),
+        SourceTests = referenceSourceTests(),
+    )))
+}
+
+// ----------------------------------------------------------------------------
+// The translators
+// ----------------------------------------------------------------------------
+
+// ReferenceTranslator is the golden translator: every submit emits the known-good
+// GALA translation of the fixture unit. Wired behind the acp AgentRunner seam so it
+// flows through the exact run/integrate/verify path a live backend would.
+func ReferenceTranslator() acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => referenceTranscript(a, referenceGalaTarget()),
+        Cancel = (_ string) => cancelledAck(),
+    )
+
+// referenceFixLoopTranslator emits the WRONG translation on the first attempt and
+// the GOLDEN one once the fix loop threads the real toolchain diagnostics back as a
+// PriorFailure — a backend that genuinely uses the fed-back diagnostics to recover.
+// It drives the real gate through one true red -> green cycle.
+func referenceFixLoopTranslator() acp.AgentRunner[TaskAssignment, Result, Clarification] =
+    acp.AgentRunner[TaskAssignment, Result, Clarification](
+        Submit = (a TaskAssignment) => referenceTranscript(a, fixLoopTargetFor(a)),
+        Cancel = (_ string) => cancelledAck(),
+    )
+
+// fixLoopTargetFor is wrong before the loop turns, golden after (the PriorFailure
+// carries the real `gala test` diagnostics the loop fed back).
+func fixLoopTargetFor(a TaskAssignment) string = a.PriorFailure match {
+    case Some(_) => referenceGalaTarget()
+    case None()  => referenceWrongTarget()
+}
+
+// referenceTranscript wraps an emitted target text into a run transcript with the
+// same Reading->Emitting->Verifying progress prefix the mock streams, reusing the
+// engine's acp-free terminus constructor (no acp pattern-matching here).
+func referenceTranscript(a TaskAssignment, targetText string) acp.RunTranscript[Result, Clarification] =
+    acp.RunTranscript[Result, Clarification](
+        Steps = mockSteps(a.Task),
+        Final = resultOutcome(Result(
+            Task       = a.Task,
+            TargetText = targetText,
+            Rationale  = "reference translation (hand-written golden GALA)",
+            Flags      = EmptyArray[UnsupportedFlag](),
+        )),
+    )
+
+// ----------------------------------------------------------------------------
+// Driving the curated fixture through the REAL verify gate
+// ----------------------------------------------------------------------------
+
+// ReferenceGateReport is the outcome of driving the curated fixture through the REAL
+// verify gate over an injected toolchain runner: did the golden translation pass,
+// was the wrong translation rejected with real diagnostics, and did the fix loop
+// recover to Done. All three must hold for the harness to succeed.
+struct ReferenceGateReport(
+    PassOk    bool,
+    FailOk    bool,
+    FailDiag  string,
+    FixLoopOk bool,
+)
+
+// RunReferenceVerifyGate drives the curated reference fixture through the REAL verify
+// gate (RealVerifier) over the INJECTED toolchain runner and reports all three
+// proofs. The cmd passes GalaToolchainRunner() (real `gala`); RealVerifier always
+// builds/tests in its OWN os.TempDir scratch module, so this never touches the
+// project workspace. It is invoked only from cmd/verifygate, never the offline suite
+// (which would risk the nested-`gala` workspace-contention bug).
+func RunReferenceVerifyGate(runner ToolchainRunner) ReferenceGateReport {
+    val verifier = RealVerifier(runner)
+    val passRes  = verifier.Verify(referenceVerifyRequest(referenceGalaTarget()))
+    val failRes  = verifier.Verify(referenceVerifyRequest(referenceWrongTarget()))
+    return ReferenceGateReport(
+        PassOk    = isVerifyPass(passRes),
+        FailOk    = isFailWithDiagnostics(failRes),
+        FailDiag  = failReasonOf(failRes),
+        FixLoopOk = referenceFixLoopReachesDone(runner),
+    )
+}
+
+// ReferenceGateAllPassed is true only when every proof held — the harness's exit
+// predicate.
+func ReferenceGateAllPassed(r ReferenceGateReport) bool =
+    r.PassOk && r.FailOk && r.FixLoopOk
+
+// ReferenceGateSummary renders the report as human-readable lines for the harness.
+func ReferenceGateSummary(r ReferenceGateReport) string =
+    "reference verify-gate proofs:\n" +
+    "  [" + checkMark(r.PassOk) + "] golden GALA cleared the real gate (VerifyPass)\n" +
+    "  [" + checkMark(r.FailOk) + "] wrong GALA rejected with real diagnostics (VerifyFail)\n" +
+    "  [" + checkMark(r.FixLoopOk) + "] fix loop re-translated against diagnostics and reached Done\n" +
+    "--- failure diagnostics (from the real toolchain) ---\n" + r.FailDiag
+
+func checkMark(ok bool) string = ok match {
+    case true  => "PASS"
+    case false => "FAIL"
+}
+
+// referenceFixLoopReachesDone runs the one-unit fixture through the engine's real
+// fix loop against the REAL gate: attempt 1 emits the wrong target (red test),
+// retryOrFail re-translates with the real diagnostics, attempt 2 emits the golden
+// target (green) and the unit settles Done. Returns whether the unit reached Done.
+func referenceFixLoopReachesDone(runner ToolchainRunner) bool {
+    val port  = MockEngineWithVerifier(referenceFixLoopTranslator(), RealVerifier(runner))
+    val final = RunToCompletion(port, port.Run(referenceFixLoopPlan()))
+    return final.Units.Exists((u UnitRun) => doneTarget(u).IsDefined())
+}
+
+// ----------------------------------------------------------------------------
+// VerifyResult projections (exhaustive)
+// ----------------------------------------------------------------------------
+
+func isVerifyPass(r VerifyResult) bool = r match {
+    case VerifyPass()          => true
+    case VerifyFail(_, _)      => false
+    case VerifyUnsupported(_)  => false
+}
+
+// isFailWithDiagnostics is true when the gate rejected the wrong translation AND the
+// rejection carries the real toolchain text (attributed to the failing stage), so a
+// silent or empty fail can't masquerade as the proof.
+func isFailWithDiagnostics(r VerifyResult) bool = r match {
+    case VerifyFail(_, why)    => strings.Contains(why, "gala test failed") || strings.Contains(why, "gala build failed")
+    case VerifyPass()          => false
+    case VerifyUnsupported(_)  => false
+}
+
+func failReasonOf(r VerifyResult) string = r match {
+    case VerifyFail(_, why)    => why
+    case VerifyPass()          => "(no failure: gate passed)"
+    case VerifyUnsupported(why) => "(unsupported: " + why + ")"
+}

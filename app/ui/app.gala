@@ -1,0 +1,50 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+)
+
+// ============================================================================
+// App wiring — the Program triple + the maximal runtime entry point.
+//
+// gala_tui exposes no single `RunFull`; `RunWithMouse` is its maximal runtime
+// (mouse + resize + the async future loop that drains the run's tick Cmds).
+// RunApp injects the engine's public port and launches the app.
+// ============================================================================
+
+// NewProgram builds the Elm triple for the given engine-port factory and
+// viewport. The factory (name → EnginePort) lets the S1 backend choice decide
+// which engine runs. Exposed so tests construct the exact same Program.
+func NewProgram(makePort func(string) engine.EnginePort, cols int, rows int) Program[Model, Msg] =
+    Program[Model, Msg](
+        Initial = NewModel(makePort, cols, rows),
+        Update  = (m, msg) => update(m, msg),
+        View    = (m) => view(m),
+    )
+
+// NewProgramResume is NewProgram seeded with a launch checkpoint probe (S0
+// resume/corrupt prompt) and auto-save enabled.
+func NewProgramResume(
+    makePort func(string) engine.EnginePort,
+    offer runview.LoadSummary,
+    cols int,
+    rows int,
+) Program[Model, Msg] =
+    Program[Model, Msg](
+        Initial = NewModelResume(makePort, offer, true, cols, rows),
+        Update  = (m, msg) => update(m, msg),
+        View    = (m) => view(m),
+    )
+
+// RunApp launches the TUI against the given engine-port factory. On startup it
+// probes the default project's checkpoint (IO here, before the pure loop) and
+// offers Resume / Start fresh accordingly; auto-save is on for the live run.
+func RunApp(makePort func(string) engine.EnginePort) Model {
+    val (w, h) = TermSize()
+    val probePort = makePort(BackendName(GoBackend()))
+    val offer = runview.ClassifyLoad(probePort.LoadCheckpoint(CheckpointPath(DefaultSourceDir())))
+    val program = NewProgramResume(makePort, offer, w, h)
+    return RunWithMouse[Model, Msg](program, (ev) => inputToMsg(ev), NoSubs[Msg]())
+}

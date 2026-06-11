@@ -1,0 +1,299 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+    "github.com/martianoff/gala-tui/harness"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// S3 dashboard — render snapshots at two widths with a mid-run RunState, plus
+// an interaction test that starts a run and asserts the activity log grows and
+// the done-count climbs as ticks advance.
+// ============================================================================
+
+// midRunModel drives scan→plan→run then `nticks` Advances and returns the model
+// sitting on S3 mid-assimilation.
+func midRunModel(cols int, rows int, nticks int) Model {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val program = NewProgram(mockFactory(), cols, rows)
+    val setup = ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = plan),
+        MRunStarted(State = st),
+    )
+    val (m1, _) = StepAll(program, setup.AppendAll(ticks(nticks)))
+    return m1
+}
+
+func logLenOf(m Model) int = m.Run match {
+    case Some(rs) => rs.Log.Length()
+    case None()   => 0
+}
+
+func testsPassingOf(m Model) int = m.Run match {
+    case Some(rs) => runview.ProjectRun(rs).TestsPassing
+    case None()   => 0
+}
+
+func testsTotalOf(m Model) int = m.Run match {
+    case Some(rs) => runview.ProjectRun(rs).TestsTotal
+    case None()   => 0
+}
+
+func completeOf(m Model) bool = m.Run match {
+    case Some(rs) => runview.ProjectRun(rs).Complete
+    case None()   => false
+}
+
+func attemptsOf(m Model, idx int) int = m.Run match {
+    case Some(rs) => {
+        val rows = runview.ProjectRun(rs).Rows
+        if (idx < 0 || idx >= rows.Length()) { return 0 }
+        return rows.Get(idx).Attempts
+    }
+    case None() => 0
+}
+
+// retryFactory builds the fix-loop engine: every unit fails its first verify and
+// passes on retry, so attempts climb and EvRetry events stream — letting the UI
+// exercise the loop without touching the acp run contract.
+func retryFactory() func(string) engine.EnginePort = (name string) => engine.RetryingMockEngine()
+
+// retryRunModel drives a retrying run scan→plan→run then `nticks` Advances.
+func retryRunModel(cols int, rows int, nticks int) Model {
+    val port = engine.RetryingMockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val program = NewProgram(retryFactory(), cols, rows)
+    val setup = ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = plan),
+        MRunStarted(State = st),
+    )
+    val (m1, _) = StepAll(program, setup.AppendAll(ticks(nticks)))
+    return m1
+}
+
+// ----- render snapshots ------------------------------------------------------
+
+func TestS3WideRendersSplitBoard(t T) T {
+    val m = midRunModel(110, 24, 5)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t,  out.Contains("Assimilation in progress"))
+    val t2 = IsTrue(t1, out.Contains("units ("))       // progress bar readout
+    val t3 = IsTrue(t2, out.Contains("Units"))          // left pane title
+    val t4 = IsTrue(t3, out.Contains("Activity"))       // right pane title
+    val t5 = IsTrue(t4, out.Contains("core/value"))     // a unit row in the tree
+    return IsTrue(t5, out.Contains("done"))             // status count / label
+}
+
+func TestS3NarrowStacksBoard(t T) T {
+    val m = midRunModel(72, 24, 5)
+    val out = str.S(Snapshot(view(m), 72, 24))
+    val t1 = IsTrue(t,  out.Contains("Assimilation in progress"))
+    val t2 = IsTrue(t1, out.Contains("Units"))
+    val t3 = IsTrue(t2, out.Contains("Activity"))
+    return IsTrue(t3, out.Contains("core/"))
+}
+
+// At completion the bar is at 100%.
+func TestS3ReachesFullProgress(t T) T {
+    val m = midRunModel(110, 24, 40)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    return IsTrue(t, out.Contains("(100%)"))
+}
+
+// The breadcrumb (Scan › Plan › Run › Verify › Report) and the tests-passing
+// counter both render in the S3 header — at wide and narrow widths.
+func TestS3BreadcrumbAndTestsWide(t T) T {
+    val m = midRunModel(110, 24, 3)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t,  out.Contains("Scan"))
+    val t2 = IsTrue(t1, out.Contains("Plan"))
+    val t3 = IsTrue(t2, out.Contains("Verify"))
+    val t4 = IsTrue(t3, out.Contains("Report"))
+    val t5 = IsTrue(t4, out.Contains("›"))            // breadcrumb separator
+    return IsTrue(t5, out.Contains("passing"))         // tests counter readout
+}
+
+func TestS3BreadcrumbAndTestsNarrow(t T) T {
+    val m = midRunModel(72, 24, 3)
+    val out = str.S(Snapshot(view(m), 72, 24))
+    val t1 = IsTrue(t,  out.Contains("Scan"))
+    val t2 = IsTrue(t1, out.Contains("Report"))
+    return IsTrue(t2, out.Contains("passing"))
+}
+
+// A retried unit shows its ×N attempt badge, the run-level "iterating…" indicator
+// renders while the loop turns, and the activity log shows the loop turning.
+func TestS3RetryBadgeAndIterating(t T) T {
+    val m = retryRunModel(110, 24, 6)   // unit 0 has failed once and converged on retry
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t,  out.Contains("×2"))          // per-unit attempt badge
+    val t2 = IsTrue(t1, out.Contains("iterating"))    // run-level loop indicator
+    return IsTrue(t2, out.Contains("retry "))         // EvRetry reads in the log
+}
+
+// Once the whole run settles, the indicator flips to the "complete" state.
+func TestS3CompleteIndicator(t T) T {
+    val m = retryRunModel(110, 24, 40)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t, out.Contains("complete"))
+    return IsTrue(t1, out.Contains("(100%)"))
+}
+
+// ----- correctness flags render on the run screen ---------------------------
+
+// mkDoneUnit builds a Done unit carrying the given translation flags, so a render
+// test can show a flagged / unverified unit without driving a live backend.
+func mkDoneUnit(id string, flags Array[engine.UnsupportedFlag]) engine.UnitRun =
+    engine.UnitRun(
+        Unit = engine.UnitId(Value = id),
+        Assignment = engine.TaskAssignment(
+            Task         = engine.TaskId(Value = id),
+            Unit         = engine.UnitId(Value = id),
+            Source       = engine.SourceContext(SourceText = "src", Dependencies = EmptyArray[engine.DependencySnippet]()),
+            Target       = engine.TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+            PriorFailure = None[engine.PriorFailure](),
+            Answers      = EmptyArray[engine.Answer](),
+        ),
+        Status = engine.Done(Output = engine.Result(
+            Task = engine.TaskId(Value = id), TargetText = "out", Rationale = "r", Flags = flags)),
+    )
+
+// flagFixtureState is a settled run with one unsupported-construct-flagged unit and
+// one unverified unit, so both correctness markers render on the run screen.
+func flagFixtureState() engine.RunState {
+    val unsupported = ArrayOf[engine.UnsupportedFlag](
+        engine.UnsupportedFlag(Construct = "generics", Reason = "no faithful target"))
+    val unverified = ArrayOf[engine.UnsupportedFlag](
+        engine.UnsupportedFlag(Construct = "unverified", Reason = "no 1:1 source test covers this unit"))
+    return engine.RunState(
+        Units = ArrayOf[engine.UnitRun](mkDoneUnit("core/value", unsupported), mkDoneUnit("app/main", unverified)),
+        Log   = EmptyArray[engine.EngineEvent]())
+}
+
+func flagRunModel(cols int, rows int) Model {
+    val program = NewProgram(mockFactory(), cols, rows)
+    val (m1, _) = StepAll(program, ArrayOf[Msg](MRunStarted(State = flagFixtureState())))
+    return m1
+}
+
+// A flagged unit (⚑) and an unverified unit (⚠) each render a per-row marker AND an
+// activity-log line, so a flagged/unverified unit is never identical to a clean pass.
+func TestRunScreenFlagAndUnverifiedMarkers(t T) T {
+    val m = flagRunModel(110, 24)
+    val out = str.S(Snapshot(view(m), 110, 24))
+    val t1 = IsTrue(t,  out.Contains("⚑"))                  // per-row unsupported-flag marker
+    val t2 = IsTrue(t1, out.Contains("⚠"))                  // per-row unverified marker
+    val t3 = IsTrue(t2, out.Contains("flagged generics"))   // activity-log line for the flag
+    return IsTrue(t3, out.Contains("unverified"))           // activity-log line for unverified
+}
+
+// ----- interaction: start a run, watch it climb -----------------------------
+
+func s3Harness() harness.Harness[Model, Msg] {
+    val program = NewProgram(mockFactory(), 110, 24)
+    return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 24)
+}
+
+func retryHarness() harness.Harness[Model, Msg] {
+    val program = NewProgram(retryFactory(), 110, 24)
+    return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 24)
+}
+
+// Driving MRunTick: a unit visibly retries (its attempt count climbs from 0) and
+// the run transitions from iterating to complete.
+func TestRetryClimbsAndCompletes(t T) T {
+    val port = engine.RetryingMockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val s0 = retryHarness().Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = plan))
+        .SendMsg(MRunStarted(State = st))
+    val before = attemptsOf(s0.Model, 0)
+    val startComplete = completeOf(s0.Model)
+    var s = s0
+    var i = 0
+    for i < 6 {
+        s = s.SendMsg(MRunTick())
+        i = i + 1
+    }
+    val midAttempts = attemptsOf(s.Model, 0)
+    var j = 0
+    for j < 40 {
+        s = s.SendMsg(MRunTick())
+        j = j + 1
+    }
+    val endComplete = completeOf(s.Model)
+    val t1 = Eq(t,  before, 0)               // no attempts spent before any tick
+    val t2 = IsFalse(t1, startComplete)      // a fresh run is still iterating
+    val t3 = IsTrue(t2, midAttempts > before) // the attempt count climbed (unit retried)
+    return IsTrue(t3, endComplete)           // the run reached the completion fixpoint
+}
+
+func TestRunGrowsLogAndDoneCount(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val s0 = s3Harness().Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = plan))
+        .SendMsg(MRunStarted(State = st))
+    val before = logLenOf(s0.Model)
+    val d0 = doneOf(s0.Model)
+    val s1 = s0
+        .SendMsg(MRunTick()).SendMsg(MRunTick()).SendMsg(MRunTick())
+        .SendMsg(MRunTick()).SendMsg(MRunTick())
+    val after = logLenOf(s1.Model)
+    val d1 = doneOf(s1.Model)
+    val t1 = Eq(t, s1.Model.Screens.Current(), RouteS3())
+    val t2 = IsTrue(t1, after > before)   // activity log grew
+    return IsTrue(t2, d1 > d0)            // done-count increased
+}
+
+// The tests-passing count climbs as the run advances: 0 at the start, reaching
+// the full source-test total once the run settles.
+func TestTestsPassingClimbs(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    val s0 = s3Harness().Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = plan))
+        .SendMsg(MRunStarted(State = st))
+    val before = testsPassingOf(s0.Model)
+    var s = s0
+    var i = 0
+    for i < 20 {
+        s = s.SendMsg(MRunTick())
+        i = i + 1
+    }
+    val after = testsPassingOf(s.Model)
+    val total = testsTotalOf(s.Model)
+    val t1 = Eq(t,  before, 0)            // nothing passing before any tick
+    val t2 = IsTrue(t1, total > 0)        // the stub has a source test
+    val t3 = IsTrue(t2, after > before)   // the count climbed
+    return Eq(t3, after, total)           // all source tests pass once settled
+}
+
+// Keyboard parity: Tab toggles the focused pane on S3.
+func TestS3TabTogglesPaneFocus(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val st = port.Run(port.Plan(ws))
+    val s = s3Harness().Start()
+        .SendMsg(MScanPlanned(Workspace = ws, Plan = port.Plan(ws)))
+        .SendMsg(MRunStarted(State = st))
+        .Press(PlainKey(Tab()))
+    return Eq(t, s.Model.S3Focus, PaneLog())
+}

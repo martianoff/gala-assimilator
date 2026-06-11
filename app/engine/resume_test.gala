@@ -1,0 +1,155 @@
+package engine
+
+// DoD proof for disk-backed resume from the dependency frontier: an interrupted run,
+// restored from disk in a FRESH process, resumes from the frontier and never
+// re-translates finished units. These tests simulate the restart literally —
+// SaveCheckpoint to a real temp file, then a NEW EnginePort value LoadCheckpoints
+// that file and Resumes — so nothing carries over in memory; only the bytes on disk.
+//
+// The frontier guarantee is already structural: advance/advanceUnit (port.gala) treat
+// Done as terminal (isActionable(Done) is false and advanceUnit(Done) is a no-op), so
+// a restored Done unit is never re-selected. These tests pin that it HOLDS across a
+// disk round-trip and would fail if it regressed. Real filesystem IO in fresh temp
+// dirs (tempCkptDir / fs) — `gala test` does not stage testdata/, so checkpoints are
+// materialized at runtime. Shared helpers (scanned) live in port_test.gala; the temp
+// dir helper (tempCkptDir) and the Missing/Corrupt cases live in persist_test.gala —
+// these add the restart-from-disk frontier proofs and the partial/empty load cases.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// progressFor counts the EvProgress events attributed to one unit — the "translating
+// activity" signal. A resumed Done unit must accrue ZERO new progress events.
+func progressFor(log Array[EngineEvent], id UnitId) int =
+    log.Count((e EngineEvent) => e match {
+        case EvProgress(u, _) => u.Value == id.Value
+        case EvStatus(_, _)   => false
+        case EvRetry(_, _, _) => false
+    })
+
+// findRunUnit looks a unit up in a run state by its id value.
+func findRunUnit(state RunState, id UnitId) Option[UnitRun] =
+    state.Units.Find((u UnitRun) => u.Unit.Value == id.Value)
+
+// ----------------------------------------------------------------------------
+// The frontier guarantee: a restored Done unit is NEVER re-translated.
+// ----------------------------------------------------------------------------
+
+// Advance the first unit all the way to Done, capture its emitted target text,
+// attempt count, and progress-event count, then SaveCheckpoint to disk. Simulating a
+// fresh process, a DIFFERENT engine whose translator ABORTS every submission loads
+// the file and resumes. The proof: if the Done unit were re-translated, the abort
+// runner would drive it to Failed (and bump its attempts / emit new progress). Assert
+// instead that it stays Done with the IDENTICAL target text and attempt count, that NO
+// new progress event was recorded for it after resume, and that the run still reaches
+// a fixpoint (IsComplete) — finishing only the unfinished frontier.
+func TestDiskRestartPreservesDoneFrontier(t T) T {
+    val p   = path.Join(tempCkptDir(), "frontier.json")
+    val eng = MockEngine()
+    val mid = eng.Advance(eng.Advance(eng.Advance(scanned(eng))))
+    val id0 = firstUnitId(mid)
+
+    val t1 = Eq(t, CountByDone(mid), 1)                      // exactly unit 0 reached Done
+    val mid0 = findRunUnit(mid, id0)                         // the Done unit, looked up once
+    val doneText0 = mid0.FlatMap((u UnitRun) => doneTarget(u)).GetOrElse("<not-done>")
+    val attempts0 = mid0.Map((u UnitRun) => u.Attempts).GetOrElse(-1)
+    val t2 = Eq(t1, eng.SaveCheckpoint(mid, p), true)
+
+    // A fresh process: a new engine value whose runner aborts ANY submission, so a
+    // re-translation of the Done unit would be visible as a Failed status.
+    val failEng = MockEngineWith(ScriptedRunner(abortOutcome("a Done unit must not be re-translated"), cancelledAck()))
+    return failEng.LoadCheckpoint(p) match {
+        case Loaded(cp) => {
+            val resumed     = failEng.Resume(cp)
+            val progBefore  = progressFor(resumed.Log, id0)       // progress for unit 0 as restored
+            val final       = RunToCompletion(failEng, resumed)
+            val t3 = Eq(t2, IsComplete(final), true)              // the run completed (frontier settled)
+            val t4 = Eq(t3, progressFor(final.Log, id0), progBefore) // NO new progress for the Done unit
+            return findRunUnit(final, id0) match {
+                case Some(u) => u.Status match {
+                    case Done(r) => {
+                        val t5 = Eq(t4, r.TargetText, doneText0)  // emitted text unchanged
+                        return Eq(t5, u.Attempts, attempts0)      // attempt count unchanged
+                    }
+                    case _ => Fail(t4, "restored Done unit must stay Done, never re-translated")
+                }
+                case None() => Fail(t4, "the Done unit must still exist after resume")
+            }
+        }
+        case Missing()  => Fail(t2, "expected Loaded, got Missing")
+        case Corrupt(r) => Fail(t2, "expected Loaded, got Corrupt: " + r)
+    }
+}
+
+// The happy restart: save mid-run, load into a fresh NORMAL engine, Resume, and
+// RunToCompletion. Assert the load is LOSSLESS (units + log identical across
+// save->load, proven by re-encode equality), the resumed run reaches IsComplete with
+// every unit Done (only the unfinished frontier was driven), and the pre-Done unit's
+// emitted text survived the disk round-trip unchanged.
+func TestDiskRestartResumesFrontierToCompletion(t T) T {
+    val p   = path.Join(tempCkptDir(), "complete.json")
+    val eng = MockEngine()
+    val mid = eng.Advance(eng.Advance(eng.Advance(scanned(eng))))
+    val id0 = firstUnitId(mid)
+    val doneText0 = findRunUnit(mid, id0).FlatMap((u UnitRun) => doneTarget(u)).GetOrElse("<not-done>")
+    val total = mid.Units.Length()
+    val t1 = Eq(t, eng.SaveCheckpoint(mid, p), true)
+
+    return eng.LoadCheckpoint(p) match {
+        case Loaded(cp) => {
+            // Lossless: same shape and byte-for-byte the same re-encoding as the saved snapshot.
+            val t2 = Eq(t1, cp.Units.Length(), mid.Units.Length())
+            val t3 = Eq(t2, cp.Log.Length(), mid.Log.Length())
+            val t4 = Eq(t3, encodeCheckpoint(cp), encodeCheckpoint(Checkpoint(Units = mid.Units, Log = mid.Log)))
+
+            val final = RunToCompletion(eng, eng.Resume(cp))
+            val t5 = Eq(t4, IsComplete(final), true)              // the run completed
+            val t6 = Eq(t5, CountByDone(final), total)            // every unit Done (frontier finished)
+            return findRunUnit(final, id0) match {
+                case Some(u) => u.Status match {
+                    case Done(r) => Eq(t6, r.TargetText, doneText0) // pre-Done unit carried through unchanged
+                    case _       => Fail(t6, "the pre-Done unit must remain Done after resume")
+                }
+                case None() => Fail(t6, "the pre-Done unit must still exist after resume")
+            }
+        }
+        case Missing()  => Fail(t1, "expected Loaded, got Missing")
+        case Corrupt(r) => Fail(t1, "expected Loaded, got Corrupt: " + r)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// LoadCheckpoint hardening for real-restart corruption: a partial (truncated)
+// file and an empty file each load as Corrupt — never Loaded, never a crash — so
+// the UI gets a clean "bad checkpoint -> start fresh" signal.
+// ----------------------------------------------------------------------------
+
+// A truncated checkpoint (a valid prefix cut off mid-write) loads as Corrupt: the
+// decoder fails out to the Try rather than returning a half-built snapshot or crashing.
+func TestLoadPartialCheckpointIsCorrupt(t T) T {
+    val p = path.Join(tempCkptDir(), "partial.json")
+    // A real checkpoint prefix cut off mid-write — the shape an interrupted save leaves.
+    fs.WriteFileString(p, "{\"v\":1,\"units\":[{\"unit\":\"core/value\",\"assignment\":{\"task\":\"core/val", 420)
+    return MockEngine().LoadCheckpoint(p) match {
+        case Corrupt(_) => IsTrue(t, true)
+        case Loaded(_)  => Fail(t, "a truncated checkpoint must be Corrupt, not Loaded")
+        case Missing()  => Fail(t, "the file exists -> Corrupt, not Missing")
+    }
+}
+
+// An empty (zero-byte) file is present but undecodable -> Corrupt, distinct from a
+// genuinely absent file (Missing).
+func TestLoadEmptyCheckpointIsCorrupt(t T) T {
+    val p = path.Join(tempCkptDir(), "empty.json")
+    fs.WriteFileString(p, "", 420)
+    return MockEngine().LoadCheckpoint(p) match {
+        case Corrupt(_) => IsTrue(t, true)
+        case Loaded(_)  => Fail(t, "an empty file must be Corrupt, not Loaded")
+        case Missing()  => Fail(t, "the file exists -> Corrupt, not Missing")
+    }
+}
