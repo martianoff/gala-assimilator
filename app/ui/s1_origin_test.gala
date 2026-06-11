@@ -1,0 +1,121 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// S1 source ORIGIN — local directory vs. start-from-GitHub. Covers the origin
+// toggle, the URL field (focus + typing + minimal validation gate), and the
+// classification of an acquired origin into the scan / failure message.
+// ============================================================================
+
+// ----- origin toggle + URL field rendering ----------------------------------
+
+func TestOriginToggleShowsUrlField(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MSetOrigin(Git = true)))
+    val t1 = IsTrue(t, m1.OriginGit)
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    val t2 = IsTrue(t1, out.Contains("GitHub URL"))   // origin radio selected
+    return IsTrue(t2, out.Contains("Repo URL"))        // the URL field appeared
+}
+
+// MSetOrigin also moves focus to the origin control (mouse parity with the ring).
+func TestSetOriginFocusesOrigin(t T) T {
+    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MSetOrigin(Git = true)))
+    return Eq(t, m1.Focus.Current(), PaneOrigin())
+}
+
+// ----- typing into the URL field --------------------------------------------
+
+// Focusing the URL field and typing edits RepoUrl — including 'q', which types here
+// rather than quitting (the field owns the key).
+func TestTypeIntoUrlField(t T) T {
+    val msgs = ArrayOf[Msg](
+        MSetOrigin(Git = true), MFocusUrl(),
+        MKeyChar(C = 'q'), MKeyChar(C = '/'), MKeyChar(C = 'a'))
+    val (m1, _) = StepAll(prog(), msgs)
+    return Eq(t, m1.RepoUrl, "q/a")
+}
+
+// Backspace deletes from the focused URL field.
+func TestBackspaceEditsUrlField(t T) T {
+    val msgs = ArrayOf[Msg](
+        MSetOrigin(Git = true), MFocusUrl(),
+        MKeyChar(C = 'a'), MKeyChar(C = 'b'), MKeyBackspace())
+    val (m1, _) = StepAll(prog(), msgs)
+    return Eq(t, m1.RepoUrl, "a")
+}
+
+// ----- validation gate ------------------------------------------------------
+
+func TestLooksLikeRepoUrl(t T) T {
+    val t1 = IsTrue(t,   looksLikeRepoUrl("https://github.com/acme/x"))
+    val t2 = IsTrue(t1,  looksLikeRepoUrl("git@github.com:acme/x.git"))
+    val t3 = IsFalse(t2, looksLikeRepoUrl(""))
+    val t4 = IsFalse(t3, looksLikeRepoUrl("not a url"))
+    return IsTrue(t4, looksLikeRepoUrl("github.com/acme/x"))
+}
+
+// A git-origin scan with an invalid URL is guarded: it never enters the scanning
+// state (and the button shows the hint instead of "scan project").
+func TestGitScanGuardedWhenUrlInvalid(t T) T {
+    val m = NewModel(mockFactory(), 110, 30).Copy(OriginGit = true, RepoUrl = "")
+    val (m1, _) = StepAll2(m, ArrayOf[Msg](MScanRequested()))
+    val t1 = IsFalse(t, m1.Scanning)
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    return IsTrue(t1, out.Contains("enter repo url"))
+}
+
+// A valid URL enables the git scan: it enters the scanning state and emits the
+// clone-then-scan Async Cmd.
+func TestGitScanValidUrlScans(t T) T {
+    val m = NewModel(mockFactory(), 110, 30).Copy(OriginGit = true, RepoUrl = "https://github.com/acme/x")
+    val (m1, cmds) = StepAll2(m, ArrayOf[Msg](MScanRequested()))
+    val t1 = IsTrue(t, m1.Scanning)
+    return IsTrue(t1, cmds.NonEmpty())
+}
+
+// ----- origin acquisition → message -----------------------------------------
+
+// A successfully acquired origin routes into MScanPlanned (the same path the local
+// scan uses); a failed acquisition routes into MScanFailed (surfaced on S1).
+func TestOriginScanToMsgRoutes(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val ok = originScanToMsg(port, engine.OriginScanned(Path = "/clone", Workspace = ws))
+    val bad = originScanToMsg(port, engine.OriginUnsupported(Reason = "clone failed"))
+    val t1 = ok match {
+        case MScanPlanned(_, _) => IsTrue(t, true)
+        case _                  => IsTrue(t, false)
+    }
+    return bad match {
+        case MScanFailed(reason) => IsTrue(t1, str.S(reason).Contains("clone failed"))
+        case _                   => IsTrue(t1, false)
+    }
+}
+
+// MScanFailed clears the scanning state and surfaces the reason on S1.
+func TestScanFailedSurfacesOnS1(t T) T {
+    val m = NewModel(mockFactory(), 110, 30).Copy(OriginGit = true, Scanning = true)
+    val (m1, _) = StepAll2(m, ArrayOf[Msg](MScanFailed(Reason = "clone failed for https://x: nope")))
+    val t1 = IsFalse(t, m1.Scanning)
+    val t2 = Eq(t1, m1.ScanError, "clone failed for https://x: nope")
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    return IsTrue(t2, out.Contains("clone failed for"))
+}
+
+// The local origin still scans through the port unchanged: the default (local) origin
+// enters the scanning state and emits the Scan→Plan Async, never routing through the
+// git acquisition bridge — so the real cloner is never invoked under `gala test`.
+func TestLocalOriginStillScansThroughPort(t T) T {
+    val (m1, cmds) = StepAll(prog(), ArrayOf[Msg](MScanRequested()))
+    val t1 = IsFalse(t, m1.OriginGit)      // local origin is the default
+    val t2 = IsTrue(t1, m1.Scanning)       // local scan started through the port
+    return IsTrue(t2, cmds.NonEmpty())
+}

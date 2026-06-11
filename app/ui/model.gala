@@ -28,9 +28,13 @@ func RouteS4() string = "S4"   // Unit / diff review
 func RouteS5() string = "S5"   // Blocker / clarification
 func RouteS6() string = "S6"   // Run report (+ resume affordance)
 func RouteS7() string = "S7"   // Directory browser (source-project picker)
+func RouteS8() string = "S8"   // Dependency forest (tracking + resolution)
 
 // S1 focus pane ids — order defines the Tab ring.
 func PaneBrowse() string      = "browse"
+func PaneOrigin() string      = "origin"  // local-dir vs GitHub-URL source origin
+func PaneUrl() string         = "url"     // GitHub repo URL (git origin)
+func PaneRef() string         = "ref"     // optional branch / tag / commit (git origin)
 func PaneTarget() string      = "target"
 func PaneUnsupported() string = "unsupported"
 func PaneRetry() string       = "retry"
@@ -47,6 +51,9 @@ func PaneLog() string   = "log"    // S3 activity log
 func s1Panes() Array[string] =
     ArrayOf[string](
         PaneBrowse(),
+        PaneOrigin(),
+        PaneUrl(),
+        PaneRef(),
         PaneTarget(),
         PaneUnsupported(),
         PaneRetry(),
@@ -91,11 +98,21 @@ struct Model(
     // resulting port (Port) then drives the whole run.
     MakePort func(string) engine.EnginePort,
     Port     engine.EnginePort,
+    // ScanGit acquires a remote SourceOrigin (clone-then-scan) for the
+    // start-from-GitHub path — the engine's public source-acquisition bridge
+    // (engine.ScanOrigin over a RepoCloner). The local-path origin never touches
+    // it: it scans through Port.Scan exactly as before. The app wires the real git
+    // cloner here; tests inject a deterministic stub.
+    ScanGit  func(engine.SourceOrigin, string) engine.OriginScan,
     Cols     int,
     Rows     int,
     // S1 interview
     SourceDir    string,
     Source       SourceInfo,
+    OriginGit    bool,     // false = local directory, true = GitHub repo URL
+    RepoUrl      string,   // git origin: the repo URL
+    RepoRef      string,   // git origin: optional branch / tag / commit
+    ScanError    string,   // a surfaced clone/scan failure (git origin), "" when clear
     TargetIdx    int,
     Unsupported  UnsupportedPolicy,
     Retry        int,
@@ -106,6 +123,10 @@ struct Model(
     Workspace Option[engine.WorkspaceModel],
     Plan      Option[engine.MigrationPlan],
     Run       Option[engine.RunState],
+    // dependency forest (plain value type from the public port)
+    Forest     Option[engine.DependencyForest],
+    DepCursor  int,        // S8 tree cursor (indexes straight into Forest.Deps)
+    ForestSaveOk bool,     // last forest auto-save result (S8 indicator)
     // S2 / S3 navigation
     S2Focus    string,
     S3Focus    string,
@@ -141,10 +162,15 @@ func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model
         Focus    = NewFocusRing(s1Panes()),
         MakePort = makePort,
         Port     = makePort(BackendName(defaultBackend)),
+        ScanGit  = defaultScanGit(),
         Cols     = cols,
         Rows     = rows,
         SourceDir    = dir,
         Source       = detectSource(dir),
+        OriginGit    = false,
+        RepoUrl      = "",
+        RepoRef      = "",
+        ScanError    = "",
         TargetIdx    = 0,
         Unsupported  = FlagContinue(),
         Retry        = 3,
@@ -154,6 +180,9 @@ func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model
         Workspace = None[engine.WorkspaceModel](),
         Plan      = None[engine.MigrationPlan](),
         Run       = None[engine.RunState](),
+        Forest       = None[engine.DependencyForest](),
+        DepCursor    = 0,
+        ForestSaveOk = true,
         S2Focus    = PaneStart(),
         S3Focus    = PaneTree(),
         TreeCursor = 0,

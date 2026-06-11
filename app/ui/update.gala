@@ -40,12 +40,28 @@ sealed type Msg {
 
     // S1 direct (mouse), each also moves focus to that control
     case MBrowse()                             // open the directory picker (S7)
+    case MSetOrigin(Git bool)                  // pick local-dir vs GitHub-URL origin
+    case MFocusUrl()                           // focus the repo-URL field (git origin)
+    case MFocusRef()                           // focus the ref field (git origin)
     case MCycleTarget()
     case MSetUnsupported(P UnsupportedPolicy)
     case MStepRetry(Dir int)
     case MSetBackend(B AgentBackend)
     case MCycleAmbiguity()
     case MScanRequested()
+
+    // S8 dependency forest (mouse + keyboard)
+    case MOpenDeps()                           // open the Dependencies screen (S8)
+    case MDepSelect(Idx int)                   // highlight a forest node
+    case MDepResolve()                         // resolve / re-queue the node
+    case MDepSkip()                            // skip (abandon) the node
+    case MDepRetry()                           // retry a failed / unsupported node
+    case MDepExpand()                          // lift the depth bound for a pruned subtree
+    case MForestTick()                         // advance the forest one step
+    case MDepsResolved(Forest engine.DependencyForest)
+    case MForestSaved(Ok bool)
+    case MForestLoaded(Load engine.ForestLoad)
+    case MScanFailed(Reason string)            // a git-origin clone/scan failure
 
     // S7 directory picker
     case MBrowseLoaded(State BrowseState)      // async listing landed
@@ -102,6 +118,12 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MKeyBackspace() => (keyBackspace(m), NoCmd[Msg]())
 
     case MBrowse()          => openBrowse(m)
+    case MSetOrigin(g)      => {
+        val mf = focusOn(m, PaneOrigin())
+        return (mf.Copy(OriginGit = g), NoCmd[Msg]())
+    }
+    case MFocusUrl()        => (focusOn(m, PaneUrl()), NoCmd[Msg]())
+    case MFocusRef()        => (focusOn(m, PaneRef()), NoCmd[Msg]())
     case MCycleTarget()     => (cycleTarget(focusOn(m, PaneTarget()), 1), NoCmd[Msg]())
     case MSetUnsupported(p) => {
         val mf = focusOn(m, PaneUnsupported())
@@ -140,9 +162,21 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MResumeLoaded(load) => resumeLoaded(m, load)
     case MCheckpointSaved(ok) => (m.Copy(LastSaveOk = ok), NoCmd[Msg]())
 
-    case MScanPlanned(ws, plan) => (scanPlanned(m, ws, plan), NoCmd[Msg]())
+    case MScanPlanned(ws, plan) => scanPlanned(m, ws, plan)
     case MRunStarted(st)        => runStarted(m, st)
     case MRunTick()             => runTick(m)
+    case MScanFailed(reason)    => (m.Copy(Scanning = false, ScanError = reason), NoCmd[Msg]())
+
+    case MOpenDeps()         => openDeps(m)
+    case MDepSelect(i)       => (depSelect(m, i), NoCmd[Msg]())
+    case MDepResolve()       => depAct(m, (r runview.DepRowVM) => r.CanResolve, engine.ResolveDep())
+    case MDepSkip()          => depAct(m, (r runview.DepRowVM) => r.CanSkip,    engine.SkipDep())
+    case MDepRetry()         => depAct(m, (r runview.DepRowVM) => r.CanRetry,   engine.RetryDep())
+    case MDepExpand()        => depAct(m, (r runview.DepRowVM) => r.CanExpand,  engine.ExpandDep())
+    case MForestTick()       => forestTick(m)
+    case MDepsResolved(f)    => depsResolved(m, f)
+    case MForestSaved(ok)    => (m.Copy(ForestSaveOk = ok), NoCmd[Msg]())
+    case MForestLoaded(load) => forestLoaded(m, load)
 }
 
 // ----- per-screen routing of shared keys ------------------------------------
@@ -277,7 +311,11 @@ func resumeWith(m Model, offer runview.LoadSummary) Tuple[Model, Cmd[Msg]] = off
             Screens     = NewScreenStack(RouteS1()).Push(RouteS3()),
         )
         val cont = if (runview.AnyActionable(st)) tickCmd() else NoCmd[Msg]()
-        return (m2, withSave(m2, st, cont))
+        val resumeCmd = withSave(m2, st, cont)
+        // Resume the dependency forest alongside the run (when persisting): a long
+        // transitive migration restores its cloned/assimilated deps from disk too.
+        val withForest = if (m.Persist) Batch[Msg](loadForestCmd(m.Port, m.SourceDir), resumeCmd) else resumeCmd
+        return (m2, withForest)
     }
     case None() => noCmd(m)
 }
@@ -298,10 +336,13 @@ func reviewedUnitId(m Model) Option[engine.UnitId] = m.Run match {
 func keyChar(m Model, c rune) Tuple[Model, Cmd[Msg]] {
     val r = m.Screens.Current()
     if (r == RouteS5()) { return (typeAnswer(m, c), NoCmd[Msg]()) }
+    if (r == RouteS1() && typingPane(m)) { return (typeOriginField(m, c), NoCmd[Msg]()) }
     if (c == 'q') { return (m, QuitCmd[Msg]()) }
     if (r == RouteS7() && c == 's') { return browseSelect(m) }
+    if (r == RouteS8()) { return depKey(m, c) }
     if (r == RouteS4()) { return reviewKey(m, c) }
     if (r == RouteS3() && c == 'p') { return (m.Copy(Screens = m.Screens.Push(RouteS6())), NoCmd[Msg]()) }
+    if ((r == RouteS3() || r == RouteS2()) && c == 'd') { return openDeps(m) }
     if (r == RouteS6() && c == 'r') { return (m, loadCmd(m.Port, m.SourceDir)) }   // resume from disk
     return noCmd(m)
 }
@@ -314,18 +355,58 @@ func reviewKey(m Model, c rune) Tuple[Model, Cmd[Msg]] {
     return noCmd(m)
 }
 
+// depKey runs an S8 forest action from the keyboard: (o)resolve (s)skip (r)retry
+// (x)expand — mirroring the per-node action buttons, gated by availability inside
+// depAct. Any other key (incl. q to quit) falls through.
+func depKey(m Model, c rune) Tuple[Model, Cmd[Msg]] {
+    if (c == 'o') { return depAct(m, (row runview.DepRowVM) => row.CanResolve, engine.ResolveDep()) }
+    if (c == 's') { return depAct(m, (row runview.DepRowVM) => row.CanSkip,    engine.SkipDep()) }
+    if (c == 'r') { return depAct(m, (row runview.DepRowVM) => row.CanRetry,   engine.RetryDep()) }
+    if (c == 'x') { return depAct(m, (row runview.DepRowVM) => row.CanExpand,  engine.ExpandDep()) }
+    if (c == 'q') { return (m, QuitCmd[Msg]()) }
+    return noCmd(m)
+}
+
+// typingPane is true when an editable S1 text field (the git URL / ref) owns focus,
+// so a printable key types into it rather than triggering a shortcut.
+func typingPane(m Model) bool {
+    val p = m.Focus.Current()
+    return p == PaneUrl() || p == PaneRef()
+}
+
+// typeOriginField appends a typed char to the focused git-origin field.
+func typeOriginField(m Model, c rune) Model {
+    if (m.Focus.Current() == PaneUrl()) { return m.Copy(RepoUrl = m.RepoUrl + string(c)) }
+    if (m.Focus.Current() == PaneRef()) { return m.Copy(RepoRef = m.RepoRef + string(c)) }
+    return m
+}
+
 func typeAnswer(m Model, c rune) Model = m.Copy(AnswerText = m.AnswerText + string(c))
 
 func keyBackspace(m Model) Model {
-    if (m.Screens.Current() != RouteS5()) { return m }
+    val r = m.Screens.Current()
+    if (r == RouteS1()) {
+        if (m.Focus.Current() == PaneUrl()) { return m.Copy(RepoUrl = dropLastRune(m.RepoUrl)) }
+        if (m.Focus.Current() == PaneRef()) { return m.Copy(RepoRef = dropLastRune(m.RepoRef)) }
+        return m
+    }
+    if (r != RouteS5()) { return m }
     if (RuneCount(m.AnswerText) == 0) { return m }
-    return m.Copy(AnswerText = str.S(m.AnswerText).DropRight(1).ToString())
+    return m.Copy(AnswerText = dropLastRune(m.AnswerText))
+}
+
+func dropLastRune(s string) string {
+    if (RuneCount(s) == 0) { return s }
+    return str.S(s).DropRight(1).ToString()
 }
 
 // s1Activate runs the focused S1 control's primary action.
 func s1Activate(m Model) Tuple[Model, Cmd[Msg]] {
     val pane = m.Focus.Current()
     if (pane == PaneBrowse())      { return openBrowse(m) }
+    if (pane == PaneOrigin())      { return noCmd(toggleOrigin(m)) }
+    if (pane == PaneUrl())         { return noCmd(m) }   // text field — typing edits it
+    if (pane == PaneRef())         { return noCmd(m) }   // text field — typing edits it
     if (pane == PaneTarget())      { return noCmd(cycleTarget(m, 1)) }
     if (pane == PaneUnsupported()) { return noCmd(moveUnsupported(m, 1)) }
     if (pane == PaneRetry())       { return noCmd(stepRetry(m, 1)) }
@@ -352,6 +433,7 @@ func stepRight(m Model) Tuple[Model, Cmd[Msg]] {
 func step(m Model, dir int) Model {
     if (m.Screens.Current() != RouteS1()) { return m }
     val pane = m.Focus.Current()
+    if (pane == PaneOrigin())      { return toggleOrigin(m) }
     if (pane == PaneTarget())      { return cycleTarget(m, dir) }
     if (pane == PaneUnsupported()) { return moveUnsupported(m, dir) }
     if (pane == PaneRetry())       { return stepRetry(m, dir) }
@@ -360,10 +442,11 @@ func step(m Model, dir int) Model {
     return m
 }
 
-// nav is ArrowUp/Down — S3 tree/log, or the S7 picker cursor.
+// nav is ArrowUp/Down — S3 tree/log, the S7 picker cursor, or the S8 forest cursor.
 func nav(m Model, dir int) Model {
     val r = m.Screens.Current()
     if (r == RouteS7()) { return browseMove(m, dir) }
+    if (r == RouteS8()) { return depNav(m, dir) }
     if (r != RouteS3()) { return m }
     if (m.S3Focus == PaneLog()) { return scrollLog(m, -dir) }
     val n = unitCount(m)
@@ -375,6 +458,7 @@ func nav(m Model, dir int) Model {
 // owns the screen (wheel up moves the cursor up).
 func scrollLog(m Model, amount int) Model {
     if (m.Screens.Current() == RouteS7()) { return browseMove(m, -amount) }
+    if (m.Screens.Current() == RouteS8()) { return depNav(m, -amount) }
     return m.Copy(LogScroll = clampInt(m.LogScroll + amount, 0, logLen(m)))
 }
 
@@ -395,6 +479,9 @@ func noCmd(m Model) Tuple[Model, Cmd[Msg]] = (m, NoCmd[Msg]())
 func focusOn(m Model, pane string) Model = m.Copy(Focus = m.Focus.FocusOn(pane))
 
 // ----- S1 pure control edits ------------------------------------------------
+
+// toggleOrigin flips the source origin between the local directory and a GitHub URL.
+func toggleOrigin(m Model) Model = m.Copy(OriginGit = !m.OriginGit)
 
 func cycleTarget(m Model, dir int) Model =
     m.Copy(TargetIdx = clampIdx(m.TargetIdx + dir, TargetLangOptions().Length()))
@@ -419,32 +506,71 @@ func toggleBackend(m Model, dir int) Model {
 
 // ----- engine flow: scan → plan → run → tick --------------------------------
 
-// startScan builds the engine port from the S1 backend selection, then probes
-// the project through it (Scan→Plan) off the loop. The selected port is stored
-// so the rest of the run (Run/Advance/ActOnUnit/AnswerBlocker) uses it too.
+// startScan builds the engine port from the S1 backend selection, then probes the
+// project through it (Scan→Plan) off the loop. The LOCAL origin scans through the
+// port exactly as before (no behavior change); the GitHub origin clones-then-scans
+// through the engine's source-acquisition bridge. The selected port is stored so the
+// rest of the run (Run/Advance/ActOnUnit/AnswerBlocker) uses it too.
 func startScan(m Model) Tuple[Model, Cmd[Msg]] {
     val port = m.MakePort(BackendName(m.Backend))
+    if (m.OriginGit) { return startGitScan(m, port) }
     val root = m.SourceDir
     val cmd = Async[engine.WorkspaceModel, Msg](
         () => port.Scan(engine.ScanRequest(Root = root)),
         (ws) => MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
     )
-    return (m.Copy(Port = port, Scanning = true), cmd)
+    return (m.Copy(Port = port, Scanning = true, ScanError = ""), cmd)
 }
 
-// scanPlanned routes to the S2 plan summary. An empty plan (the scanned folder
-// had no migratable units) is a dead end, so focus the back button rather than a
-// start action the view doesn't even offer.
-func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) Model {
+// startGitScan acquires a remote origin: it builds engine.GitRepo(Url, Ref) and runs
+// the clone-then-scan bridge off the loop. The URL is gated minimally first (so an
+// empty/garbage field never kicks a clone); on success the result flows into the same
+// MScanPlanned the local path uses, on failure into MScanFailed (surfaced on S1).
+func startGitScan(m Model, port engine.EnginePort) Tuple[Model, Cmd[Msg]] {
+    if (!looksLikeRepoUrl(m.RepoUrl)) { return noCmd(m) }
+    val origin = engine.GitOrigin(m.RepoUrl, m.RepoRef)
+    val dest = gitCloneDest(m.RepoUrl)
+    val scan = m.ScanGit
+    val cmd = Async[engine.OriginScan, Msg](
+        () => scan(origin, dest),
+        (os) => originScanToMsg(port, os),
+    )
+    return (m.Copy(Port = port, Scanning = true, ScanError = ""), cmd)
+}
+
+// originScanToMsg classifies the acquired origin (the sealed-type match lives in
+// runview) and routes a successful scan into MScanPlanned, a failure into MScanFailed.
+func originScanToMsg(port engine.EnginePort, os engine.OriginScan) Msg {
+    val sum = runview.ClassifyOrigin(os)
+    if (sum.Ok) { return MScanPlanned(Workspace = sum.Workspace, Plan = port.Plan(sum.Workspace)) }
+    return MScanFailed(Reason = sum.Reason)
+}
+
+// scanPlanned routes to the S2 plan summary and kicks off dependency resolution off
+// the loop (ResolveDeps → MDepsResolved), so the dependency forest is discovered as
+// soon as a scan lands. An empty plan (the scanned folder had no migratable units) is
+// a dead end, so focus the back button rather than a start action the view doesn't
+// even offer.
+func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) Tuple[Model, Cmd[Msg]] {
     val focus = if (plan.Items.IsEmpty()) PaneBack() else PaneStart()
-    return m.Copy(
+    val m2 = m.Copy(
         Scanning  = false,
+        ScanError = "",
         Workspace = Some(ws),
         Plan      = Some(plan),
         S2Focus   = focus,
         Screens   = m.Screens.Push(RouteS2()),
     )
+    return (m2, resolveDepsCmd(m2.Port, ws))
 }
+
+// resolveDepsCmd resolves the scanned workspace's dependencies into a forest off the
+// Update loop. A rootless / dependency-free project yields an empty forest (no-op).
+func resolveDepsCmd(port engine.EnginePort, ws engine.WorkspaceModel) Cmd[Msg] =
+    Async[engine.DependencyForest, Msg](
+        () => port.ResolveDeps(ws),
+        (f) => MDepsResolved(Forest = f),
+    )
 
 // startRun materializes the run and routes to S3, kicking the first tick.
 func startRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
@@ -495,6 +621,96 @@ func withSave(m Model, state engine.RunState, base Cmd[Msg]) Cmd[Msg] =
 // tickCmd schedules the next tick off the Update loop (a Future the runtime
 // drains). In tests, MRunTick is sent directly instead.
 func tickCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(60)), () => MRunTick())
+
+// ----- dependency forest: resolve → advance → fixpoint, operator actions -----
+
+// openDeps pushes the Dependencies screen (S8), resetting the tree cursor. The
+// forest may still be resolving (None / empty) — S8 renders that state itself.
+func openDeps(m Model) Tuple[Model, Cmd[Msg]] =
+    (m.Copy(Screens = m.Screens.Push(RouteS8()), DepCursor = 0), NoCmd[Msg]())
+
+// depsResolved adopts the resolved forest and starts the forest-tick loop when it
+// still has drivable nodes (mirrors runStarted/runTick for the run).
+func depsResolved(m Model, f engine.DependencyForest) Tuple[Model, Cmd[Msg]] {
+    val m2 = m.Copy(Forest = Some(f))
+    val cont = if (runview.ForestActionable(f)) forestTickCmd() else NoCmd[Msg]()
+    return (m2, withForestSave(m2, f, cont))
+}
+
+// forestTick advances the forest one step; re-schedules itself while any node is
+// still drivable, and (when persisting) auto-checkpoints the forest off the loop —
+// the forest analogue of runTick.
+func forestTick(m Model) Tuple[Model, Cmd[Msg]] = m.Forest match {
+    case Some(f) => {
+        if (runview.ForestActionable(f)) {
+            val next = m.Port.AdvanceForest(f)
+            val m2 = m.Copy(Forest = Some(next))
+            val cont = if (runview.ForestActionable(next)) forestTickCmd() else NoCmd[Msg]()
+            return (m2, withForestSave(m2, next, cont))
+        }
+        return (m, NoCmd[Msg]())
+    }
+    case None() => (m, NoCmd[Msg]())
+}
+
+// depAct runs an operator decision on the node at the tree cursor THROUGH the port,
+// gated on the projected availability (a plain bool — no engine sealed-type match
+// here), and resumes the forest-tick loop if the action made a node drivable again.
+func depAct(m Model, allowed func(runview.DepRowVM) bool, action engine.DepAction) Tuple[Model, Cmd[Msg]] = m.Forest match {
+    case Some(f) => {
+        val idx = m.DepCursor
+        if (idx < 0 || idx >= f.Deps.Length()) { return noCmd(m) }
+        val row = runview.ProjectForest(f).Rows.Get(idx)
+        if (!allowed(row)) { return noCmd(m) }
+        val id = f.Deps.Get(idx).Node.Id
+        val next = m.Port.ActOnDependency(f, id, action)
+        val m2 = m.Copy(Forest = Some(next))
+        val cont = if (runview.ForestActionable(next)) forestTickCmd() else NoCmd[Msg]()
+        return (m2, withForestSave(m2, next, cont))
+    }
+    case None() => noCmd(m)
+}
+
+// depSelect moves the tree cursor to a clicked node.
+func depSelect(m Model, i int) Model {
+    val n = depCount(m)
+    val hi = if (n > 0) n - 1 else 0
+    return m.Copy(DepCursor = clampInt(i, 0, hi))
+}
+
+// depNav steps the tree cursor (arrow keys / wheel) within S8.
+func depNav(m Model, dir int) Model {
+    val n = depCount(m)
+    val hi = if (n > 0) n - 1 else 0
+    return m.Copy(DepCursor = clampInt(m.DepCursor + dir, 0, hi))
+}
+
+func depCount(m Model) int = m.Forest match {
+    case Some(f) => f.Deps.Length()
+    case None()  => 0
+}
+
+// forestLoaded adopts a forest restored from disk (resume) and continues its tick
+// loop when it still has drivable nodes.
+func forestLoaded(m Model, load engine.ForestLoad) Tuple[Model, Cmd[Msg]] {
+    val sum = runview.ClassifyForestLoad(load)
+    return sum.Forest match {
+        case Some(f) => {
+            val m2 = m.Copy(Forest = Some(f))
+            val cont = if (runview.ForestActionable(f)) forestTickCmd() else NoCmd[Msg]()
+            return (m2, cont)
+        }
+        case None() => noCmd(m)
+    }
+}
+
+// withForestSave batches a forest auto-checkpoint before `base` when persistence is
+// on; off (tests) it returns `base` unchanged, so no IO is issued.
+func withForestSave(m Model, forest engine.DependencyForest, base Cmd[Msg]) Cmd[Msg] =
+    if (m.Persist) Batch[Msg](saveForestCmd(m.Port, forest, m.SourceDir), base) else base
+
+// forestTickCmd schedules the next forest tick off the Update loop.
+func forestTickCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(60)), () => MForestTick())
 
 func unitCount(m Model) int = m.Run match {
     case Some(rs) => rs.Units.Length()

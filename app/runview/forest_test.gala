@@ -1,0 +1,191 @@
+package runview
+
+import (
+    . "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// ProjectForest / ClassifyOrigin / ClassifyForestLoad projection tests.
+//
+// Forests are built by hand from the engine's public value types (the same style
+// as runview_test.gala builds RunStates), and the plain VM output is asserted —
+// every DepResolution case projected to its expected glyph / label / flags, the
+// in-flight progress reused from the run projection, and the forest roll-up.
+// ============================================================================
+
+// ----- fixtures -------------------------------------------------------------
+
+func mkNode(module string, version string, url string, direct bool) DependencyNode =
+    DependencyNode(
+        Id      = DependencyId(Value = module),
+        Coord   = ModuleCoord(Module = module, Version = version),
+        RepoUrl = url,
+        Direct  = direct,
+    )
+
+func mkDep(module string, depth int, status DepResolution) DependencyRun =
+    DependencyRun(
+        Node     = mkNode(module, "v1.0.0", "https://" + module, true),
+        Dest     = "/deps/" + module,
+        Status   = status,
+        Depth    = depth,
+        Children = EmptyArray[DependencyId](),
+    )
+
+// mkForest assembles a DependencyForest with a correctly-derived DepMap (so a
+// projection over it matches what the engine's own driver would carry).
+func mkForest(deps Array[DependencyRun]) DependencyForest {
+    val depMap = deps.FoldLeft[HashMap[string, DependencyRun]](
+        EmptyHashMap[string, DependencyRun](),
+        (acc HashMap[string, DependencyRun], d DependencyRun) => acc.Put(d.Node.Id.Value, d),
+    )
+    return DependencyForest(
+        Deps     = deps,
+        DepMap   = depMap,
+        Visited  = EmptyArray[string](),
+        MaxDepth = 5,
+        DepsBase = "/deps",
+    )
+}
+
+// row0 projects a single-node forest and returns that node's row.
+func row0(status DepResolution) DepRowVM =
+    ProjectForest(mkForest(ArrayOf[DependencyRun](mkDep("github.com/x/y", 1, status)))).Rows.Get(0)
+
+// ----- per-DepResolution projection -----------------------------------------
+
+func TestProjectDepPending(t T) T {
+    val r = row0(DepPending())
+    val t1 = Eq(t,  r.Glyph, "○")
+    val t2 = Eq(t1, r.Status, "pending")
+    val t3 = IsTrue(t2, r.Active)
+    val t4 = IsTrue(t3, r.CanSkip)
+    val t5 = IsFalse(t4, r.IsDone)
+    return IsFalse(t5, r.IsFailed)
+}
+
+func TestProjectDepDone(t T) T {
+    val r = row0(DepDone())
+    val t1 = Eq(t,  r.Glyph, "✓")
+    val t2 = Eq(t1, r.Status, "done")
+    val t3 = IsTrue(t2, r.IsDone)
+    val t4 = IsTrue(t3, r.CanRetry)
+    return IsFalse(t4, r.Active)
+}
+
+func TestProjectDepSkipped(t T) T {
+    val r = row0(DepSkipped())
+    val t1 = Eq(t,  r.Glyph, "⊘")
+    val t2 = Eq(t1, r.Status, "skipped")
+    val t3 = IsTrue(t2, r.IsSkipped)
+    val t4 = IsTrue(t3, r.CanResolve)
+    val t5 = IsTrue(t4, r.CanExpand)
+    return IsTrue(t5, strContains(r.Reason, "skipped"))
+}
+
+// An unsupported dependency must be surfaced with its reason and a distinguishing
+// flag — never folded in with the clean nodes (the product invariant).
+func TestProjectDepUnsupported(t T) T {
+    val r = row0(DepUnsupported(Reason = "no VCS host mapping for module golang.org/x/tools"))
+    val t1 = Eq(t,  r.Glyph, "⚠")
+    val t2 = Eq(t1, r.Status, "unsupported")
+    val t3 = IsTrue(t2, r.IsUnsupported)
+    val t4 = IsTrue(t3, strContains(r.Reason, "no VCS host"))
+    val t5 = IsTrue(t4, r.CanRetry)
+    return IsFalse(t5, r.IsFailed)
+}
+
+func TestProjectDepFailed(t T) T {
+    val r = row0(DepFailed(Reason = "clone failed: network unreachable"))
+    val t1 = Eq(t,  r.Glyph, "✗")
+    val t2 = Eq(t1, r.Status, "failed")
+    val t3 = IsTrue(t2, r.IsFailed)
+    val t4 = IsTrue(t3, strContains(r.Reason, "clone failed"))
+    return IsTrue(t4, r.CanRetry)
+}
+
+// A DepAssimilating node folds in its embedded sub-run's progress, REUSING the run
+// projection (1 of 2 units done → 50%).
+func TestProjectDepAssimilatingProgress(t T) T {
+    val run = rsOf(ArrayOf[UnitRun](
+        mkUnit("a", "x", doneStatus("out", "r", noFlags())),
+        mkUnit("b", "x", Queued())))
+    val r = row0(DepAssimilating(Run = run))
+    val t1 = Eq(t,  r.Status, "assimilating")
+    val t2 = Eq(t1, r.UnitsTotal, 2)
+    val t3 = Eq(t2, r.UnitsDone, 1)
+    val t4 = Eq(t3, r.Pct, 50)
+    return IsTrue(t4, r.Active)
+}
+
+// ----- forest roll-up + depth -----------------------------------------------
+
+func TestProjectForestCountsAndDepth(t T) T {
+    val deps = ArrayOf[DependencyRun](
+        mkDep("github.com/a/a", 1, DepDone()),
+        mkDep("github.com/b/b", 2, DepUnsupported(Reason = "vanity host")),
+        mkDep("github.com/c/c", 2, DepFailed(Reason = "boom")),
+        mkDep("github.com/d/d", 1, DepPending()))
+    val fv = ProjectForest(mkForest(deps))
+    val t1 = Eq(t,  fv.Total, 4)
+    val t2 = Eq(t1, fv.Done, 1)
+    val t3 = Eq(t2, fv.Unsupported, 1)
+    val t4 = Eq(t3, fv.Failed, 1)
+    val t5 = Eq(t4, fv.Pct, 25)
+    // Depth is preserved per row for the view's indentation.
+    val t6 = Eq(t5, fv.Rows.Get(1).Depth, 2)
+    return IsFalse(t6, fv.Complete)   // a pending node remains → not at a fixpoint
+}
+
+func TestProjectForestEmpty(t T) T {
+    val fv = ProjectForest(mkForest(EmptyArray[DependencyRun]()))
+    val t1 = Eq(t, fv.Total, 0)
+    val t2 = Eq(t1, fv.Pct, 0)
+    val t3 = IsTrue(t2, fv.Rows.IsEmpty())
+    return IsTrue(t3, fv.Complete)   // nothing to drive → complete
+}
+
+// ----- ForestActionable -----------------------------------------------------
+
+func TestForestActionable(t T) T {
+    val pending = mkForest(ArrayOf[DependencyRun](mkDep("github.com/a/a", 1, DepPending())))
+    val settled = mkForest(ArrayOf[DependencyRun](
+        mkDep("github.com/a/a", 1, DepDone()),
+        mkDep("github.com/b/b", 1, DepSkipped())))
+    val empty = mkForest(EmptyArray[DependencyRun]())
+    val t1 = IsTrue(t,  ForestActionable(pending))
+    val t2 = IsFalse(t1, ForestActionable(settled))
+    return IsFalse(t2, ForestActionable(empty))
+}
+
+// ----- origin acquisition projection ----------------------------------------
+
+func TestClassifyOriginScanned(t T) T {
+    val ws = NewWorkspaceModel(EmptyArray[Package](), EmptyArray[DepEdge]())
+    val sum = ClassifyOrigin(OriginScanned(Path = "/clone", Workspace = ws))
+    val t1 = IsTrue(t, sum.Ok)
+    return Eq(t1, sum.Path, "/clone")
+}
+
+func TestClassifyOriginUnsupported(t T) T {
+    val sum = ClassifyOrigin(OriginUnsupported(Reason = "clone failed for https://x: nope"))
+    val t1 = IsFalse(t, sum.Ok)
+    return IsTrue(t1, strContains(sum.Reason, "clone failed"))
+}
+
+// ----- forest checkpoint load projection ------------------------------------
+
+func TestClassifyForestLoad(t T) T {
+    val f = mkForest(ArrayOf[DependencyRun](mkDep("github.com/a/a", 1, DepDone())))
+    val loaded = ClassifyForestLoad(ForestLoaded(Value = f))
+    val missing = ClassifyForestLoad(ForestMissing())
+    val corrupt = ClassifyForestLoad(ForestCorrupt(Reason = "undecodable"))
+    val t1 = Eq(t,  loaded.Kind, "loaded")
+    val t2 = IsFalse(t1, loaded.Forest.IsEmpty())
+    val t3 = Eq(t2, missing.Kind, "missing")
+    val t4 = Eq(t3, corrupt.Kind, "corrupt")
+    return IsTrue(t4, strContains(corrupt.Reason, "undecodable"))
+}

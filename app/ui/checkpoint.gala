@@ -22,6 +22,12 @@ func CheckpointDir(root string) string = path.Join(root, ".assimilator")
 // CheckpointPath is the stable per-project checkpoint file.
 func CheckpointPath(root string) string = path.Join(CheckpointDir(root), "state.json")
 
+// ForestCheckpointPath is the stable per-project DEPENDENCY-FOREST checkpoint, the
+// forest-scoped sibling of CheckpointPath. A transitive multi-dependency migration
+// is exactly the run that must survive quit/crash without re-cloning finished deps,
+// so the forest persists alongside the run state.
+func ForestCheckpointPath(root string) string = path.Join(CheckpointDir(root), "forest.json")
+
 // doSave ensures the state dir exists, then persists the run via the port.
 // Returns the port's success flag (false on any IO failure — never throws).
 func doSave(port engine.EnginePort, state engine.RunState, root string) bool {
@@ -43,4 +49,26 @@ func loadCmd(port engine.EnginePort, root string) Cmd[Msg] =
     Async[engine.CheckpointLoad, Msg](
         () => port.LoadCheckpoint(CheckpointPath(root)),
         (load) => MResumeLoaded(Load = load),
+    )
+
+// doSaveForest ensures the state dir exists, then persists the forest via the port.
+func doSaveForest(port engine.EnginePort, forest engine.DependencyForest, root string) bool {
+    fs.MkdirAll(CheckpointDir(root), 493)   // 0755; ignore result — SaveForest reports failure
+    return port.SaveForest(forest, ForestCheckpointPath(root))
+}
+
+// saveForestCmd persists the dependency forest off the Update loop; the result
+// surfaces as MForestSaved so the UI can show a save indicator.
+func saveForestCmd(port engine.EnginePort, forest engine.DependencyForest, root string) Cmd[Msg] =
+    Async[bool, Msg](
+        () => doSaveForest(port, forest, root),
+        (ok) => MForestSaved(Ok = ok),
+    )
+
+// loadForestCmd reads the forest checkpoint off the loop; the result surfaces as
+// MForestLoaded (resumed alongside the run checkpoint).
+func loadForestCmd(port engine.EnginePort, root string) Cmd[Msg] =
+    Async[engine.ForestLoad, Msg](
+        () => port.LoadForest(ForestCheckpointPath(root)),
+        (load) => MForestLoaded(Load = load),
     )

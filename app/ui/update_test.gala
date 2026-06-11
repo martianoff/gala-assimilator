@@ -44,7 +44,7 @@ func doneOf(m Model) int = m.Run match {
 
 func TestTabAdvancesFocus(t T) T {
     val (m1, _) = StepAll(prog(), ArrayOf[Msg](MFocusNext()))
-    return Eq(t, m1.Focus.Current(), PaneTarget())
+    return Eq(t, m1.Focus.Current(), PaneOrigin())
 }
 
 func TestShiftTabWrapsToLastPane(t T) T {
