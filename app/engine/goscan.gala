@@ -43,7 +43,7 @@ func ScanGoWorkspace(root string) WorkspaceModel {
     val dirs       = files.Map((f goFile) => f.Rel).Distinct()
     val packages   = dirs.Map((d string) => buildPackage(module, d, files))
     val crossEdges = buildCrossEdges(packages, files, module)
-    return NewWorkspaceModel(packages, crossEdges)
+    return NewWorkspaceModelFull(packages, crossEdges, root)
 }
 
 // goFile is a discovered `.go` file: its package-directory (slash-relative to the

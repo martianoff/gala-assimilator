@@ -1,0 +1,239 @@
+package engine
+
+// Proof of DEPENDENCY-FOREST assimilation, fully offline: from a root project that
+// requires a dependency, AdvanceForest clones each dependency into ITS OWN folder,
+// scans it, drives a SEPARATE run to completion, and recurses transitively into the
+// dependency's own go.mod — terminating under the depth bound and a cycle-dedup
+// visited set. Also: an unresolvable dependency is parked DepUnsupported (never
+// dropped), and ActOnDependency's skip / resolve / retry / expand transitions.
+//
+// Everything runs against a POPULATED MockRepoCloner (in-memory fixture repos written
+// to temp dirs) and the deterministic MockTranslator + MockVerifier — no network, no
+// credentials. The forest driver is exercised through the free functions (the port
+// wires a cloner the same way; the offline MockEngine wires an EMPTY cloner, proven
+// separately in forest_persist_test.gala).
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// ----------------------------------------------------------------------------
+// Fixtures: a root that requires depA; depA requires depB; depB requires depA
+// (a cycle, to prove dedup terminates).
+// ----------------------------------------------------------------------------
+
+val depaUrl = "https://github.com/acme/depa"
+val depbUrl = "https://github.com/acme/depb"
+val depaModule = "github.com/acme/depa"
+val depbModule = "github.com/acme/depb"
+
+val depaRepoFiles = ArrayOf[MockFile](
+    MockFile(RelPath = "go.mod",       Content = "module github.com/acme/depa\n\ngo 1.21\n\nrequire github.com/acme/depb v1.0.0\n"),
+    MockFile(RelPath = "depa.go",      Content = "package depa\n\nfunc A() int {\n\treturn 1\n}\n"),
+    MockFile(RelPath = "depa_test.go", Content = "package depa\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {\n\tif A() != 1 {\n\t\tt.Fatal(\"x\")\n\t}\n}\n"),
+)
+
+val depbRepoFiles = ArrayOf[MockFile](
+    MockFile(RelPath = "go.mod",  Content = "module github.com/acme/depb\n\ngo 1.21\n\nrequire github.com/acme/depa v1.0.0\n"),
+    MockFile(RelPath = "depb.go", Content = "package depb\n\nfunc B() int {\n\treturn 2\n}\n"),
+)
+
+func forestCloner() RepoCloner =
+    MockRepoCloner(EmptyHashMap[string, Array[MockFile]]()
+        .Put(depaUrl, depaRepoFiles)
+        .Put(depbUrl, depbRepoFiles))
+
+// materializeForestRoot writes a root project requiring depA and returns its path.
+func materializeForestRoot(requireLine string) string {
+    val root = fs.MkdirTemp("", "gala_forest_root").GetOrElse("")
+    fs.WriteFileString(path.Join(root, "go.mod"), "module example.com/root\n\ngo 1.21\n\n" + requireLine, 420)
+    fs.WriteFileString(path.Join(root, "main.go"), "package main\n\nfunc main() {}\n", 420)
+    return root
+}
+
+func freshDepsBase() string = fs.MkdirTemp("", "gala_forest_deps").GetOrElse("")
+
+// driveForest runs a forest to completion over the populated fixture cloner with the
+// deterministic mock translator + verifier.
+func driveForest(forest DependencyForest) DependencyForest =
+    AdvanceForestToCompletion(
+        forestCloner(), GoDependencyResolver(),
+        MockTranslator(), MockVerifier(), DefaultMaxAttempts(),
+        forest,
+    )
+
+// ----------------------------------------------------------------------------
+// Transitive recursion to completion, each dep in its own folder, cycle deduped.
+// ----------------------------------------------------------------------------
+
+func TestForestAssimilatesTransitivelyToCompletion(t T) T {
+    val root  = materializeForestRoot("require github.com/acme/depa v1.0.0\n")
+    val model = ScanGoWorkspace(root)
+    val base  = freshDepsBase()
+    val seed  = resolveForest(GoDependencyResolver(), model, base, DefaultMaxDepth())
+
+    // Seed: exactly the one direct dependency (depA), pending.
+    val t1 = Eq(t, seed.Deps.Length(), 1)
+    val t2 = Eq(t1, CountDepsDone(seed), 0)
+
+    val final = driveForest(seed)
+
+    // Transitive recursion discovered depB through depA's go.mod; the depB -> depA
+    // cycle was deduped, so the forest has EXACTLY two dependency nodes.
+    val t3 = Eq(t2, final.Deps.Length(), 2)
+    val t4 = Eq(t3, ForestComplete(final), true)
+    val t5 = Eq(t4, CountDepsDone(final), 2)
+
+    // Each dependency was cloned into its OWN folder (distinct, on disk).
+    val da = depRun(final, depaModule)
+    val db = depRun(final, depbModule)
+    val t6 = da match {
+        case Some(d) => Eq(t5, fs.Exists(path.Join(d.Dest, "depa.go")), true)
+        case None()  => Fail(t5, "expected a depA node")
+    }
+    val t7 = db match {
+        case Some(d) => Eq(t6, fs.Exists(path.Join(d.Dest, "depb.go")), true)
+        case None()  => Fail(t6, "expected a depB node (discovered transitively)")
+    }
+    return forestDestsDistinct(t7, da, db)
+}
+
+// depB's go.mod requires depA, which was already visited — so depB carries the edge
+// back to depA but the forest never created a second depA node (cycle terminated).
+func TestForestCycleDedup(t T) T {
+    val root  = materializeForestRoot("require github.com/acme/depa v1.0.0\n")
+    val final = driveForest(resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), DefaultMaxDepth()))
+    val t1 = Eq(t, final.Deps.Length(), 2)
+    return depRun(final, depbModule) match {
+        case Some(d) => Eq(t1, d.Children.Exists((c DependencyId) => c.Value == depaModule), true)
+        case None()  => Fail(t1, "expected a depB node")
+    }
+}
+
+// With the depth bound at 1, depA (depth 1) is assimilated but depB (depth 2) is
+// SURFACED as DepSkipped — never cloned — so the bound is visible, not silent.
+func TestForestDepthBoundSurfacesSkip(t T) T {
+    val root  = materializeForestRoot("require github.com/acme/depa v1.0.0\n")
+    val seed  = resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), 1)
+    val final = driveForest(seed)
+    val t1 = Eq(t, ForestComplete(final), true)
+    val t2 = depRun(final, depaModule) match {
+        case Some(d) => isDepDone(t1, d)
+        case None()  => Fail(t1, "expected a depA node")
+    }
+    return depRun(final, depbModule) match {
+        case Some(d) => isDepSkipped(t2, d)
+        case None()  => Fail(t2, "a beyond-depth dependency must be surfaced (DepSkipped), not dropped")
+    }
+}
+
+// An unresolvable dependency (vanity host, no VCS mapping) is parked DepUnsupported —
+// surfaced with a reason, never silently dropped, never a clone attempt.
+func TestForestUnsupportedDependency(t T) T {
+    val root  = materializeForestRoot("require golang.org/x/tools v0.1.0\n")
+    val seed  = resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), DefaultMaxDepth())
+    val final = driveForest(seed)
+    val t1 = Eq(t, final.Deps.Length(), 1)
+    return final.Deps.Head().Status match {
+        case DepUnsupported(_) => IsTrue(t1, true)
+        case _                 => Fail(t1, "an unresolvable dependency must settle DepUnsupported")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ActOnDependency: skip / resolve / retry / expand.
+// ----------------------------------------------------------------------------
+
+func TestActOnDependencySkipThenResolve(t T) T {
+    val root = materializeForestRoot("require github.com/acme/depa v1.0.0\n")
+    val seed = resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), DefaultMaxDepth())
+    val id   = DependencyId(Value = depaModule)
+
+    val skipped = actOnDependency(seed, id, SkipDep())
+    val t1 = depRun(skipped, depaModule) match {
+        case Some(d) => isDepSkipped(t, d)
+        case None()  => Fail(t, "expected depA node")
+    }
+    val resolved = actOnDependency(skipped, id, ResolveDep())
+    return depRun(resolved, depaModule) match {
+        case Some(d) => isDepPending(t1, d)
+        case None()  => Fail(t1, "expected depA node")
+    }
+}
+
+// A clone failure (empty cloner) lands depA in DepFailed; RetryDep re-queues it
+// DepPending for another attempt.
+func TestActOnDependencyRetryAfterFailure(t T) T {
+    val root = materializeForestRoot("require github.com/acme/depa v1.0.0\n")
+    val seed = resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), DefaultMaxDepth())
+    val failed = advanceForest(EmptyMockRepoCloner(), GoDependencyResolver(), MockTranslator(), MockVerifier(), DefaultMaxAttempts(), seed)
+    val t1 = depRun(failed, depaModule) match {
+        case Some(d) => isDepFailed(t, d)
+        case None()  => Fail(t, "expected depA node")
+    }
+    val retried = actOnDependency(failed, DependencyId(Value = depaModule), RetryDep())
+    return depRun(retried, depaModule) match {
+        case Some(d) => isDepPending(t1, d)
+        case None()  => Fail(t1, "expected depA node")
+    }
+}
+
+// ExpandDep lifts the depth bound and re-queues a depth-skipped node, so driving the
+// forest again now clones it to completion.
+func TestActOnDependencyExpandGrowsSubtree(t T) T {
+    val root = materializeForestRoot("require github.com/acme/depa v1.0.0\n")
+    val seed = resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), 1)
+    val bounded = driveForest(seed)
+    // depB was skipped at the bound.
+    val t1 = depRun(bounded, depbModule) match {
+        case Some(d) => isDepSkipped(t, d)
+        case None()  => Fail(t, "expected a depth-skipped depB node")
+    }
+    val expanded = actOnDependency(bounded, DependencyId(Value = depbModule), ExpandDep())
+    val t2 = Eq(t1, expanded.MaxDepth, 2)
+    val final = driveForest(expanded)
+    return depRun(final, depbModule) match {
+        case Some(d) => isDepDone(t2, d)
+        case None()  => Fail(t2, "expected depB node")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Small status assertion helpers
+// ----------------------------------------------------------------------------
+
+func depRun(forest DependencyForest, module string) Option[DependencyRun] =
+    forest.DepMap.Get(module)
+
+func isDepDone(t T, d DependencyRun) T = d.Status match {
+    case DepDone() => IsTrue(t, true)
+    case _         => Fail(t, "expected DepDone")
+}
+
+func isDepSkipped(t T, d DependencyRun) T = d.Status match {
+    case DepSkipped() => IsTrue(t, true)
+    case _            => Fail(t, "expected DepSkipped")
+}
+
+func isDepPending(t T, d DependencyRun) T = d.Status match {
+    case DepPending() => IsTrue(t, true)
+    case _            => Fail(t, "expected DepPending")
+}
+
+func isDepFailed(t T, d DependencyRun) T = d.Status match {
+    case DepFailed(_) => IsTrue(t, true)
+    case _            => Fail(t, "expected DepFailed")
+}
+
+func forestDestsDistinct(t T, a Option[DependencyRun], b Option[DependencyRun]) T =
+    a match {
+        case Some(da) => b match {
+            case Some(db) => Eq(t, da.Dest != db.Dest, true)
+            case None()   => Fail(t, "expected both dep nodes")
+        }
+        case None() => Fail(t, "expected both dep nodes")
+    }

@@ -1,0 +1,162 @@
+package engine
+
+// START-FROM-GITHUB source acquisition — the engine's front-of-the-pipeline seam
+// for migrating a project (and, via the dependency forest, its dependencies) that
+// lives in a remote VCS repo rather than a local checkout.
+//
+// Two pure-data value types plus a struct-of-func port (the GALA-idiomatic shape,
+// like Verifier / ToolchainRunner):
+//   - SourceOrigin — WHERE a migration's source comes from: a LocalPath already on
+//     disk, or a GitRepo to clone. The local case keeps the existing scan behavior
+//     byte-for-byte (LocalOrigin -> LocalPath); the git case is the new entry.
+//   - RepoCloner   — Clone: CloneRequest -> CloneResult. A real backend performs its
+//     `git clone` IO inside Clone and hands back the value; the contract stays pure.
+//
+// MockRepoCloner is the DEFAULT offline cloner the suite runs against: it
+// materializes a fixture file tree (held in memory, keyed by URL) into the
+// requested Dest folder — no network, fully deterministic. RealRepoCloner
+// (realclone.gala) shells `git clone` behind the same port and is never exercised
+// by `gala test`.
+//
+// Transport-neutral (CLAUDE.md / architecture.md): the clone IO lives at this
+// deliberate edge (like goscan / persist); NO gala_tui, NO app/ui, no acp.*.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// ----------------------------------------------------------------------------
+// Where the source comes from
+// ----------------------------------------------------------------------------
+
+// SourceOrigin is the input that says where to read a migration's source from.
+// Sealed so every acquisition path is handled: a path already on disk, or a remote
+// repo to clone first. Adding a new origin (a tarball URL, say) is a new case here,
+// and the exhaustive matches force every consumer to handle it.
+sealed type SourceOrigin {
+    case LocalPath(Root string)            // a checkout already on disk — scan it directly
+    case GitRepo(Url string, Ref string)   // a remote repo — clone (at Ref, "" = default branch) then scan
+}
+
+// LocalOrigin is the constructor for the existing local-path case — the helper the
+// brief asks for so a local scan stays trivial to express and behaves identically
+// to the pre-origin path.
+func LocalOrigin(root string) SourceOrigin = LocalPath(Root = root)
+
+// GitOrigin is the constructor for a remote repo origin. Ref is the branch / tag /
+// commit to check out; "" means the cloner's default (the repo's default branch).
+func GitOrigin(url string, ref string) SourceOrigin = GitRepo(Url = url, Ref = ref)
+
+// ----------------------------------------------------------------------------
+// The clone contract
+// ----------------------------------------------------------------------------
+
+// CloneRequest is one clone: the repo Url, the Ref to check out ("" = default
+// branch), and the Dest folder to clone INTO (the dependency forest gives every
+// dependency its own Dest, so clones never collide).
+struct CloneRequest(
+    Url  string,
+    Ref  string,
+    Dest string,
+)
+
+// CloneResult is the sealed outcome of a clone: the local Path the source now lives
+// at, or the reason the clone could not be performed. A failure is FIRST-CLASS
+// (surface, don't guess) — a dependency whose clone fails is flagged, never
+// silently dropped.
+sealed type CloneResult {
+    case Cloned(Path string)
+    case CloneFailed(Reason string)
+}
+
+// RepoCloner is the clone port: a struct of one function value. A real backend runs
+// `git clone` inside Clone; the mock materializes a fixture tree. RepoCloner is a
+// FUNCTION value, so it never crosses EnginePort as data — the engine wiring
+// captures a concrete cloner the same way it captures the translator runner.
+struct RepoCloner(
+    Clone func(CloneRequest) CloneResult,
+)
+
+// ----------------------------------------------------------------------------
+// MockRepoCloner — the deterministic offline cloner (the suite default)
+// ----------------------------------------------------------------------------
+
+// MockFile is one file in a fixture repo tree: its repo-relative path (slash form)
+// and its content. A list of these IS a fixture repo.
+struct MockFile(
+    RelPath string,
+    Content string,
+)
+
+// MockRepoCloner materializes fixture repos OFFLINE: `repos` maps a clone Url to the
+// file tree at that Url. A Clone writes that tree into the request's Dest and
+// returns Cloned(Dest); a Url with no fixture is CloneFailed (an unknown repo is a
+// real failure, surfaced — not an empty success). This is what `gala test` uses, so
+// the forest's clone -> scan -> recurse arc is exercised with zero network.
+func MockRepoCloner(repos HashMap[string, Array[MockFile]]) RepoCloner =
+    RepoCloner(Clone = (req CloneRequest) => mockClone(repos, req))
+
+// EmptyMockRepoCloner is the default cloner the offline MockEngine wires in: it has
+// NO fixtures, so every clone fails. The forest port is callable through MockEngine
+// (a pending dep settles DepUnsupported rather than crashing), while the rich
+// multi-level forest behavior is proven against a POPULATED MockRepoCloner directly.
+func EmptyMockRepoCloner() RepoCloner =
+    MockRepoCloner(EmptyHashMap[string, Array[MockFile]]())
+
+func mockClone(repos HashMap[string, Array[MockFile]], req CloneRequest) CloneResult =
+    repos.Get(req.Url) match {
+        case Some(files) => materializeRepo(req.Dest, files)
+        case None()      => CloneFailed(Reason = "mock cloner: no fixture for repo " + req.Url)
+    }
+
+// materializeRepo writes every fixture file under dest, creating parent dirs. A
+// write failure surfaces as CloneFailed (the IO edge never pretends it cloned).
+func materializeRepo(dest string, files Array[MockFile]) CloneResult {
+    val failure = files.FoldLeft[string](
+        "",
+        (acc string, f MockFile) => {
+            if acc != "" { return acc }
+            return writeMockFile(dest, f)
+        },
+    )
+    if failure != "" { return CloneFailed(Reason = failure) }
+    return Cloned(Path = dest)
+}
+
+// writeMockFile writes one fixture file under dest (0o755 dirs / 0o644 file).
+// Returns "" on success or a reason on failure.
+func writeMockFile(dest string, f MockFile) string {
+    val full = path.Join(dest, f.RelPath)
+    if fs.MkdirAll(path.Dir(full), 493).IsFailure() { return "mock cloner: mkdir failed for " + full }
+    if fs.WriteFileString(full, f.Content, 420).IsFailure() { return "mock cloner: write failed for " + full }
+    return ""
+}
+
+// ----------------------------------------------------------------------------
+// Origin -> WorkspaceModel (clone-if-needed, then scan)
+// ----------------------------------------------------------------------------
+
+// OriginScan is the sealed result of acquiring + scanning a SourceOrigin: the
+// scanned workspace (with the local path it now lives at), or the reason
+// acquisition failed (a clone that did not succeed). Failure is surfaced, never an
+// empty workspace passed off as a clean scan.
+sealed type OriginScan {
+    case OriginScanned(Path string, Workspace WorkspaceModel)
+    case OriginUnsupported(Reason string)
+}
+
+// ScanOrigin acquires a SourceOrigin and scans it to a WorkspaceModel. A LocalPath
+// is scanned in place (dest ignored — identical to the pre-origin local behavior).
+// A GitRepo is cloned into `dest` first; a failed clone is OriginUnsupported, never
+// a silent empty scan. This is the single bridge GitRepo -> cloned path ->
+// ScanGoWorkspace, reused by both a one-shot start and the dependency forest.
+func ScanOrigin(cloner RepoCloner, origin SourceOrigin, dest string) OriginScan = origin match {
+    case LocalPath(root) => OriginScanned(Path = root, Workspace = ScanGoWorkspace(root))
+    case GitRepo(url, ref) => cloner.Clone(CloneRequest(Url = url, Ref = ref, Dest = dest)) match {
+        case Cloned(p)         => OriginScanned(Path = p, Workspace = ScanGoWorkspace(p))
+        case CloneFailed(why)  => OriginUnsupported(Reason = "clone failed for " + url + ": " + why)
+    }
+}

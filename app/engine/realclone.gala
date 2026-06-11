@@ -1,0 +1,72 @@
+package engine
+
+// RealRepoCloner — the engine's REAL clone backend: the toolchain-backed
+// implementation of the RepoCloner contract (clone.gala). It shells `git clone`
+// into the requested Dest and maps the result onto a CloneResult — a non-zero exit
+// (bad URL, auth failure, network error) becomes CloneFailed carrying git's ACTUAL
+// stderr, so the forest can flag the dependency rather than guess.
+//
+// THE PROCESS RUNNER IS INJECTED (GitRunner), exactly like RealVerifier's
+// ToolchainRunner: RealRepoCloner never calls exec inside its own logic. Why it
+// matters — the offline suite injects a deterministic fake (no real `git`, no
+// network, no flakiness), and the default runner (GitCliRunner) that actually
+// spawns `git` is exercised only on the live-backend round, never from `gala test`.
+//
+// NOT THE DEFAULT, ON PURPOSE: MockRepoCloner stays the default everywhere so the
+// suite is offline and deterministic. RealRepoCloner is what GoEngine wires for a
+// real migration. It reuses ToolchainResult (realverify.gala) as the runner's
+// uniform "ok + combined output" shape.
+//
+// Transport-neutral: IO lives at this deliberate edge; NO gala_tui, NO app/ui, no
+// acp.* crosses the RepoCloner contract.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    "os/exec"
+)
+
+// GitRunner is the injected "run git with args -> result" port: a struct of one
+// function value (like ToolchainRunner). RealRepoCloner depends on this rather than
+// calling exec itself, so a test can substitute a deterministic fake.
+struct GitRunner(
+    Run func(Array[string]) ToolchainResult,
+)
+
+// GitCliRunner is the DEFAULT real runner: it spawns `git <args>` and captures the
+// combined output via os/exec. CombinedOutput buffers both pipes (no drain
+// deadlock) and returns a non-nil error on a non-zero exit, which maps to Ok =
+// false with git's diagnostics still in Output. Exercised only on the live round.
+func GitCliRunner() GitRunner =
+    GitRunner(Run = (args Array[string]) => runGitCmd(args))
+
+func runGitCmd(args Array[string]) ToolchainResult {
+    val gargs = args.ToGoSlice()
+    val c = exec.Command("git", gargs...)
+    val out, err = c.CombinedOutput()
+    val text = string(out)
+    if err == nil { return ToolchainResult(Ok = true, Output = text) }
+    return ToolchainResult(Ok = false, Output = text)
+}
+
+// RealRepoCloner builds the clone port over an injected git runner. The pure mapping
+// (build args -> run -> CloneResult) is the same whether the runner is real `git` or
+// a test fake.
+func RealRepoCloner(runner GitRunner) RepoCloner =
+    RepoCloner(Clone = (req CloneRequest) => realClone(runner, req))
+
+// realClone runs a shallow `git clone` of req.Url into req.Dest, pinning the branch/
+// tag when a Ref is given. Shallow (`--depth 1`) because the migration reads a
+// snapshot, not history. A red exit is surfaced with git's stderr.
+func realClone(runner GitRunner, req CloneRequest) CloneResult {
+    val res = runner.Run(cloneArgs(req))
+    if res.Ok { return Cloned(Path = req.Dest) }
+    return CloneFailed(Reason = "git clone exited non-zero:\n" + res.Output)
+}
+
+// cloneArgs assembles the `git clone` argv: a shallow clone, with `--branch <ref>`
+// only when a Ref is pinned (an empty Ref takes the repo's default branch).
+func cloneArgs(req CloneRequest) Array[string] {
+    val base = ArrayOf[string]("clone", "--depth", "1")
+    val withRef = if (req.Ref == "") base else base.AppendAll(ArrayOf[string]("--branch", req.Ref))
+    return withRef.AppendAll(ArrayOf[string](req.Url, req.Dest))
+}

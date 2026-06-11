@@ -1,0 +1,215 @@
+package engine
+
+// DEPENDENCY RESOLUTION — turn a cloned repo's manifest into the external modules it
+// depends on, each mapped (where possible) to the VCS repo it can be cloned from.
+//
+// The DependencyResolver port is EXTENSIBLE BY ECOSYSTEM: today only Go
+// (GoDependencyResolver parses `go.mod`'s `require` block), but a Maven / npm / Cargo
+// resolver slots in behind the same struct-of-func port with ZERO engine changes —
+// SelectResolver(ecosystem) is the single seam, mirroring SelectBackend.
+//
+// MAPPING TO A VCS URL is best-effort and HONEST: a module on a known VCS host
+// (github.com / gitlab.com / bitbucket.org) maps to its https repo URL; a module on
+// a host with no known mapping (a vanity import path, a private proxy) gets
+// RepoUrl = "" and is FLAGGED UNSUPPORTED downstream — never silently dropped
+// (product invariant: surface, don't guess). The forest decides what to do with an
+// unsupported node (park it as DepUnsupported); the resolver only reports the fact.
+//
+// Pure analysis except the resolver's single go.mod read (a deliberate IO edge, like
+// goscan); NO gala_tui, NO app/ui, no acp.*.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// ----------------------------------------------------------------------------
+// Value types
+// ----------------------------------------------------------------------------
+
+// DependencyId identifies one dependency for its whole lifecycle in the forest. Its
+// Value is the MODULE PATH (e.g. "github.com/x/y"), which is also the cycle-dedup
+// key — a module is visited at most once across the whole transitive resolution.
+struct DependencyId(Value string)
+
+// ModuleCoord is a module's coordinate: its module path and the required version.
+// (The ecosystem-neutral name "coordinate" — a Maven groupId:artifactId:version
+// would be the same shape — so the forest model does not bake in Go specifics.)
+struct ModuleCoord(
+    Module  string,
+    Version string,
+)
+
+// ModuleRequire is one parsed `require` entry: the module, its version, and whether
+// go.mod marked it `// indirect` (a transitive dependency not imported directly).
+struct ModuleRequire(
+    Module   string,
+    Version  string,
+    Indirect bool,
+)
+
+// DependencyNode is one resolved dependency: a stable id (the module path), its
+// coordinate, the VCS repo URL it can be cloned from ("" when no known VCS mapping
+// applies — the unsupported flag), and whether it is a DIRECT dependency of the
+// repo under resolution (vs. an `// indirect` transitive one).
+struct DependencyNode(
+    Id      DependencyId,
+    Coord   ModuleCoord,
+    RepoUrl string,
+    Direct  bool,
+)
+
+// IsResolvable reports whether a node mapped to a clonable VCS URL. A node that is
+// NOT resolvable is the "surface, don't guess" case: the forest parks it as
+// DepUnsupported with the reason rather than attempting a clone it cannot perform.
+func IsResolvable(n DependencyNode) bool = n.RepoUrl != ""
+
+// ResolveRequest is one resolution: the local path of a CLONED repo whose manifest
+// (go.mod) is read to discover its dependencies.
+struct ResolveRequest(
+    RepoPath string,
+)
+
+// DependencyGraph is the resolver's output: the dependency nodes discovered for one
+// repo. (A flat node list — the transitive EDGES are reconstructed by the forest as
+// it recurses, so the resolver stays a pure per-repo manifest read.)
+struct DependencyGraph(
+    Nodes Array[DependencyNode],
+)
+
+// DependencyResolver is the resolution port, tagged by Ecosystem so the forest can
+// pick the right one. A struct of one function value (the GALA-idiomatic port).
+struct DependencyResolver(
+    Ecosystem string,
+    Resolve   func(ResolveRequest) DependencyGraph,
+)
+
+// ----------------------------------------------------------------------------
+// Ecosystem selection — the single pluggable seam (mirrors SelectBackend)
+// ----------------------------------------------------------------------------
+
+// SelectResolver maps an ecosystem name to its DependencyResolver. Today only "go"
+// is implemented; any other name falls back to the Go resolver so the forest is
+// always driveable. A future Maven/npm resolver is added as one more branch here and
+// nothing else in the engine changes — the forest depends only on the port.
+func SelectResolver(ecosystem string) DependencyResolver {
+    if ecosystem == "go" { return GoDependencyResolver() }
+    return GoDependencyResolver()
+}
+
+// ----------------------------------------------------------------------------
+// The Go resolver
+// ----------------------------------------------------------------------------
+
+// GoDependencyResolver reads `<RepoPath>/go.mod`, parses its `require` block, and
+// maps each entry to a DependencyNode (resolving the VCS URL where the host is
+// known). A missing / unreadable go.mod yields an empty graph rather than a crash —
+// the same "degrade, don't fake" discipline as the scanner.
+func GoDependencyResolver() DependencyResolver =
+    DependencyResolver(
+        Ecosystem = "go",
+        Resolve   = (req ResolveRequest) => goResolve(req.RepoPath),
+    )
+
+func goResolve(repoPath string) DependencyGraph =
+    DependencyGraph(Nodes = requiresToNodes(parseRequires(readGoMod(repoPath))))
+
+func readGoMod(repoPath string) string =
+    fs.ReadFileString(path.Join(repoPath, "go.mod")).GetOrElse("")
+
+// requiresToNodes maps each parsed require to a node, resolving its VCS URL. This is
+// the single require -> node mapping, shared by the resolver and the forest's root
+// seeding (resolveForest), so both classify "resolvable vs unsupported" identically.
+func requiresToNodes(reqs Array[ModuleRequire]) Array[DependencyNode] =
+    reqs.Map((r ModuleRequire) => DependencyNode(
+        Id      = DependencyId(Value = r.Module),
+        Coord   = ModuleCoord(Module = r.Module, Version = r.Version),
+        RepoUrl = moduleToRepoUrl(r.Module),
+        Direct  = !r.Indirect,
+    ))
+
+// ----------------------------------------------------------------------------
+// go.mod require parsing (line-based — go/modfile is not reachable from GALA)
+// ----------------------------------------------------------------------------
+
+// requireScan is the fold state while walking go.mod lines: whether we are inside a
+// `require ( … )` block and the entries collected so far.
+struct requireScan(
+    InBlock  bool,
+    Requires Array[ModuleRequire],
+)
+
+// parseRequires recovers the dependency entries from go.mod. It reads only the
+// `require` section — a single `require x v` line or a `require ( … )` block — so a
+// `module` / `go` / `replace` line is never mistaken for a dependency.
+func parseRequires(content string) Array[ModuleRequire] {
+    val end = strings.Split(content, "\n").FoldLeft[requireScan](
+        requireScan(InBlock = false, Requires = EmptyArray[ModuleRequire]()),
+        (st requireScan, raw string) => stepRequire(st, strings.TrimSpace(raw)),
+    )
+    return end.Requires
+}
+
+func stepRequire(st requireScan, line string) requireScan = st.InBlock match {
+    case true  => (line == ")") match {
+        case true  => st.Copy(InBlock = false)
+        case false => appendRequire(st, line)
+    }
+    case false => strings.HasPrefix(line, "require") match {
+        case true  => strings.Contains(line, "(") match {
+            case true  => st.Copy(InBlock = true)
+            case false => appendRequire(st, stripRequireKeyword(line))
+        }
+        case false => st
+    }
+}
+
+// stripRequireKeyword drops the leading `require ` from a single-line require so the
+// remainder parses like an in-block entry ("github.com/x/y v1.2.3 // indirect").
+func stripRequireKeyword(line string) string =
+    strings.TrimSpace(strings.TrimPrefix(line, "require"))
+
+// appendRequire parses one require entry line ("<module> <version> [// indirect]")
+// and appends it. A line missing a module+version pair is skipped (a blank line, a
+// stray comment) rather than yielding a malformed node.
+func appendRequire(st requireScan, line string) requireScan {
+    val noComment = commentStripped(line)
+    val parts = strings.Fields(noComment)
+    if parts.Length() < 2 { return st }
+    return st.Copy(Requires = st.Requires.Append(ModuleRequire(
+        Module   = parts.Get(0),
+        Version  = parts.Get(1),
+        Indirect = strings.Contains(line, "// indirect"),
+    )))
+}
+
+// commentStripped removes a trailing `// …` comment so Fields sees only the
+// module+version tokens. Split on "//" and keep the part before it (Split always
+// returns at least the whole string, so Get(0) is total).
+func commentStripped(line string) string =
+    strings.TrimSpace(strings.Split(line, "//").Get(0))
+
+// ----------------------------------------------------------------------------
+// Module path -> VCS repo URL
+// ----------------------------------------------------------------------------
+
+// moduleToRepoUrl maps a module path to the https VCS repo it lives in, for the
+// hosts whose layout is "host/owner/repo[/subpath…]" (the repo is the first three
+// segments). An unknown host yields "" — the explicit unsupported signal, NOT a
+// guessed URL. Examples:
+//   github.com/x/y        -> https://github.com/x/y
+//   github.com/x/y/v2     -> https://github.com/x/y      (the major-version subpath
+//                                                          is inside the same repo)
+//   golang.org/x/tools    -> ""                           (vanity host — unsupported)
+func moduleToRepoUrl(module string) string {
+    val segs = strings.Split(module, "/")
+    if segs.Length() < 3 { return "" }
+    if !knownVcsHost(segs.Get(0)) { return "" }
+    return "https://" + segs.Get(0) + "/" + segs.Get(1) + "/" + segs.Get(2)
+}
+
+func knownVcsHost(host string) bool =
+    host == "github.com" || host == "gitlab.com" || host == "bitbucket.org"

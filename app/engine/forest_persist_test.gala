@@ -1,0 +1,146 @@
+package engine
+
+// Tests for forest checkpoint persistence: a forest spanning EVERY DepResolution case
+// (including an in-flight DepAssimilating run and a DepResolved workspace) round-trips
+// to disk and back byte-for-byte; Missing and Corrupt are distinct, never a crash; and
+// the port methods (ResolveDeps / SaveForest / LoadForest) are wired and callable.
+// Real filesystem IO in fresh temp dirs (the suite does not stage testdata/).
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+func tempForestDir() string = fs.MkdirTemp("", "gala_forest_ckpt").GetOrElse("")
+
+func depNode(module string, url string) DependencyNode =
+    DependencyNode(
+        Id      = DependencyId(Value = module),
+        Coord   = ModuleCoord(Module = module, Version = "v1.0.0"),
+        RepoUrl = url,
+        Direct  = true,
+    )
+
+// allStatesForest builds a forest with one node in EACH DepResolution case, so the
+// round-trip exercises every encoder branch — including a real embedded RunState
+// (advanced a couple of ticks) and a real embedded WorkspaceModel.
+func allStatesForest() DependencyForest {
+    val ws  = ScanGoWorkspace(materializeFixture())
+    val run = advance(MockTranslator(), MockVerifier(), DefaultMaxAttempts(),
+              advance(MockTranslator(), MockVerifier(), DefaultMaxAttempts(),
+              runFor(goPlanFor(ws))))
+    val deps = ArrayOf[DependencyRun](
+        DependencyRun(Node = depNode("github.com/a/pending", "https://github.com/a/pending"), Dest = "/d/pending", Status = DepPending(),       Depth = 1, Children = EmptyArray[DependencyId]()),
+        DependencyRun(Node = depNode("github.com/a/cloning", "https://github.com/a/cloning"), Dest = "/d/cloning", Status = DepCloning(),       Depth = 1, Children = EmptyArray[DependencyId]()),
+        DependencyRun(Node = depNode("github.com/a/resolved","https://github.com/a/resolved"),Dest = "/d/resolved",Status = DepResolved(Workspace = ws), Depth = 1, Children = EmptyArray[DependencyId]()),
+        DependencyRun(Node = depNode("github.com/a/assim",   "https://github.com/a/assim"),   Dest = "/d/assim",   Status = DepAssimilating(Run = run), Depth = 1, Children = ArrayOf[DependencyId](DependencyId(Value = "github.com/a/child"))),
+        DependencyRun(Node = depNode("github.com/a/done",    "https://github.com/a/done"),    Dest = "/d/done",    Status = DepDone(),          Depth = 2, Children = EmptyArray[DependencyId]()),
+        DependencyRun(Node = depNode("github.com/a/skipped", "https://github.com/a/skipped"), Dest = "/d/skipped", Status = DepSkipped(),       Depth = 2, Children = EmptyArray[DependencyId]()),
+        DependencyRun(Node = depNode("golang.org/x/uns",     ""),                             Dest = "/d/uns",     Status = DepUnsupported(Reason = "no VCS host mapping"), Depth = 1, Children = EmptyArray[DependencyId]()),
+        DependencyRun(Node = depNode("github.com/a/failed",  "https://github.com/a/failed"),  Dest = "/d/failed",  Status = DepFailed(Reason = "clone failed: boom"), Depth = 1, Children = EmptyArray[DependencyId]()),
+    )
+    return rebuildForest(
+        deps,
+        ArrayOf[string]("example.com/root", "github.com/a/pending", "github.com/a/done"),
+        DefaultMaxDepth(),
+        "/deps/base",
+    )
+}
+
+// Save then Load reconstructs a forest whose re-encoding is byte-for-byte identical —
+// the encoding is deterministic and faithful across all eight DepResolution cases plus
+// the nested RunState / WorkspaceModel.
+func TestForestRoundTripExact(t T) T {
+    val p = path.Join(tempForestDir(), "forest.json")
+    val forest = allStatesForest()
+    val t1 = Eq(t, saveForest(forest, p), true)
+    return loadForest(p) match {
+        case ForestLoaded(f2) => {
+            val t2 = Eq(t1, f2.Deps.Length(), forest.Deps.Length())
+            val t3 = Eq(t2, f2.MaxDepth, forest.MaxDepth)
+            val t4 = Eq(t3, f2.DepsBase, forest.DepsBase)
+            return Eq(t4, encodeForest(f2), encodeForest(forest))
+        }
+        case ForestMissing()  => Fail(t1, "expected ForestLoaded, got ForestMissing")
+        case ForestCorrupt(r) => Fail(t1, "expected ForestLoaded, got ForestCorrupt: " + r)
+    }
+}
+
+// The derived DepMap is rebuilt on load (not serialized) and resolves every node.
+func TestForestRoundTripRebuildsMap(t T) T {
+    val p = path.Join(tempForestDir(), "map.json")
+    val forest = allStatesForest()
+    val t1 = Eq(t, saveForest(forest, p), true)
+    return loadForest(p) match {
+        case ForestLoaded(f2) => {
+            val t2 = Eq(t1, f2.DepMap.Size(), forest.Deps.Length())
+            return f2.DepMap.Get("github.com/a/assim") match {
+                case Some(_) => IsTrue(t2, true)
+                case None()  => Fail(t2, "the rebuilt DepMap must resolve every node")
+            }
+        }
+        case ForestMissing()  => Fail(t1, "expected ForestLoaded, got ForestMissing")
+        case ForestCorrupt(r) => Fail(t1, "expected ForestLoaded, got ForestCorrupt: " + r)
+    }
+}
+
+// An absent path loads as ForestMissing — distinct from corruption.
+func TestForestLoadMissing(t T) T {
+    return loadForest(path.Join(tempForestDir(), "nope.json")) match {
+        case ForestMissing()  => IsTrue(t, true)
+        case ForestLoaded(_)  => Fail(t, "no file -> ForestMissing")
+        case ForestCorrupt(_) => Fail(t, "no file -> ForestMissing, not Corrupt")
+    }
+}
+
+// A present-but-garbage file loads as ForestCorrupt (decoder fails out to a Try),
+// never a crash.
+func TestForestLoadCorrupt(t T) T {
+    val p = path.Join(tempForestDir(), "bad.json")
+    fs.WriteFileString(p, "{ not a forest ", 420)
+    return loadForest(p) match {
+        case ForestCorrupt(_) => IsTrue(t, true)
+        case ForestLoaded(_)  => Fail(t, "garbage must load as ForestCorrupt")
+        case ForestMissing()  => Fail(t, "the file exists -> Corrupt, not Missing")
+    }
+}
+
+// A wrong-version-but-valid-JSON file is Corrupt (surface, don't guess).
+func TestForestLoadWrongVersion(t T) T {
+    val p = path.Join(tempForestDir(), "v9.json")
+    fs.WriteFileString(p, "{\"v\":9,\"maxDepth\":1,\"depsBase\":\"\",\"visited\":[],\"deps\":[]}", 420)
+    return loadForest(p) match {
+        case ForestCorrupt(_) => IsTrue(t, true)
+        case ForestLoaded(_)  => Fail(t, "an unknown version must be Corrupt")
+        case ForestMissing()  => Fail(t, "the file exists -> Corrupt, not Missing")
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Port wiring: ResolveDeps / SaveForest / LoadForest reachable through EnginePort.
+// ----------------------------------------------------------------------------
+
+// GoEngine().ResolveDeps reads the real root go.mod into a pending forest (one direct
+// dependency), through the port — no clone, no network.
+func TestResolveDepsThroughPort(t T) T {
+    val root  = materializeForestRoot("require github.com/acme/depa v1.0.0\n")
+    val model = GoEngine().Scan(ScanRequest(Root = root))
+    val forest = GoEngine().ResolveDeps(model)
+    return Eq(t, forest.Deps.Length(), 1)
+}
+
+// SaveForest / LoadForest are wired on the offline MockEngine and round-trip a forest.
+func TestForestCheckpointThroughPort(t T) T {
+    val eng = MockEngine()
+    val p = path.Join(tempForestDir(), "port.json")
+    val forest = allStatesForest()
+    val t1 = Eq(t, eng.SaveForest(forest, p), true)
+    return eng.LoadForest(p) match {
+        case ForestLoaded(f2) => Eq(t1, encodeForest(f2), encodeForest(forest))
+        case ForestMissing()  => Fail(t1, "expected ForestLoaded, got ForestMissing")
+        case ForestCorrupt(r) => Fail(t1, "expected ForestLoaded, got ForestCorrupt: " + r)
+    }
+}
