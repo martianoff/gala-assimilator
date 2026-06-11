@@ -122,11 +122,11 @@ func TestForestDepthBoundSurfacesSkip(t T) T {
     val final = driveForest(seed)
     val t1 = Eq(t, ForestComplete(final), true)
     val t2 = depRun(final, depaModule) match {
-        case Some(d) => isDepDone(t1, d)
+        case Some(d) => assertDepDone(t1, d)
         case None()  => Fail(t1, "expected a depA node")
     }
     return depRun(final, depbModule) match {
-        case Some(d) => isDepSkipped(t2, d)
+        case Some(d) => assertDepSkipped(t2, d)
         case None()  => Fail(t2, "a beyond-depth dependency must be surfaced (DepSkipped), not dropped")
     }
 }
@@ -155,12 +155,12 @@ func TestActOnDependencySkipThenResolve(t T) T {
 
     val skipped = actOnDependency(seed, id, SkipDep())
     val t1 = depRun(skipped, depaModule) match {
-        case Some(d) => isDepSkipped(t, d)
+        case Some(d) => assertDepSkipped(t, d)
         case None()  => Fail(t, "expected depA node")
     }
     val resolved = actOnDependency(skipped, id, ResolveDep())
     return depRun(resolved, depaModule) match {
-        case Some(d) => isDepPending(t1, d)
+        case Some(d) => assertDepPending(t1, d)
         case None()  => Fail(t1, "expected depA node")
     }
 }
@@ -172,12 +172,12 @@ func TestActOnDependencyRetryAfterFailure(t T) T {
     val seed = resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), DefaultMaxDepth())
     val failed = advanceForest(EmptyMockRepoCloner(), GoDependencyResolver(), MockTranslator(), MockVerifier(), DefaultMaxAttempts(), seed)
     val t1 = depRun(failed, depaModule) match {
-        case Some(d) => isDepFailed(t, d)
+        case Some(d) => assertDepFailed(t, d)
         case None()  => Fail(t, "expected depA node")
     }
     val retried = actOnDependency(failed, DependencyId(Value = depaModule), RetryDep())
     return depRun(retried, depaModule) match {
-        case Some(d) => isDepPending(t1, d)
+        case Some(d) => assertDepPending(t1, d)
         case None()  => Fail(t1, "expected depA node")
     }
 }
@@ -190,14 +190,14 @@ func TestActOnDependencyExpandGrowsSubtree(t T) T {
     val bounded = driveForest(seed)
     // depB was skipped at the bound.
     val t1 = depRun(bounded, depbModule) match {
-        case Some(d) => isDepSkipped(t, d)
+        case Some(d) => assertDepSkipped(t, d)
         case None()  => Fail(t, "expected a depth-skipped depB node")
     }
     val expanded = actOnDependency(bounded, DependencyId(Value = depbModule), ExpandDep())
     val t2 = Eq(t1, expanded.MaxDepth, 2)
     val final = driveForest(expanded)
     return depRun(final, depbModule) match {
-        case Some(d) => isDepDone(t2, d)
+        case Some(d) => assertDepDone(t2, d)
         case None()  => Fail(t2, "expected depB node")
     }
 }
@@ -209,22 +209,22 @@ func TestActOnDependencyExpandGrowsSubtree(t T) T {
 func depRun(forest DependencyForest, module string) Option[DependencyRun] =
     forest.DepMap.Get(module)
 
-func isDepDone(t T, d DependencyRun) T = d.Status match {
+func assertDepDone(t T, d DependencyRun) T = d.Status match {
     case DepDone() => IsTrue(t, true)
     case _         => Fail(t, "expected DepDone")
 }
 
-func isDepSkipped(t T, d DependencyRun) T = d.Status match {
+func assertDepSkipped(t T, d DependencyRun) T = d.Status match {
     case DepSkipped() => IsTrue(t, true)
     case _            => Fail(t, "expected DepSkipped")
 }
 
-func isDepPending(t T, d DependencyRun) T = d.Status match {
+func assertDepPending(t T, d DependencyRun) T = d.Status match {
     case DepPending() => IsTrue(t, true)
     case _            => Fail(t, "expected DepPending")
 }
 
-func isDepFailed(t T, d DependencyRun) T = d.Status match {
+func assertDepFailed(t T, d DependencyRun) T = d.Status match {
     case DepFailed(_) => IsTrue(t, true)
     case _            => Fail(t, "expected DepFailed")
 }

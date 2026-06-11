@@ -291,6 +291,19 @@ func isDepTerminal(s DepResolution) bool = s match {
     case DepAssimilating(_) => false
 }
 
+// isDepDone is the single "this dependency finished" classifier, reused by the count
+// projection (and a clearer read than re-matching all eight cases inline).
+func isDepDone(s DepResolution) bool = s match {
+    case DepDone()          => true
+    case DepPending()       => false
+    case DepCloning()       => false
+    case DepResolved(_)     => false
+    case DepAssimilating(_) => false
+    case DepSkipped()       => false
+    case DepUnsupported(_)  => false
+    case DepFailed(_)       => false
+}
+
 // ForestComplete is the forest fixpoint: every dependency has settled into a terminal
 // status. AdvanceForest is a no-op once it holds.
 func ForestComplete(forest DependencyForest) bool =
@@ -299,7 +312,7 @@ func ForestComplete(forest DependencyForest) bool =
 // forestStepBudget is a safety backstop bounding AdvanceForestToCompletion's loop so
 // a malformed forest (a hand-built DepCloning the engine never produces) can't spin
 // forever. It is far above any real forest's step count.
-func forestStepBudget(forest DependencyForest) int = 10000
+func forestStepBudget() int = 10000
 
 // AdvanceForestToCompletion advances a forest until ForestComplete — the forest
 // analogue of RunToCompletion. It terminates because the transitive closure is bounded
@@ -316,7 +329,7 @@ func AdvanceForestToCompletion(
     var f = forest
     var i = 0
     var more = !ForestComplete(f)
-    for more && i < forestStepBudget(f) {
+    for more && i < forestStepBudget() {
         f = advanceForest(cloner, resolver, runner, verifier, maxAttempts, f)
         more = !ForestComplete(f)
         i = i + 1
@@ -328,16 +341,7 @@ func AdvanceForestToCompletion(
 
 // CountDepsDone is how many dependencies reached DepDone.
 func CountDepsDone(forest DependencyForest) int =
-    forest.Deps.Count((d DependencyRun) => d.Status match {
-        case DepDone()          => true
-        case DepPending()       => false
-        case DepCloning()       => false
-        case DepResolved(_)     => false
-        case DepAssimilating(_) => false
-        case DepSkipped()       => false
-        case DepUnsupported(_)  => false
-        case DepFailed(_)       => false
-    })
+    forest.Deps.Count((d DependencyRun) => isDepDone(d.Status))
 
 // ----------------------------------------------------------------------------
 // Operator actions on a node (ActOnDependency)

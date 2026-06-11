@@ -91,14 +91,12 @@ struct DependencyResolver(
 // Ecosystem selection — the single pluggable seam (mirrors SelectBackend)
 // ----------------------------------------------------------------------------
 
-// SelectResolver maps an ecosystem name to its DependencyResolver. Today only "go"
-// is implemented; any other name falls back to the Go resolver so the forest is
-// always driveable. A future Maven/npm resolver is added as one more branch here and
-// nothing else in the engine changes — the forest depends only on the port.
-func SelectResolver(ecosystem string) DependencyResolver {
-    if ecosystem == "go" { return GoDependencyResolver() }
-    return GoDependencyResolver()
-}
+// SelectResolver maps an ecosystem name to its DependencyResolver — the single
+// pluggable seam. Today the Go resolver is the only implementation, so every
+// ecosystem resolves to it; a future Maven/npm resolver is added as a branch here on
+// `ecosystem` and nothing else in the engine changes (the forest depends only on the
+// port). The parameter is the seam's stable API even while there is one impl.
+func SelectResolver(ecosystem string) DependencyResolver = GoDependencyResolver()
 
 // ----------------------------------------------------------------------------
 // The Go resolver
