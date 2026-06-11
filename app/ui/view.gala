@@ -29,6 +29,7 @@ func view(m Model) Widget {
     if (route == RouteS4()) { return s4View(m) }
     if (route == RouteS5()) { return s5View(m) }
     if (route == RouteS6()) { return s6View(m) }
+    if (route == RouteS7()) { return s7View(m) }
     return resizeNotice(m)
 }
 
@@ -77,34 +78,46 @@ func s0Corrupt(offer runview.LoadSummary) Widget =
     )))
 
 func maxI(a int, b int) int = if (a > b) a else b
+func minI(a int, b int) int = if (a < b) a else b
 
 // ============================================================================
 // S1 — Setup / Interview
 // ============================================================================
 
+// s1View groups the interview into SOURCE / TARGET / OPTIONS sections, each a
+// cyan heading over indented fields, and closes with a primary scan action and a
+// key-hint footer so the keyboard model (tab/arrows/enter) is discoverable. When
+// wide, retry + agent share one aligned row; when narrow they stack.
 func s1View(m Model) Widget {
     val combined = m.Cols >= WideCols()
-    val mid = if (combined)
-        ArrayOf[LayoutChild](Fixed(1, retryBackendRow(m)))
+    val options = if (combined)
+        ArrayOf[LayoutChild](
+            Fixed(1, unsupportedRow(m)),
+            Fixed(1, ambiguityRow(m)),
+            Fixed(1, retryBackendRow(m)),
+        )
     else
         ArrayOf[LayoutChild](
+            Fixed(1, unsupportedRow(m)),
+            Fixed(1, ambiguityRow(m)),
             Fixed(1, retryRow(m)),
             Fixed(1, backendRow(m)),
         )
-    val top = ArrayOf[LayoutChild](
+    val head = ArrayOf[LayoutChild](
         Fixed(1, headerRow("Gala Assimilator — new migration")),
-        Fixed(1, Text("")),
+        Fixed(1, sectionRow("SOURCE")),
         Fixed(1, sourceRow(m)),
         Fixed(1, detectedRow(m)),
+        Fixed(1, sectionRow("TARGET")),
         Fixed(1, targetRow(m)),
-        Fixed(1, unsupportedRow(m)),
+        Fixed(1, sectionRow("OPTIONS")),
     )
     val tail = ArrayOf[LayoutChild](
-        Fixed(1, ambiguityRow(m)),
         Fixed(1, Text("")),
         Fixed(1, scanRow(m)),
+        Fixed(1, s1Footer()),
     )
-    val children = top.AppendAll(mid).AppendAll(tail)
+    val children = head.AppendAll(options).AppendAll(tail)
     return Border(Column(children))
 }
 
@@ -115,22 +128,33 @@ func headerRow(title string) Widget =
         Fixed(8, TextStyled("q quit ", DefaultStyle().WithDim())),
     ))
 
-func labelW() int = 17
+func s1Footer() Widget =
+    TextStyled("  tab move · ←→ change · enter select · q quit", DefaultStyle().WithDim())
 
-func fieldRow(label string, control Widget) Widget =
+// sectionRow is a cyan section heading; the fields beneath it indent one level
+// further (subFieldRow) so the grouping reads at a glance.
+func sectionRow(title string) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Fixed(labelW(), TextStyled(label, DefaultStyle().WithDim())),
+        Flex(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan()))),
+    ))
+
+func subLabelW() int = 14
+
+func subFieldRow(label string, control Widget) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(4, Text("")),
+        Fixed(subLabelW(), TextStyled(label, DefaultStyle().WithDim())),
         Flex(1, control),
     ))
 
 func sourceRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneBrowse())
     return Row(ArrayOf[LayoutChild](
-        Fixed(2, Text("")),
-        Fixed(labelW(), TextStyled("Source project", DefaultStyle().WithDim())),
+        Fixed(4, Text("")),
+        Fixed(subLabelW(), TextStyled("Project", DefaultStyle().WithDim())),
         Flex(1, TextStyled(m.SourceDir, DefaultStyle())),
-        Fixed(12, btnWidget("browse", focused, MBrowse())),
+        Fixed(12, btnWidget("browse…", focused, MBrowse())),
     ))
 }
 
@@ -138,27 +162,29 @@ func detectedRow(m Model) Widget {
     val info = m.Source
     val text = if (info.Detected)
         s"${info.Lang}  (${info.Marker}, ${info.FileCnt} files)"
-    else
+    else if (info.Marker == "")
         "—  (no recognised project)"
+    else
+        "—  (" + info.Marker + ")"
     val mark = if (info.Detected) " ✓" else " ✗"
     val markStyle = if (info.Detected)
         DefaultStyle().WithFg(BrightGreen())
     else
         DefaultStyle().WithFg(BrightYellow())
     return Row(ArrayOf[LayoutChild](
-        Fixed(2, Text("")),
-        Fixed(labelW(), TextStyled("Detected source", DefaultStyle().WithDim())),
+        Fixed(4, Text("")),
+        Fixed(subLabelW(), TextStyled("Detected", DefaultStyle().WithDim())),
         Flex(1, TextStyled(text, DefaultStyle())),
         Fixed(3, TextStyled(mark, markStyle)),
     ))
 }
 
 func targetRow(m Model) Widget =
-    fieldRow("Target language",
+    subFieldRow("Language",
         cyclerWidget(m.TargetLang(), m.Focus.IsFocused(PaneTarget()), MCycleTarget()))
 
 func ambiguityRow(m Model) Widget =
-    fieldRow("Ambiguity",
+    subFieldRow("Ambiguity",
         cyclerWidget(m.Ambiguity(), m.Focus.IsFocused(PaneAmbiguity()), MCycleAmbiguity()))
 
 func unsupportedRow(m Model) Widget {
@@ -171,7 +197,7 @@ func unsupportedRow(m Model) Widget {
         radioCell(isSkip, f, "skip",            MSetUnsupported(P = SkipUnit())),
         radioCell(isStop, f, "stop",            MSetUnsupported(P = StopAll())),
     ))
-    return fieldRow("Unsupported", group)
+    return subFieldRow("Unsupported", group)
 }
 
 func backendGroup(m Model) Widget {
@@ -192,18 +218,21 @@ func retryControl(m Model) Widget =
         Fixed(10, TextStyled(" per unit", DefaultStyle().WithDim())),
     ))
 
+// retryBackendRow keeps retry and agent on one row when wide, but anchors the
+// agent group right after its label (a small fixed gap, not a screen-edge Flex)
+// so it reads as part of the form instead of floating off to the right.
 func retryBackendRow(m Model) Widget =
     Row(ArrayOf[LayoutChild](
-        Fixed(2, Text("")),
-        Fixed(labelW(), TextStyled("Retry budget", DefaultStyle().WithDim())),
+        Fixed(4, Text("")),
+        Fixed(subLabelW(), TextStyled("Retry", DefaultStyle().WithDim())),
         Fixed(18, retryControl(m)),
-        Flex(1, Text("")),
-        Fixed(15, TextStyled("Agent backend", DefaultStyle().WithDim())),
-        Fixed(32, backendGroup(m)),
+        Fixed(3, Text("")),
+        Fixed(8, TextStyled("Agent", DefaultStyle().WithDim())),
+        Flex(1, backendGroup(m)),
     ))
 
-func retryRow(m Model) Widget = fieldRow("Retry budget", retryControl(m))
-func backendRow(m Model) Widget = fieldRow("Agent backend", backendGroup(m))
+func retryRow(m Model) Widget = subFieldRow("Retry", retryControl(m))
+func backendRow(m Model) Widget = subFieldRow("Agent", backendGroup(m))
 
 func scanRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneScan())
@@ -231,6 +260,7 @@ func s2Empty(m Model) Widget =
     Border(TextStyled("  (no plan — scan a project first)", DefaultStyle().WithDim()))
 
 func s2Board(m Model, pv runview.PlanVM) Widget {
+    if (pv.Units == 0) { return s2EmptyPlan(m, pv) }
     val itemRows = pv.Items.Map((id) =>
         Fixed(1, TextStyled("   • " + id, DefaultStyle())))
     val head = ArrayOf[LayoutChild](
@@ -248,6 +278,33 @@ func s2Board(m Model, pv runview.PlanVM) Widget {
     val children = head.AppendAll(itemRows).AppendAll(foot)
     return Border(Column(children))
 }
+
+// s2EmptyPlan is the "we scanned, but there's nothing to migrate" state. The
+// scan succeeded — it just found no source units — so this is a dead end the
+// user must back out of, not a run to start. There is no start affordance, only
+// a clear explanation and a way back to pick another folder.
+func s2EmptyPlan(m Model, pv runview.PlanVM) Widget =
+    Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Migration plan — nothing to migrate")),
+        Fixed(1, Text("")),
+        Fixed(1, kvRow("Source", m.SourceDir)),
+        Fixed(1, kvRow("Scanned", s"${pv.Packages} packages · 0 migratable units")),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("  ⚠ No migratable units were found in this project.",
+            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+        Fixed(1, TextStyled("    This folder doesn't look like a Go source project",
+            DefaultStyle().WithDim())),
+        Fixed(1, TextStyled("    — no .go files were detected under it.",
+            DefaultStyle().WithDim())),
+        Fixed(1, Text("")),
+        Fixed(1, Row(ArrayOf[LayoutChild](
+            Fixed(2, Text("")),
+            Fixed(30, btnWidget("← back & choose a folder", true, MBack())),
+            Flex(1, Text("")),
+        ))),
+        Flex(1, Text("")),
+        Fixed(1, TextStyled("  esc back · q quit", DefaultStyle().WithDim())),
+    )))
 
 func kvRow(label string, value string) Widget =
     Row(ArrayOf[LayoutChild](
@@ -275,6 +332,7 @@ func s3View(m Model) Widget = m.Run match {
 }
 
 func s3Board(m Model, rv runview.RunVM) Widget {
+    if (rv.Total == 0) { return s3Empty() }
     val board = if (m.Cols >= WideCols()) splitBoard(m, rv) else stackedBoard(m, rv)
     return Border(Column(ArrayOf[LayoutChild](
         Fixed(1, headerRow("Assimilation in progress")),
@@ -286,6 +344,21 @@ func s3Board(m Model, rv runview.RunVM) Widget {
         Fixed(1, s3Footer()),
     )))
 }
+
+// s3Empty guards the degenerate run (no units — e.g. a resumed empty checkpoint):
+// a 0/0 board would read as a finished migration, so say plainly there was nothing
+// to do rather than show a misleading "complete ✓".
+func s3Empty() Widget =
+    Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Assimilation — nothing to do")),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("  This run has no units — nothing was migrated.",
+            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+        Fixed(1, TextStyled("  Go back and scan a project that has source to translate.",
+            DefaultStyle().WithDim())),
+        Flex(1, Text("")),
+        Fixed(1, TextStyled("  esc back · q quit", DefaultStyle().WithDim())),
+    )))
 
 // ----- pipeline-step breadcrumb ---------------------------------------------
 
@@ -682,6 +755,90 @@ func s6Board(m Model, rv runview.RunVM) Widget {
 }
 
 // ============================================================================
+// S7 — Directory browser (the source-project picker)
+//
+// A scrollable list of the current directory's sub-directories (".." first), each
+// flagged when it looks like a project root. Cursor + actions are both mouse- and
+// keyboard-reachable: click a row to highlight, the buttons / keys open (descend),
+// select (commit), or cancel. The header always shows the folder being listed so
+// "select" is unambiguous.
+// ============================================================================
+
+func s7View(m Model) Widget = m.Browse match {
+    case Some(b) => s7Board(m, b)
+    case None()  => Border(TextStyled("  (no directory)", DefaultStyle().WithDim()))
+}
+
+func s7Board(m Model, b BrowseState) Widget =
+    Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Choose source project")),
+        Fixed(1, kvRow("Folder", b.Dir)),
+        Fixed(1, Text("")),
+        Flex(1, browseList(m, b)),
+        Fixed(1, Text("")),
+        Fixed(1, s7Buttons()),
+        Fixed(1, TextStyled("  ↑↓ move · enter open · s select · ← parent · esc cancel",
+            DefaultStyle().WithDim())),
+    )))
+
+// browseList renders a window of the entries around the cursor (so a deep
+// directory still scrolls), or a loading / empty notice.
+func browseList(m Model, b BrowseState) Widget {
+    val total = b.Entries.Length()
+    if (total == 0) {
+        val msg = if (b.Loading) "  scanning filesystem…" else "  (no sub-directories here)"
+        return Column(ArrayOf[LayoutChild](Fixed(1, TextStyled(msg, DefaultStyle().WithDim()))))
+    }
+    val avail = maxI(1, m.Rows - 9)
+    val start = browseWindowStart(b.Cursor, avail, total)
+    val end = minI(total, start + avail)
+    val rows = ArrayTabulate[LayoutChild](end - start, (k int) => {
+        val idx = start + k
+        return Fixed(1, browseRow(b, idx))
+    })
+    return Column(rows)
+}
+
+// browseWindowStart keeps the cursor inside the visible window, clamped so the
+// last page doesn't scroll past the end.
+func browseWindowStart(cursor int, avail int, total int) int {
+    if (total <= avail) { return 0 }
+    val s = cursor - avail / 2
+    if (s < 0) { return 0 }
+    val maxStart = total - avail
+    if (s > maxStart) { return maxStart }
+    return s
+}
+
+func browseRow(b BrowseState, idx int) Widget {
+    val e = b.Entries.Get(idx)
+    val selected = idx == b.Cursor
+    val caret = if (selected) "▸ " else "  "
+    val name = if (e.IsParent) ".." else e.Name + "/"
+    val marker = if (e.Marker == "") "" else "   (" + e.Marker + ")"
+    val text = "  " + caret + name + marker
+    val style = browseRowStyle(selected, e.Marker != "")
+    return TextStyled(text, style).OnClick(MBrowseClick(Idx = idx))
+}
+
+func browseRowStyle(selected bool, isProject bool) Style {
+    if (selected) { return DefaultStyle().WithReverse().WithBold() }
+    if (isProject) { return DefaultStyle().WithFg(BrightGreen()) }
+    return DefaultStyle()
+}
+
+func s7Buttons() Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(12, btnWidget("open ▸", false, MBrowseOpen())),
+        Fixed(2, Text("")),
+        Fixed(14, btnWidget("select ✓", false, MBrowseSelect())),
+        Fixed(2, Text("")),
+        Fixed(12, btnWidget("cancel", false, MBack())),
+        Flex(1, Text("")),
+    ))
+
+// ============================================================================
 // Shared control primitives
 // ============================================================================
 
@@ -695,7 +852,7 @@ func btnWidget(label string, focused bool, msg Msg) Widget {
 }
 
 func cyclerWidget(value string, focused bool, msg Msg) Widget {
-    val txt = "‹ " + value + " ▾ ›"
+    val txt = "‹ " + value + " ›"
     val style = if (focused)
         DefaultStyle().WithReverse().WithBold()
     else

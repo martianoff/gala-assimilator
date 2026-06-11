@@ -28,7 +28,7 @@ func TestKeyboardCyclesTargetLanguage(t T) T {
     val t1 = Eq(t, s.Model.TargetLang(), "TypeScript")
     // View reflects the new selection.
     val out = str.S(Snapshot(view(s.Model), 110, 20))
-    return IsTrue(t1, out.Contains("‹ TypeScript ▾ ›"))
+    return IsTrue(t1, out.Contains("‹ TypeScript ›"))
 }
 
 // Mouse: clicking the "skip" radio selects the Skip policy (no keyboard used).

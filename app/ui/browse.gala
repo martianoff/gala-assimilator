@@ -1,0 +1,211 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// ============================================================================
+// S7 — directory browser (the real source-project picker).
+//
+// Replaces the old "cycle three hardcoded paths" Browse stub with a navigable
+// directory tree backed by real filesystem IO. All IO (listing a directory,
+// detecting a project root) is wrapped in an Async Cmd so it never runs on the
+// pure Update path — the same discipline the engine scan follows. On commit, a
+// real project detection (go.mod / package.json / Cargo.toml + a recursive file
+// count) replaces the cosmetic detectSource stub, so the S1 readout reflects the
+// directory the user actually chose rather than a fixed stand-in.
+// ============================================================================
+
+// ----- opening / navigating -------------------------------------------------
+
+// openBrowse pushes the picker (in a loading state) and kicks off the listing of
+// the source directory's parent, so the current project shows among its siblings.
+func openBrowse(m Model) Tuple[Model, Cmd[Msg]] {
+    val loading = BrowseState(
+        Dir     = m.SourceDir,
+        Entries = EmptyArray[BrowseEntry](),
+        Cursor  = 0,
+        Loading = true,
+    )
+    val m2 = m.Copy(
+        Browse  = Some(loading),
+        Focus   = m.Focus.FocusOn(PaneBrowse()),
+        Screens = m.Screens.Push(RouteS7()),
+    )
+    return (m2, openBrowseCmd(m.SourceDir))
+}
+
+// browseLoaded swaps in a completed listing.
+func browseLoaded(m Model, st BrowseState) Model = m.Copy(Browse = Some(st))
+
+// browseHighlight moves the cursor to a clicked row.
+func browseHighlight(m Model, i int) Model = m.Browse match {
+    case Some(b) => {
+        val hi = browseHi(b)
+        return m.Copy(Browse = Some(b.Copy(Cursor = clampInt(i, 0, hi))))
+    }
+    case None() => m
+}
+
+// browseMove steps the cursor (arrow keys / wheel).
+func browseMove(m Model, dir int) Model = m.Browse match {
+    case Some(b) => {
+        val hi = browseHi(b)
+        return m.Copy(Browse = Some(b.Copy(Cursor = clampInt(b.Cursor + dir, 0, hi))))
+    }
+    case None() => m
+}
+
+// browseOpen descends into the highlighted entry (Enter / [open] / ArrowRight).
+// The ".." entry's Path is already the parent, so it just re-lists upward.
+func browseOpen(m Model) Tuple[Model, Cmd[Msg]] = m.Browse match {
+    case Some(b) => {
+        if (b.Entries.IsEmpty()) { return noCmd(m) }
+        val e = b.Entries.Get(clampInt(b.Cursor, 0, browseHi(b)))
+        return (m, browseCmd(e.Path))
+    }
+    case None() => noCmd(m)
+}
+
+// browseParent re-lists the parent of the current directory (ArrowLeft).
+func browseParent(m Model) Tuple[Model, Cmd[Msg]] = m.Browse match {
+    case Some(b) => {
+        val up = path.Dir(b.Dir)
+        if (up == b.Dir) { return noCmd(m) }
+        return (m, browseCmd(up))
+    }
+    case None() => noCmd(m)
+}
+
+// browseSelect commits the highlighted directory as the source project: it pops
+// back to S1 with the path set and a "detecting…" readout, then kicks off the
+// real project detection off the loop.
+func browseSelect(m Model) Tuple[Model, Cmd[Msg]] = m.Browse match {
+    case Some(b) => {
+        val target = browseTarget(b)
+        val m2 = m.Copy(
+            SourceDir = target,
+            Source    = detectingInfo(),
+            Browse    = None[BrowseState](),
+            Screens   = m.Screens.Pop(),
+        )
+        return (m2, detectCmd(target))
+    }
+    case None() => noCmd(m)
+}
+
+// browseTarget is the path the picker commits: the highlighted entry, or the
+// current directory itself when the listing is empty.
+func browseTarget(b BrowseState) string {
+    if (b.Entries.IsEmpty()) { return b.Dir }
+    return b.Entries.Get(clampInt(b.Cursor, 0, browseHi(b))).Path
+}
+
+func browseHi(b BrowseState) int {
+    val n = b.Entries.Length()
+    if (n > 0) { return n - 1 }
+    return 0
+}
+
+// detectingInfo is the transient S1 readout shown while real detection runs.
+func detectingInfo() SourceInfo =
+    SourceInfo(Lang = "", Marker = "detecting…", FileCnt = 0, Detected = false)
+
+// ----- Async commands (the only place filesystem IO happens) ----------------
+
+func openBrowseCmd(sourceDir string) Cmd[Msg] =
+    Async[BrowseState, Msg](() => listStart(sourceDir), (st) => MBrowseLoaded(State = st))
+
+func browseCmd(dir string) Cmd[Msg] =
+    Async[BrowseState, Msg](() => listDir(dir), (st) => MBrowseLoaded(State = st))
+
+func detectCmd(dir string) Cmd[Msg] =
+    Async[SourceInfo, Msg](() => detectSourceAt(dir), (info) => MSourceDetected(Info = info))
+
+// ----- listing --------------------------------------------------------------
+
+// listStart picks the directory the picker opens on: the parent of an existing
+// source dir (so siblings show), else the current working directory.
+func listStart(sourceDir string) BrowseState {
+    if (sourceDir != "" && fs.Exists(sourceDir)) { return listDir(path.Dir(sourceDir)) }
+    return listDir(path.Abs(".").GetOrElse("."))
+}
+
+// listDir reads `dir`'s child directories into a BrowseState. os.ReadDir already
+// yields entries sorted by name; hidden dirs are pruned, ".." is prepended unless
+// we're at the filesystem root, and each child is flagged with a project marker.
+func listDir(dir string) BrowseState {
+    val entries = fs.ReadDir(dir).GetOrElse(EmptyArray[fs.FileInfo]())
+    val children = entries
+        .Filter((fi fs.FileInfo) => fi.IsDir && !isHiddenDir(fi.Name))
+        .Map((fi fs.FileInfo) => childEntry(dir, fi.Name))
+    val rows = if (atRoot(dir)) children else prependParent(dir, children)
+    return BrowseState(Dir = dir, Entries = rows, Cursor = 0, Loading = false)
+}
+
+func childEntry(parent string, name string) BrowseEntry =
+    BrowseEntry(
+        Name     = name,
+        Path     = path.Join(parent, name),
+        IsParent = false,
+        Marker   = projectMarker(path.Join(parent, name)),
+    )
+
+func prependParent(dir string, rest Array[BrowseEntry]) Array[BrowseEntry] {
+    val up = BrowseEntry(Name = "..", Path = path.Dir(dir), IsParent = true, Marker = "")
+    return ArrayOf[BrowseEntry](up).AppendAll(rest)
+}
+
+func atRoot(dir string) bool = path.Dir(dir) == dir
+
+func isHiddenDir(name string) bool = strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules"
+
+// projectMarker names the manifest that makes a directory look like a project
+// root, or "" when none is present. Cheap: one Exists check per known manifest.
+func projectMarker(dir string) string {
+    if (fs.Exists(path.Join(dir, "go.mod")))       { return "go.mod" }
+    if (fs.Exists(path.Join(dir, "package.json"))) { return "package.json" }
+    if (fs.Exists(path.Join(dir, "Cargo.toml")))   { return "Cargo.toml" }
+    return ""
+}
+
+// ----- real source detection (replaces the detectSource stub on commit) -----
+
+// detectSourceAt produces the S1 readout for a chosen directory from its real
+// contents: the recognised language (by manifest) and a recursive count of that
+// language's source files. Unrecognised directories report "no recognised project".
+func detectSourceAt(dir string) SourceInfo {
+    if (fs.Exists(path.Join(dir, "go.mod"))) {
+        return SourceInfo(Lang = "Go", Marker = "go.mod found", FileCnt = countFiles(dir, ".go"), Detected = true)
+    }
+    if (fs.Exists(path.Join(dir, "package.json"))) {
+        return SourceInfo(Lang = "TypeScript/JS", Marker = "package.json found", FileCnt = countFiles(dir, ".ts"), Detected = true)
+    }
+    if (fs.Exists(path.Join(dir, "Cargo.toml"))) {
+        return SourceInfo(Lang = "Rust", Marker = "Cargo.toml found", FileCnt = countFiles(dir, ".rs"), Detected = true)
+    }
+    return SourceInfo(Lang = "", Marker = "no recognised project", FileCnt = 0, Detected = false)
+}
+
+// countFiles recursively counts files ending in `ext` under `dir`, pruning hidden
+// and vendored directories (same exclusions as the picker listing).
+func countFiles(dir string, ext string) int {
+    val entries = fs.ReadDir(dir).GetOrElse(EmptyArray[fs.FileInfo]())
+    return entries.FoldLeft[int](0, (acc int, fi fs.FileInfo) => acc + entryCount(dir, fi, ext))
+}
+
+func entryCount(dir string, fi fs.FileInfo, ext string) int = fi.IsDir match {
+    case true  => isHiddenDir(fi.Name) match {
+        case true  => 0
+        case false => countFiles(path.Join(dir, fi.Name), ext)
+    }
+    case false => strings.HasSuffix(fi.Name, ext) match {
+        case true  => 1
+        case false => 0
+    }
+}
