@@ -27,10 +27,12 @@ changes behavior is the worst possible output. So:
 
 ## Build, test, run
 
-GALA dependencies are resolved via `gala.mod` (no Bazel needed for the inner loop).
+You need the **GALA toolchain** (`gala`) on your `PATH`. Run the commands from the
+**repository root** — that's where `gala.mod` lives, and GALA resolves dependencies
+from it (no Bazel needed for the inner loop).
 
 ```sh
-# build
+# build (build the entry point explicitly — see the note below)
 gala build -o gala_assimilator ./cmd/gala_assimilator
 
 # test (whole workspace)
@@ -40,11 +42,26 @@ gala test
 ./gala_assimilator
 ```
 
-In the TUI: pick the **source project** and **agent backend** on S1 → review the
-scanned **package/unit plan** on S2 → start, and watch the **assimilation
-dashboard** (S3) climb 0 → 100 %. Open a unit (S4) to see its diff, the agent's
-rationale, and verify results; answer any parked blockers (S5); review the
-summary and resume an interrupted run from S6.
+> Build the **entry point** (`./cmd/gala_assimilator`), not the whole-workspace
+> pattern. `gala build ./...` can fail with `no Go files in …/gen` on some platforms
+> (notably Windows); the explicit entry-point build above is the canonical one and
+> links the full UI.
+
+Two extra runnable harnesses (outside `gala test`, documented in `docs/`):
+
+```sh
+# real verify gate over a curated fixture (real `gala build`/`gala test`)
+gala run ./cmd/verifygate          # docs/verify-gate.md
+
+# live Claude backend smoke (needs the `claude` CLI authenticated)
+gala run ./cmd/smoke               # docs/smoke.md
+```
+
+In the TUI: pick the **source project** and **agent backend** on the **setup**
+screen → review the scanned **package/unit plan** → start, and watch the **run
+dashboard** climb 0 → 100 %. Open a unit to see its **diff**, the agent's
+rationale, and verify results; answer any parked **blockers**; then review the
+**summary** and resume an interrupted run from there.
 
 ## How it works
 
@@ -63,7 +80,7 @@ for the layering, the assimilation loop, and the seam invariants.
 
 ## Agent backends
 
-Selectable on S1:
+Selectable on the setup screen:
 
 - **Mock** — deterministic, offline. The default for tests and demos; no network.
 - **Go (real scan)** — reads the real Go project and runs it through the mock
@@ -81,15 +98,30 @@ frontier and never re-translates finished units.
 ## Status
 
 Working: real Go scanning (multi-package, cross-package deps), the orchestration
-loop 0 → 100 %, the S1–S6 screens (mouse + keyboard, responsive, tested), the
-verify gate on 1:1 source tests, blocker park/answer, and checkpoint/restore.
+loop 0 → 100 %, all screens (setup → plan → run dashboard → unit/diff → blockers →
+summary; mouse + keyboard, responsive, tested), the verify gate on 1:1 source
+tests, blocker park/answer, and the run dashboard surfacing the fix loop (attempt
+counts, retry log lines) and correctness flags (unsupported / unverified).
 
-In progress / next: disk-backed resume UI, an end-to-end multi-package demo with
-per-package commits, and a runtime smoke test of the live Claude backend.
+Proven offline and reproducibly:
 
-Translation quality against the live backend is not yet validated end to end; the
-mock translator emits placeholder output, so the current proof is of the
-**pipeline**, not of real Go → GALA output.
+- a multi-package Go project driven **0 → 100 %** end to end and integrated
+  per-package to disk ([docs/demo.md](docs/demo.md));
+- the **real verify gate** running `gala build`/`gala test` over a curated
+  semantics-preserving fixture — a true pass, a real diagnostic-carrying failure,
+  and a fix-loop recovery ([docs/verify-gate.md](docs/verify-gate.md));
+- **disk-backed resume across a process restart** — Resume vs. Start fresh at
+  launch, resuming from the dependency frontier without re-translating finished
+  units;
+- a runnable **live-backend smoke** that drives the real Claude CLI end to end
+  ([docs/smoke.md](docs/smoke.md)).
+
+In progress / next: a live Claude run at **project scale** (the smoke proves the
+live loop on one unit), per-package commits during a live migration, and
+**translation-quality** validation across a real corpus. The mock translator emits
+placeholder output, so the offline proof is of the **pipeline**, not of real
+Go → GALA translation quality — see [docs/roadmap.md](docs/roadmap.md) for the
+detailed checklist.
 
 ## Contributing
 
