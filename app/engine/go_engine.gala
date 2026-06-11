@@ -52,6 +52,15 @@ func GoEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clar
     SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
     LoadCheckpoint = (path string) => loadCheckpoint(path),
     Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
+    // Forest: GoEngine wires the REAL git cloner (RealRepoCloner over GitCliRunner) so a
+    // real migration clones each dependency into its own folder. The clone is the
+    // toolchain edge — exercised on the live round, never by `gala test` (the suite
+    // drives the forest through the free functions with a MockRepoCloner).
+    ResolveDeps     = (m WorkspaceModel) => resolveForest(SelectResolver("go"), m, depsBaseFor(m), DefaultMaxDepth()),
+    AdvanceForest   = (f DependencyForest) => advanceForest(RealRepoCloner(GitCliRunner()), SelectResolver("go"), runner, verifier, maxAttempts, f),
+    ActOnDependency = (f DependencyForest, id DependencyId, a DepAction) => actOnDependency(f, id, a),
+    SaveForest      = (f DependencyForest, path string) => saveForest(f, path),
+    LoadForest      = (path string) => loadForest(path),
 )
 
 // goPlanFor builds the plan from a scanned workspace, threading each unit's REAL

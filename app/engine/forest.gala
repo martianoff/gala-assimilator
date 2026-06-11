@@ -1,0 +1,436 @@
+package engine
+
+// DEPENDENCY-FOREST assimilation — the product model for migrating a project AND its
+// dependencies. Each dependency is cloned into ITS OWN folder and assimilated as a
+// SEPARATE translate -> verify -> fix run; the result is a FOREST: the root project's
+// run plus one independent RunState per dependency, never merged into one workspace.
+//
+// Resolution is TRANSITIVE ("deeply clone") with two guards that make it terminate:
+//   - a DEPTH BOUND (MaxDepth) caps how far the transitive closure is followed;
+//   - a VISITED set (keyed by module path) dedups, so a dependency cycle
+//     (A -> B -> A) is followed once and stops.
+// A dependency that can't be resolved to a VCS URL (a vanity host, a private proxy)
+// is parked DepUnsupported — surfaced, NEVER silently dropped (product invariant).
+//
+// PURE DATA: a DependencyForest is Deps + a derived DepMap + the Visited set + the
+// bounds — no function values, no handles. The cloner / resolver / run machinery are
+// supplied to the FREE functions here (and captured by the EnginePort closures), the
+// same way `advance` is handed a runner+verifier; they never live in the forest, so
+// the forest checkpoints (SaveForest / LoadForest) as plain JSON.
+//
+// Transport-neutral: NO gala_tui, NO app/ui. acp appears ONLY as the type of the
+// sub-run machinery threaded in (`advance`), never in a forest type and never across
+// the port.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+    acp "github.com/martianoff/gala-acp"
+)
+
+// ----------------------------------------------------------------------------
+// Forest value types (pure data)
+// ----------------------------------------------------------------------------
+
+// DepResolution is where ONE dependency sits in its own lifecycle. The happy path is
+// DepPending -> DepAssimilating(run) -> DepDone; DepUnsupported / DepFailed / DepSkipped
+// are the off-ramps (each carrying why, where there's a reason). DepCloning and
+// DepResolved are the finer-grained transient states a UI may surface; the one-step
+// engine collapses clone+scan+start into the Pending -> Assimilating transition, but
+// the states exist (and round-trip) so a more granular driver can use them.
+sealed type DepResolution {
+    case DepPending()                       // discovered, not yet cloned
+    case DepCloning()                       // clone in flight (transient)
+    case DepResolved(Workspace WorkspaceModel) // cloned + scanned, run not yet started (transient)
+    case DepAssimilating(Run RunState)      // its own translate->verify->fix run is live
+    case DepDone()                          // its run reached completion
+    case DepSkipped()                       // operator abandoned it
+    case DepUnsupported(Reason string)      // no VCS mapping — surfaced, not dropped
+    case DepFailed(Reason string)           // clone / scan failure
+}
+
+// DependencyRun is the per-dependency forest node: the resolved Node, the OWN folder
+// it is cloned into (Dest — never shared), its DepResolution status, its Depth in the
+// transitive closure (root deps = 1), and the ids of the child dependencies its own
+// go.mod pulled in (the reconstructed transitive edges).
+struct DependencyRun(
+    Node     DependencyNode,
+    Dest     string,
+    Status   DepResolution,
+    Depth    int,
+    Children Array[DependencyId],
+)
+
+// DependencyForest is the whole forest as pure data: every DependencyRun, a derived
+// DepMap (DependencyId.Value -> run) for O(1) lookup, the Visited module-path set
+// (cycle dedup), the MaxDepth bound, and the DepsBase directory each dependency's own
+// Dest folder is allocated under.
+struct DependencyForest(
+    Deps     Array[DependencyRun],
+    DepMap   HashMap[string, DependencyRun],
+    Visited  Array[string],
+    MaxDepth int,
+    DepsBase string,
+)
+
+// DepAction is an operator decision on one dependency node (UI-driven). Sealed so
+// every action is handled. ResolveDep / RetryDep re-queue a node for (re)cloning;
+// SkipDep abandons it; ExpandDep lifts the depth bound by one and re-queues the node
+// so a subtree pruned by the bound can grow.
+sealed type DepAction {
+    case ResolveDep()
+    case SkipDep()
+    case RetryDep()
+    case ExpandDep()
+}
+
+// DefaultMaxDepth bounds the transitive clone. Five levels is deep enough to reach a
+// real project's meaningful dependencies and shallow enough to terminate quickly; an
+// operator lifts it per-node with ExpandDep.
+func DefaultMaxDepth() int = 5
+
+// depsBaseFor derives the directory a project's dependency clones live under: a
+// SIBLING of the source root (root + "__deps"), so dependency checkouts never land
+// inside the scanned source tree and get mistaken for project source on a rescan. A
+// rootless model (the synthetic stub) yields a plain relative base — it resolves no
+// real dependencies anyway, so the base is never written to.
+func depsBaseFor(model WorkspaceModel) string {
+    if model.Root == "" { return "gala_assimilator_deps" }
+    return model.Root + "__deps"
+}
+
+// ----------------------------------------------------------------------------
+// Building the initial forest from the root workspace (ResolveDeps)
+// ----------------------------------------------------------------------------
+
+// resolveForest seeds the forest from the ROOT project: it resolves the root's
+// go.mod (via the resolver, keyed off model.Root) into one DepPending node per direct
+// dependency, each allocated its own Dest under depsBase. The root module itself is
+// marked Visited so a dependency that points back at the root is deduped, not cloned.
+func resolveForest(resolver DependencyResolver, model WorkspaceModel, depsBase string, maxDepth int) DependencyForest {
+    val rootModule = rootModulePath(model)
+    val nodes = resolver.Resolve(ResolveRequest(RepoPath = model.Root)).Nodes
+    val seed = DependencyForest(
+        Deps     = EmptyArray[DependencyRun](),
+        DepMap   = EmptyHashMap[string, DependencyRun](),
+        Visited  = ArrayOf[string](rootModule),
+        MaxDepth = maxDepth,
+        DepsBase = depsBase,
+    )
+    return nodes.FoldLeft[DependencyForest](seed, (acc DependencyForest, n DependencyNode) => seedDep(acc, n, 1))
+}
+
+// rootModulePath is the root project's module path (the module-root package "."),
+// used to seed the Visited set. "" when the model has no module-root package.
+func rootModulePath(model WorkspaceModel) string =
+    model.PackageMap.Get(".") match {
+        case Some(p) => p.ModulePath
+        case None()  => ""
+    }
+
+// seedDep adds one dependency node at `depth` as DepPending, unless its module is
+// already Visited (dedup). It is the shared "introduce a new dep" step used by both
+// the root seeding and the transitive recursion.
+func seedDep(forest DependencyForest, node DependencyNode, depth int) DependencyForest {
+    val mod = node.Id.Value
+    if isVisited(forest, mod) { return forest }
+    val run = DependencyRun(
+        Node     = node,
+        Dest     = destForNode(forest.DepsBase, node),
+        Status   = DepPending(),
+        Depth    = depth,
+        Children = EmptyArray[DependencyId](),
+    )
+    return appendDep(markVisited(forest, mod), run)
+}
+
+// destForNode allocates a dependency its OWN folder under depsBase, flattening the
+// module path ("github.com/x/y" -> "github.com_x_y") so each dep is isolated and no
+// two collide.
+func destForNode(depsBase string, node DependencyNode) string =
+    path.Join(depsBase, strings.ReplaceAll(node.Id.Value, "/", "_"))
+
+// ----------------------------------------------------------------------------
+// AdvanceForest — one step of the forest assimilation
+// ----------------------------------------------------------------------------
+
+// advanceForest drives the forest forward ONE step: it processes the next DepPending
+// dependency (clone into its own folder -> scan -> start its own RunState -> recurse
+// into its go.mod deps under the depth+visited guards) and then advances every
+// in-flight sub-run by one tick (completing it to DepDone when its run is done). A
+// forest with nothing pending and no live sub-run is a fixpoint.
+func advanceForest(
+    cloner RepoCloner,
+    resolver DependencyResolver,
+    runner acp.AgentRunner[TaskAssignment, Result, Clarification],
+    verifier Verifier,
+    maxAttempts int,
+    forest DependencyForest,
+) DependencyForest {
+    val afterPending = forest.Deps.Find((d DependencyRun) => isPending(d.Status)) match {
+        case Some(dep) => processPending(cloner, resolver, forest, dep)
+        case None()    => forest
+    }
+    return advanceInFlight(runner, verifier, maxAttempts, afterPending)
+}
+
+// processPending acquires ONE pending dependency. An unresolvable node (no VCS URL)
+// is parked DepUnsupported (surfaced, not dropped) without a clone attempt; a clone
+// failure is DepFailed carrying the reason; a successful clone scans the dep into its
+// own workspace, starts its own run, and recurses into its dependencies.
+func processPending(cloner RepoCloner, resolver DependencyResolver, forest DependencyForest, dep DependencyRun) DependencyForest {
+    val id = dep.Node.Id
+    if !IsResolvable(dep.Node) {
+        return setDepStatus(forest, id, DepUnsupported(
+            Reason = "no VCS host mapping for module " + dep.Node.Coord.Module + " — cannot clone",
+        ))
+    }
+    return cloner.Clone(CloneRequest(Url = dep.Node.RepoUrl, Ref = dep.Node.Coord.Version, Dest = dep.Dest)) match {
+        case CloneFailed(why)  => setDepStatus(forest, id, DepFailed(Reason = "clone failed: " + why))
+        case Cloned(clonedPath) => assimilateCloned(resolver, forest, dep, clonedPath)
+    }
+}
+
+// assimilateCloned turns a freshly-cloned dependency into a live sub-run: scan the
+// clone into its OWN WorkspaceModel, start its OWN RunState (the dep is migrated
+// separately, never merged), recurse into the dependencies ITS go.mod declares (depth
+// +1, deduped), and mark the node DepAssimilating.
+func assimilateCloned(resolver DependencyResolver, forest DependencyForest, dep DependencyRun, clonedPath string) DependencyForest {
+    val ws = ScanGoWorkspace(clonedPath)
+    val run = startDepRun(ws)
+    val childNodes = resolver.Resolve(ResolveRequest(RepoPath = clonedPath)).Nodes
+    val withChildren = addChildren(forest, dep, childNodes)
+    return setDepStatus(withChildren, dep.Node.Id, DepAssimilating(Run = run))
+}
+
+// startDepRun builds a dependency's own run from its scanned workspace — the SAME
+// plan/run machinery the root project uses (goPlanFor threads real source text), so a
+// dependency is assimilated by exactly the same translate->verify->fix loop.
+func startDepRun(ws WorkspaceModel) RunState = runFor(goPlanFor(ws))
+
+// addChildren records the transitive edges from a parent dependency to the deps its
+// go.mod pulled in, and introduces each not-yet-seen child as a new DepPending node
+// (under the depth bound + visited dedup). A child beyond the depth bound is parked
+// DepSkipped with the reason, so the boundary is SURFACED rather than silently
+// pruned; a child whose module is already Visited is only edged, never re-cloned.
+func addChildren(forest DependencyForest, parent DependencyRun, childNodes Array[DependencyNode]) DependencyForest =
+    childNodes.FoldLeft[DependencyForest](forest, (acc DependencyForest, child DependencyNode) => addChild(acc, parent, child))
+
+func addChild(forest DependencyForest, parent DependencyRun, child DependencyNode) DependencyForest {
+    val withEdge = addEdge(forest, parent.Node.Id, child.Id)
+    val mod = child.Id.Value
+    val childDepth = parent.Depth + 1
+    if isVisited(withEdge, mod)        { return withEdge }
+    if childDepth > withEdge.MaxDepth  { return parkDepthBounded(withEdge, child, childDepth) }
+    return seedDep(withEdge, child, childDepth)
+}
+
+// parkDepthBounded introduces a beyond-the-bound child as a Visited, DepSkipped node
+// so it shows up in the forest (with the reason) instead of vanishing — and ExpandDep
+// can later lift the bound and re-queue it.
+func parkDepthBounded(forest DependencyForest, child DependencyNode, childDepth int) DependencyForest {
+    val run = DependencyRun(
+        Node     = child,
+        Dest     = destForNode(forest.DepsBase, child),
+        Status   = DepSkipped(),
+        Depth    = childDepth,
+        Children = EmptyArray[DependencyId](),
+    )
+    return appendDep(markVisited(forest, child.Id.Value), run)
+}
+
+// advanceInFlight ticks every live sub-run by one step: a DepResolved dep starts its
+// run; a DepAssimilating dep advances one tick, settling DepDone the moment its run
+// reaches completion. Other states are untouched.
+func advanceInFlight(
+    runner acp.AgentRunner[TaskAssignment, Result, Clarification],
+    verifier Verifier,
+    maxAttempts int,
+    forest DependencyForest,
+) DependencyForest {
+    val ticked = forest.Deps.Map((d DependencyRun) => tickDep(runner, verifier, maxAttempts, d))
+    return rebuildForest(ticked, forest.Visited, forest.MaxDepth, forest.DepsBase)
+}
+
+func tickDep(
+    runner acp.AgentRunner[TaskAssignment, Result, Clarification],
+    verifier Verifier,
+    maxAttempts int,
+    dep DependencyRun,
+) DependencyRun = dep.Status match {
+    case DepResolved(ws)      => dep.Copy(Status = DepAssimilating(Run = startDepRun(ws)))
+    case DepAssimilating(run) => IsComplete(run) match {
+        case true  => dep.Copy(Status = DepDone())
+        case false => dep.Copy(Status = DepAssimilating(Run = advance(runner, verifier, maxAttempts, run)))
+    }
+    case DepPending()         => dep
+    case DepCloning()         => dep
+    case DepDone()            => dep
+    case DepSkipped()         => dep
+    case DepUnsupported(_)    => dep
+    case DepFailed(_)         => dep
+}
+
+// ----------------------------------------------------------------------------
+// Completeness + a convenience driver (not part of the port)
+// ----------------------------------------------------------------------------
+
+// isDepTerminal is true for the settled statuses no further AdvanceForest step can
+// move. DepCloning is listed terminal-for-driving only as a backstop — the engine
+// never rests a node there.
+func isDepTerminal(s DepResolution) bool = s match {
+    case DepDone()         => true
+    case DepSkipped()      => true
+    case DepUnsupported(_) => true
+    case DepFailed(_)      => true
+    case DepPending()      => false
+    case DepCloning()      => false
+    case DepResolved(_)    => false
+    case DepAssimilating(_) => false
+}
+
+// isDepDone is the single "this dependency finished" classifier, reused by the count
+// projection (and a clearer read than re-matching all eight cases inline).
+func isDepDone(s DepResolution) bool = s match {
+    case DepDone()          => true
+    case DepPending()       => false
+    case DepCloning()       => false
+    case DepResolved(_)     => false
+    case DepAssimilating(_) => false
+    case DepSkipped()       => false
+    case DepUnsupported(_)  => false
+    case DepFailed(_)       => false
+}
+
+// ForestComplete is the forest fixpoint: every dependency has settled into a terminal
+// status. AdvanceForest is a no-op once it holds.
+func ForestComplete(forest DependencyForest) bool =
+    !forest.Deps.Exists((d DependencyRun) => !isDepTerminal(d.Status))
+
+// forestStepBudget is a safety backstop bounding AdvanceForestToCompletion's loop so
+// a malformed forest (a hand-built DepCloning the engine never produces) can't spin
+// forever. It is far above any real forest's step count.
+func forestStepBudget() int = 10000
+
+// AdvanceForestToCompletion advances a forest until ForestComplete — the forest
+// analogue of RunToCompletion. It terminates because the transitive closure is bounded
+// (depth + visited dedup) and each sub-run is itself bounded; the step budget is only
+// a backstop. A convenience for tests / a "run all", not part of the port.
+func AdvanceForestToCompletion(
+    cloner RepoCloner,
+    resolver DependencyResolver,
+    runner acp.AgentRunner[TaskAssignment, Result, Clarification],
+    verifier Verifier,
+    maxAttempts int,
+    forest DependencyForest,
+) DependencyForest {
+    var f = forest
+    var i = 0
+    var more = !ForestComplete(f)
+    for more && i < forestStepBudget() {
+        f = advanceForest(cloner, resolver, runner, verifier, maxAttempts, f)
+        more = !ForestComplete(f)
+        i = i + 1
+    }
+    return f
+}
+
+// CountDepsByStatus projections — small read helpers for tests / the UI.
+
+// CountDepsDone is how many dependencies reached DepDone.
+func CountDepsDone(forest DependencyForest) int =
+    forest.Deps.Count((d DependencyRun) => isDepDone(d.Status))
+
+// ----------------------------------------------------------------------------
+// Operator actions on a node (ActOnDependency)
+// ----------------------------------------------------------------------------
+
+func actOnDependency(forest DependencyForest, id DependencyId, action DepAction) DependencyForest =
+    forest.DepMap.Get(id.Value) match {
+        case Some(dep) => applyDepAction(forest, dep, action)
+        case None()    => forest
+    }
+
+func applyDepAction(forest DependencyForest, dep DependencyRun, action DepAction) DependencyForest = action match {
+    case SkipDep()    => setDepStatus(forest, dep.Node.Id, DepSkipped())
+    case ResolveDep() => setDepStatus(forest, dep.Node.Id, DepPending())
+    case RetryDep()   => setDepStatus(forest, dep.Node.Id, DepPending())
+    case ExpandDep()  => expandDep(forest, dep)
+}
+
+// expandDep lifts the forest's depth bound by one and re-queues the node as
+// DepPending, so a subtree that was parked at the previous bound can now grow.
+func expandDep(forest DependencyForest, dep DependencyRun) DependencyForest {
+    val bumped = forest.Copy(MaxDepth = forest.MaxDepth + 1)
+    return setDepStatus(bumped, dep.Node.Id, DepPending())
+}
+
+// ----------------------------------------------------------------------------
+// Forest mutation helpers (rebuild the derived DepMap on every change)
+// ----------------------------------------------------------------------------
+
+// rebuildForest re-derives the DepMap from the deps so it can never drift, mirroring
+// NewWorkspaceModel's PackageMap discipline.
+func rebuildForest(deps Array[DependencyRun], visited Array[string], maxDepth int, depsBase string) DependencyForest =
+    DependencyForest(
+        Deps     = deps,
+        DepMap   = depMapOf(deps),
+        Visited  = visited,
+        MaxDepth = maxDepth,
+        DepsBase = depsBase,
+    )
+
+func depMapOf(deps Array[DependencyRun]) HashMap[string, DependencyRun] =
+    deps.FoldLeft[HashMap[string, DependencyRun]](
+        EmptyHashMap[string, DependencyRun](),
+        (acc HashMap[string, DependencyRun], d DependencyRun) => acc.Put(d.Node.Id.Value, d),
+    )
+
+func appendDep(forest DependencyForest, run DependencyRun) DependencyForest =
+    rebuildForest(forest.Deps.Append(run), forest.Visited, forest.MaxDepth, forest.DepsBase)
+
+func isVisited(forest DependencyForest, module string) bool =
+    forest.Visited.Exists((m string) => m == module)
+
+func markVisited(forest DependencyForest, module string) DependencyForest =
+    rebuildForest(forest.Deps, forest.Visited.Append(module), forest.MaxDepth, forest.DepsBase)
+
+func sameDepId(d DependencyRun, id DependencyId) bool = d.Node.Id.Value == id.Value
+
+func isPending(s DepResolution) bool = s match {
+    case DepPending()       => true
+    case DepCloning()       => false
+    case DepResolved(_)     => false
+    case DepAssimilating(_) => false
+    case DepDone()          => false
+    case DepSkipped()       => false
+    case DepUnsupported(_)  => false
+    case DepFailed(_)       => false
+}
+
+// setDepStatus replaces one node's status, preserving its edges/depth, and rebuilds
+// the map.
+func setDepStatus(forest DependencyForest, id DependencyId, status DepResolution) DependencyForest {
+    val deps = forest.Deps.Map((d DependencyRun) => sameDepId(d, id) match {
+        case true  => d.Copy(Status = status)
+        case false => d
+    })
+    return rebuildForest(deps, forest.Visited, forest.MaxDepth, forest.DepsBase)
+}
+
+// addEdge records a parent -> child dependency edge on the parent node (idempotent —
+// a repeated edge is not duplicated).
+func addEdge(forest DependencyForest, parentId DependencyId, childId DependencyId) DependencyForest {
+    val deps = forest.Deps.Map((d DependencyRun) => sameDepId(d, parentId) match {
+        case true  => d.Copy(Children = appendChildId(d.Children, childId))
+        case false => d
+    })
+    return rebuildForest(deps, forest.Visited, forest.MaxDepth, forest.DepsBase)
+}
+
+func appendChildId(children Array[DependencyId], childId DependencyId) Array[DependencyId] {
+    if children.Exists((c DependencyId) => c.Value == childId.Value) { return children }
+    return children.Append(childId)
+}

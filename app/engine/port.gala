@@ -147,6 +147,15 @@ struct EnginePort(
     SaveCheckpoint func(RunState, string) bool,
     LoadCheckpoint func(string) CheckpointLoad,
     Integrate      func(RunState, WorkspaceModel, string) IntegrateResult,
+    // Dependency forest (assimilate a project AND its dependencies — each dep is a
+    // SEPARATE run). Pure data crosses the port: WorkspaceModel / DependencyForest /
+    // DependencyId / DepAction / ForestLoad — never the RepoCloner or Dependency
+    // resolver (function values the engine captures), and never acp.*.
+    ResolveDeps     func(WorkspaceModel) DependencyForest,
+    AdvanceForest   func(DependencyForest) DependencyForest,
+    ActOnDependency func(DependencyForest, DependencyId, DepAction) DependencyForest,
+    SaveForest      func(DependencyForest, string) bool,
+    LoadForest      func(string) ForestLoad,
 )
 
 // ----------------------------------------------------------------------------
@@ -193,6 +202,15 @@ func MockEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Cl
     SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
     LoadCheckpoint = (path string) => loadCheckpoint(path),
     Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
+    // Forest: the offline MockEngine wires the EMPTY mock cloner (no fixtures), so the
+    // port is callable — a pending dep with no fixture settles DepUnsupported/DepFailed
+    // rather than crashing — while the rich multi-level forest behavior is proven
+    // against a POPULATED MockRepoCloner through the free functions directly.
+    ResolveDeps     = (m WorkspaceModel) => resolveForest(SelectResolver("go"), m, depsBaseFor(m), DefaultMaxDepth()),
+    AdvanceForest   = (f DependencyForest) => advanceForest(EmptyMockRepoCloner(), SelectResolver("go"), runner, verifier, maxAttempts, f),
+    ActOnDependency = (f DependencyForest, id DependencyId, a DepAction) => actOnDependency(f, id, a),
+    SaveForest      = (f DependencyForest, path string) => saveForest(f, path),
+    LoadForest      = (path string) => loadForest(path),
 )
 
 // ----------------------------------------------------------------------------

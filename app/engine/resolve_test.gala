@@ -1,0 +1,101 @@
+package engine
+
+// Proof that the Go dependency resolver turns a cloned repo's `go.mod` `require`
+// block into DependencyNodes — resolving each module to its VCS repo URL where the
+// host is known, FLAGGING the rest unsupported (RepoUrl = "") rather than guessing —
+// and that direct vs. `// indirect` is preserved. Real filesystem IO over a go.mod
+// materialized to a temp dir (the suite does not stage testdata/).
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// A go.mod with a require BLOCK: a resolvable direct dep, a resolvable indirect dep,
+// and a vanity-host dep with no known VCS mapping.
+val sampleGoMod =
+    "module example.com/app\n\ngo 1.21\n\n" +
+    "require (\n" +
+    "\tgithub.com/acme/widget v1.2.3\n" +
+    "\tgithub.com/acme/gadget v0.4.0 // indirect\n" +
+    "\tgolang.org/x/tools v0.1.0\n" +
+    ")\n"
+
+func writeGoMod(content string) string {
+    val dir = fs.MkdirTemp("", "gala_resolve").GetOrElse("")
+    fs.WriteFileString(path.Join(dir, "go.mod"), content, 420)
+    return dir
+}
+
+func findNode(g DependencyGraph, module string) Option[DependencyNode] =
+    g.Nodes.Find((n DependencyNode) => n.Coord.Module == module)
+
+// The require block yields one node per entry; a known host resolves to its https
+// repo URL and is marked direct.
+func TestGoResolverResolvesDirect(t T) T {
+    val g = GoDependencyResolver().Resolve(ResolveRequest(RepoPath = writeGoMod(sampleGoMod)))
+    val t1 = Eq(t, g.Nodes.Length(), 3)
+    return findNode(g, "github.com/acme/widget") match {
+        case Some(n) => {
+            val a = Eq(t1, n.RepoUrl, "https://github.com/acme/widget")
+            val b = Eq(a, n.Direct, true)
+            return Eq(b, n.Coord.Version, "v1.2.3")
+        }
+        case None() => Fail(t1, "expected a widget node")
+    }
+}
+
+// An `// indirect` entry is recorded as NOT direct.
+func TestGoResolverMarksIndirect(t T) T {
+    val g = GoDependencyResolver().Resolve(ResolveRequest(RepoPath = writeGoMod(sampleGoMod)))
+    return findNode(g, "github.com/acme/gadget") match {
+        case Some(n) => Eq(t, n.Direct, false)
+        case None()  => Fail(t, "expected a gadget node")
+    }
+}
+
+// A module on a host with no known VCS mapping is FLAGGED unsupported (RepoUrl = ""),
+// never silently dropped — it is still a node, just not resolvable.
+func TestGoResolverFlagsUnsupportedHost(t T) T {
+    val g = GoDependencyResolver().Resolve(ResolveRequest(RepoPath = writeGoMod(sampleGoMod)))
+    return findNode(g, "golang.org/x/tools") match {
+        case Some(n) => {
+            val a = Eq(t, n.RepoUrl, "")
+            return Eq(a, IsResolvable(n), false)
+        }
+        case None() => Fail(t, "an unsupported-host dependency must still be surfaced as a node")
+    }
+}
+
+// A single-line `require x v` (no block) is parsed too.
+func TestGoResolverSingleLineRequire(t T) T {
+    val g = GoDependencyResolver().Resolve(ResolveRequest(
+        RepoPath = writeGoMod("module m\n\ngo 1.21\n\nrequire github.com/a/b v1.0.0\n"),
+    ))
+    val t1 = Eq(t, g.Nodes.Length(), 1)
+    return Eq(t1, g.Nodes.Head().RepoUrl, "https://github.com/a/b")
+}
+
+// A missing go.mod degrades to an empty graph (no crash) — "degrade, don't fake".
+func TestGoResolverMissingGoMod(t T) T {
+    val dir = fs.MkdirTemp("", "gala_resolve_empty").GetOrElse("")
+    return Eq(t, GoDependencyResolver().Resolve(ResolveRequest(RepoPath = dir)).Nodes.Length(), 0)
+}
+
+// The module-path -> VCS-URL mapping: known hosts map (major-version subpath stays
+// inside the same repo); unknown hosts and too-short paths map to "".
+func TestModuleToRepoUrlMapping(t T) T {
+    val t1 = Eq(t, moduleToRepoUrl("github.com/x/y"), "https://github.com/x/y")
+    val t2 = Eq(t1, moduleToRepoUrl("github.com/x/y/v2"), "https://github.com/x/y")
+    val t3 = Eq(t2, moduleToRepoUrl("gitlab.com/a/b"), "https://gitlab.com/a/b")
+    val t4 = Eq(t3, moduleToRepoUrl("bitbucket.org/a/b/sub"), "https://bitbucket.org/a/b")
+    val t5 = Eq(t4, moduleToRepoUrl("golang.org/x/tools"), "")
+    return Eq(t5, moduleToRepoUrl("example.com/single"), "")
+}
+
+// SelectResolver is the pluggable-by-ecosystem seam: "go" yields the Go resolver.
+func TestSelectResolverGo(t T) T =
+    Eq(t, SelectResolver("go").Ecosystem, "go")

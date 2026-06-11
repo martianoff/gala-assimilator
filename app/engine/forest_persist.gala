@@ -1,0 +1,285 @@
+package engine
+
+// FOREST CHECKPOINT — disk persistence for the dependency forest, the forest-scoped
+// sibling of persist.gala's run checkpoint. A long, transitive, multi-dependency
+// migration is exactly the kind of run that must survive quit / crash and resume
+// without re-cloning and re-assimilating finished dependencies, so the whole forest
+// (every per-dependency RunState included) round-trips to disk as pure data.
+//
+// Same hand-rolled streaming-JSON approach as persist.gala (the high-level Codec[T]
+// only auto-derives plain structs; the forest is a tree of SEALED types —
+// DepResolution, and the nested RunState's UnitStatus / EngineEvent — that each need a
+// "k" discriminator). It REUSES persist.gala's element encoders (encUnitRun /
+// encEngineEvent and the encArray / decArray plumbing) for the embedded run state, and
+// adds the forest-specific shapes here. A leading "v":1 guards the format; the decode
+// is positional (it relies on the field order this encoder writes), and a malformed or
+// wrong-version file is surfaced as ForestCorrupt rather than crashing the resume.
+//
+// Atomic write (temp + os.Rename) is shared with persist.gala (atomicRename). IO lives
+// at this edge; NO gala_tui, NO app/ui, no acp.* crosses the new port methods.
+
+import (
+    . "martianoff/gala/std"
+    . "martianoff/gala/collection_immutable"
+    "martianoff/gala/fs"
+    json "martianoff/gala/json"
+)
+
+// ForestLoad is the sealed result of reading a forest checkpoint: the restored forest,
+// a clean "no file there", or a present-but-unreadable file with the reason. Absence
+// and corruption are DISTINCT, and neither is a crash. (Distinct case names from
+// CheckpointLoad's Loaded/Missing/Corrupt — a sealed case is a type, so they can't be
+// shared across two sealed types in one package.)
+sealed type ForestLoad {
+    case ForestLoaded(Value DependencyForest)
+    case ForestMissing()
+    case ForestCorrupt(Reason string)
+}
+
+// ----------------------------------------------------------------------------
+// Save / load (the IO edge — mirrors saveCheckpoint / loadCheckpoint)
+// ----------------------------------------------------------------------------
+
+func saveForest(forest DependencyForest, path string) bool {
+    val body = encodeForest(forest)
+    val tmp  = path + ".tmp"
+    if fs.WriteFileString(tmp, body, 420).IsFailure() { return false }
+    if atomicRename(tmp, path).IsFailure() {
+        fs.RemoveAll(tmp)
+        return false
+    }
+    return true
+}
+
+func loadForest(path string) ForestLoad {
+    if !fs.Exists(path) { return ForestMissing() }
+    val read = fs.ReadFileString(path)
+    if read.IsFailure() { return ForestCorrupt(Reason = "unreadable forest: " + read.Err.Error()) }
+    val decoded = Try[DependencyForest](() => decodeForest(read.Get()))
+    if decoded.IsFailure() { return ForestCorrupt(Reason = "undecodable forest: " + decoded.Err.Error()) }
+    return ForestLoaded(Value = decoded.Get())
+}
+
+// ----------------------------------------------------------------------------
+// Encode
+// ----------------------------------------------------------------------------
+
+func encodeForest(forest DependencyForest) string {
+    val w = json.NewJsonEncoder()
+    w.WriteStartObject()
+    w.WriteKey("v");        w.WriteInt(1)
+    w.WriteKey("maxDepth"); w.WriteInt(forest.MaxDepth)
+    w.WriteKey("depsBase"); w.WriteString(forest.DepsBase)
+    w.WriteKey("visited");  encArray[string](w, forest.Visited, encStr)
+    w.WriteKey("deps");     encArray[DependencyRun](w, forest.Deps, encDependencyRun)
+    w.WriteEndObject()
+    return w.String()
+}
+
+func encDependencyRun(w *json.JsonEncoderImpl, d DependencyRun) {
+    w.WriteStartObject()
+    w.WriteKey("node");     encDependencyNode(w, d.Node)
+    w.WriteKey("dest");     w.WriteString(d.Dest)
+    w.WriteKey("status");   encDepResolution(w, d.Status)
+    w.WriteKey("depth");    w.WriteInt(d.Depth)
+    w.WriteKey("children"); encArray[DependencyId](w, d.Children, encDependencyId)
+    w.WriteEndObject()
+}
+
+func encDependencyId(w *json.JsonEncoderImpl, id DependencyId) { w.WriteString(id.Value) }
+
+func encDependencyNode(w *json.JsonEncoderImpl, n DependencyNode) {
+    w.WriteStartObject()
+    w.WriteKey("id");      w.WriteString(n.Id.Value)
+    w.WriteKey("module");  w.WriteString(n.Coord.Module)
+    w.WriteKey("version"); w.WriteString(n.Coord.Version)
+    w.WriteKey("repoUrl"); w.WriteString(n.RepoUrl)
+    w.WriteKey("direct");  w.WriteBool(n.Direct)
+    w.WriteEndObject()
+}
+
+// encDepResolution tags the sealed case with "k" and writes that case's payload —
+// including, for an in-flight dependency, its WHOLE embedded RunState / WorkspaceModel.
+func encDepResolution(w *json.JsonEncoderImpl, s DepResolution) {
+    w.WriteStartObject()
+    w.WriteKey("k")
+    s match {
+        case DepPending()         => w.WriteString("pending")
+        case DepCloning()         => w.WriteString("cloning")
+        case DepResolved(ws)      => { w.WriteString("resolved");     w.WriteKey("workspace"); encWorkspaceModel(w, ws) }
+        case DepAssimilating(run) => { w.WriteString("assimilating"); w.WriteKey("run");       encRunState(w, run) }
+        case DepDone()            => w.WriteString("done")
+        case DepSkipped()         => w.WriteString("skipped")
+        case DepUnsupported(r)    => { w.WriteString("unsupported"); w.WriteKey("reason"); w.WriteString(r) }
+        case DepFailed(r)         => { w.WriteString("failed");      w.WriteKey("reason"); w.WriteString(r) }
+    }
+    w.WriteEndObject()
+}
+
+// encRunState writes the embedded per-dependency run (its units + event log), reusing
+// persist.gala's UnitRun / EngineEvent element encoders.
+func encRunState(w *json.JsonEncoderImpl, run RunState) {
+    w.WriteStartObject()
+    w.WriteKey("units"); encArray[UnitRun](w, run.Units, encUnitRun)
+    w.WriteKey("log");   encArray[EngineEvent](w, run.Log, encEngineEvent)
+    w.WriteEndObject()
+}
+
+func encWorkspaceModel(w *json.JsonEncoderImpl, m WorkspaceModel) {
+    w.WriteStartObject()
+    w.WriteKey("root");       w.WriteString(m.Root)
+    w.WriteKey("packages");   encArray[Package](w, m.Packages, encPackage)
+    w.WriteKey("crossEdges"); encArray[DepEdge](w, m.CrossEdges, encDepEdge)
+    w.WriteEndObject()
+}
+
+func encPackage(w *json.JsonEncoderImpl, p Package) {
+    w.WriteStartObject()
+    w.WriteKey("id");         w.WriteString(p.Id.Value)
+    w.WriteKey("modulePath"); w.WriteString(p.ModulePath)
+    w.WriteKey("units");      encArray[Unit](w, p.Units, encUnit)
+    w.WriteKey("edges");      encArray[DepEdge](w, p.Edges, encDepEdge)
+    w.WriteEndObject()
+}
+
+func encUnit(w *json.JsonEncoderImpl, u Unit) {
+    w.WriteStartObject()
+    w.WriteKey("id");     w.WriteString(u.Id.Value)
+    w.WriteKey("path");   w.WriteString(u.Path)
+    w.WriteKey("kind");   w.WriteString(unitKindTag(u.Kind))
+    w.WriteKey("source"); w.WriteString(u.Source)
+    w.WriteEndObject()
+}
+
+func encDepEdge(w *json.JsonEncoderImpl, e DepEdge) {
+    w.WriteStartObject()
+    w.WriteKey("from"); w.WriteString(e.From)
+    w.WriteKey("to");   w.WriteString(e.To)
+    w.WriteEndObject()
+}
+
+// unitKindTag / unitKindFromTag are the forest checkpoint's own UnitKind <-> string
+// mapping (the test helper kindTag lives in a _test file, which the library build does
+// not see, so the persist layer carries its own).
+func unitKindTag(k UnitKind) string = k match {
+    case SourceUnit() => "source"
+    case SourceTest() => "source_test"
+    case AddedTest()  => "added_test"
+}
+
+func unitKindFromTag(tag string) UnitKind {
+    if tag == "source_test" { return SourceTest() }
+    if tag == "added_test"  { return AddedTest() }
+    return SourceUnit()
+}
+
+// ----------------------------------------------------------------------------
+// Decode (positional — mirrors the encode order above)
+// ----------------------------------------------------------------------------
+
+func decodeForest(s string) DependencyForest {
+    val d = json.NewJsonDecoder(s)
+    d.StartObject()
+    d.ReadKey(); val v = d.ReadInt()
+    if v != 1 { panic("unsupported forest version") }
+    d.ReadKey(); val maxDepth = d.ReadInt()
+    d.ReadKey(); val depsBase = d.ReadString()
+    d.ReadKey(); val visited  = decArray[string](d, decStr)
+    d.ReadKey(); val deps     = decArray[DependencyRun](d, decDependencyRun)
+    d.EndObject()
+    return rebuildForest(deps, visited, maxDepth, depsBase)
+}
+
+func decDependencyRun(d *json.JsonDecoderImpl) DependencyRun {
+    d.StartObject()
+    d.ReadKey(); val node     = decDependencyNode(d)
+    d.ReadKey(); val dest     = d.ReadString()
+    d.ReadKey(); val status   = decDepResolution(d)
+    d.ReadKey(); val depth    = d.ReadInt()
+    d.ReadKey(); val children = decArray[DependencyId](d, decDependencyId)
+    d.EndObject()
+    return DependencyRun(Node = node, Dest = dest, Status = status, Depth = depth, Children = children)
+}
+
+func decDependencyId(d *json.JsonDecoderImpl) DependencyId = DependencyId(Value = d.ReadString())
+
+func decDependencyNode(d *json.JsonDecoderImpl) DependencyNode {
+    d.StartObject()
+    d.ReadKey(); val id      = d.ReadString()
+    d.ReadKey(); val module  = d.ReadString()
+    d.ReadKey(); val version = d.ReadString()
+    d.ReadKey(); val repoUrl = d.ReadString()
+    d.ReadKey(); val direct  = d.ReadBool()
+    d.EndObject()
+    return DependencyNode(
+        Id      = DependencyId(Value = id),
+        Coord   = ModuleCoord(Module = module, Version = version),
+        RepoUrl = repoUrl,
+        Direct  = direct,
+    )
+}
+
+func decDepResolution(d *json.JsonDecoderImpl) DepResolution {
+    d.StartObject()
+    d.ReadKey(); val tag = d.ReadString()
+    val status = decDepResolutionByTag(d, tag)
+    d.EndObject()
+    return status
+}
+
+func decDepResolutionByTag(d *json.JsonDecoderImpl, tag string) DepResolution {
+    if tag == "pending"      { return DepPending() }
+    if tag == "cloning"      { return DepCloning() }
+    if tag == "resolved"     { d.ReadKey(); return DepResolved(Workspace = decWorkspaceModel(d)) }
+    if tag == "assimilating" { d.ReadKey(); return DepAssimilating(Run = decRunState(d)) }
+    if tag == "done"         { return DepDone() }
+    if tag == "skipped"      { return DepSkipped() }
+    if tag == "unsupported"  { d.ReadKey(); val r = d.ReadString(); return DepUnsupported(Reason = r) }
+    if tag == "failed"       { d.ReadKey(); val r = d.ReadString(); return DepFailed(Reason = r) }
+    panic("unknown DepResolution tag: " + tag)
+}
+
+func decRunState(d *json.JsonDecoderImpl) RunState {
+    d.StartObject()
+    d.ReadKey(); val units = decArray[UnitRun](d, decUnitRun)
+    d.ReadKey(); val log   = decArray[EngineEvent](d, decEngineEvent)
+    d.EndObject()
+    return RunState(Units = units, Log = log)
+}
+
+func decWorkspaceModel(d *json.JsonDecoderImpl) WorkspaceModel {
+    d.StartObject()
+    d.ReadKey(); val root     = d.ReadString()
+    d.ReadKey(); val packages = decArray[Package](d, decPackage)
+    d.ReadKey(); val cross    = decArray[DepEdge](d, decDepEdge)
+    d.EndObject()
+    return NewWorkspaceModelFull(packages, cross, root)
+}
+
+func decPackage(d *json.JsonDecoderImpl) Package {
+    d.StartObject()
+    d.ReadKey(); val id     = d.ReadString()
+    d.ReadKey(); val module = d.ReadString()
+    d.ReadKey(); val units  = decArray[Unit](d, decUnit)
+    d.ReadKey(); val edges  = decArray[DepEdge](d, decDepEdge)
+    d.EndObject()
+    return Package(Id = PackageId(Value = id), ModulePath = module, Units = units, Edges = edges)
+}
+
+func decUnit(d *json.JsonDecoderImpl) Unit {
+    d.StartObject()
+    d.ReadKey(); val id     = d.ReadString()
+    d.ReadKey(); val p      = d.ReadString()
+    d.ReadKey(); val kind   = unitKindFromTag(d.ReadString())
+    d.ReadKey(); val source = d.ReadString()
+    d.EndObject()
+    return Unit(Id = UnitId(Value = id), Path = p, Kind = kind, Source = source)
+}
+
+func decDepEdge(d *json.JsonDecoderImpl) DepEdge {
+    d.StartObject()
+    d.ReadKey(); val from = d.ReadString()
+    d.ReadKey(); val to   = d.ReadString()
+    d.EndObject()
+    return DepEdge(From = from, To = to)
+}

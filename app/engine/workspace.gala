@@ -66,21 +66,37 @@ struct Package(
 )
 
 // WorkspaceModel is the whole scanned project: its packages, the cross-package
-// dependency edges, and a PackageMap (PackageId.Value -> Package) for O(1)
-// lookup without rescanning the array.
+// dependency edges, a PackageMap (PackageId.Value -> Package) for O(1) lookup
+// without rescanning the array, and the filesystem Root the scan read from.
+//
+// Root is the on-disk directory this model was scanned from ("" for the synthetic
+// stub, which has no real path). It is the seam the dependency resolver reads the
+// project's `go.mod` `require` block back through (ResolveDeps -> resolveForest):
+// the WorkspaceModel does not pre-parse requires, so the single place that knows a
+// project's external dependencies stays the resolver, keyed off this Root.
 struct WorkspaceModel(
     Packages   Array[Package],
     CrossEdges Array[DepEdge],
     PackageMap HashMap[string, Package],
+    Root       string,
 )
 
-// NewWorkspaceModel assembles a WorkspaceModel and derives its PackageMap from
-// the package list, so the map can never drift out of sync with Packages.
+// NewWorkspaceModel assembles a WorkspaceModel with NO recorded filesystem root
+// (Root = ""), deriving its PackageMap from the package list so the map can never
+// drift out of sync with Packages. The synthetic stub and any rootless caller use
+// this; a real disk scan uses NewWorkspaceModelFull to record where it read from.
 func NewWorkspaceModel(packages Array[Package], crossEdges Array[DepEdge]) WorkspaceModel =
+    NewWorkspaceModelFull(packages, crossEdges, "")
+
+// NewWorkspaceModelFull is NewWorkspaceModel plus the filesystem Root the scan read
+// from — the form ScanGoWorkspace uses so the resolver can re-open the project's
+// go.mod (and a checkpointed dependency workspace round-trips its Root).
+func NewWorkspaceModelFull(packages Array[Package], crossEdges Array[DepEdge], root string) WorkspaceModel =
     WorkspaceModel(
         Packages   = packages,
         CrossEdges = crossEdges,
         PackageMap = buildPackageMap(packages),
+        Root       = root,
     )
 
 func buildPackageMap(packages Array[Package]) HashMap[string, Package] =

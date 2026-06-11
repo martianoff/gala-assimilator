@@ -1,0 +1,79 @@
+package engine
+
+// Proof that a migration can START FROM A REMOTE REPO, fully OFFLINE: the
+// MockRepoCloner materializes a fixture repo tree into its own folder and ScanOrigin
+// scans it to a WorkspaceModel — the GitRepo -> cloned path -> ScanGoWorkspace arc —
+// while the local-path origin still scans in place, identical to the pre-origin
+// behavior. An unknown repo (no fixture) is surfaced as OriginUnsupported, never an
+// empty scan. No network: the cloner writes a real directory under a temp dir.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// A fixture repo: a minimal, scannable Go module (a source unit + its 1:1 source
+// test) so the scanned workspace has real shape.
+val widgetRepoFiles = ArrayOf[MockFile](
+    MockFile(RelPath = "go.mod",         Content = "module github.com/acme/widget\n\ngo 1.21\n"),
+    MockFile(RelPath = "widget.go",      Content = "package widget\n\nfunc Hello() string {\n\treturn \"hi\"\n}\n"),
+    MockFile(RelPath = "widget_test.go", Content = "package widget\n\nimport \"testing\"\n\nfunc TestHello(t *testing.T) {\n\tif Hello() == \"\" {\n\t\tt.Fatal(\"empty\")\n\t}\n}\n"),
+)
+
+func widgetCloner() RepoCloner =
+    MockRepoCloner(EmptyHashMap[string, Array[MockFile]]().Put("https://github.com/acme/widget", widgetRepoFiles))
+
+// A GitRepo origin clones the fixture into its own dest folder, then scans it: real
+// files on disk, one package, exactly one 1:1 source test counted.
+func TestGitOriginClonesThenScans(t T) T {
+    val dest = fs.MkdirTemp("", "gala_clone").GetOrElse("")
+    return ScanOrigin(widgetCloner(), GitOrigin("https://github.com/acme/widget", "v1.0.0"), dest) match {
+        case OriginScanned(p, ws) => {
+            val t1 = Eq(t, fs.Exists(path.Join(p, "widget.go")), true)
+            val t2 = Eq(t1, ws.Packages.Length(), 1)
+            val t3 = Eq(t2, ws.Root, p)
+            return Eq(t3, SourceTestCount(ws), 1)
+        }
+        case OriginUnsupported(r) => Fail(t, "expected a scanned workspace, got unsupported: " + r)
+    }
+}
+
+// The RepoCloner port itself returns Cloned(dest) on success.
+func TestMockClonerClonedPath(t T) T {
+    val dest = fs.MkdirTemp("", "gala_clone_ok").GetOrElse("")
+    return widgetCloner().Clone(CloneRequest(Url = "https://github.com/acme/widget", Ref = "", Dest = dest)) match {
+        case Cloned(p)        => Eq(t, p, dest)
+        case CloneFailed(r)   => Fail(t, "expected Cloned, got CloneFailed: " + r)
+    }
+}
+
+// An unknown repo (no fixture) is a FIRST-CLASS failure: CloneFailed at the port,
+// OriginUnsupported through ScanOrigin — never a silent empty workspace.
+func TestUnknownRepoIsSurfaced(t T) T {
+    val dest = fs.MkdirTemp("", "gala_clone_miss").GetOrElse("")
+    val cloner = EmptyMockRepoCloner()
+    val tPort = cloner.Clone(CloneRequest(Url = "https://github.com/x/missing", Ref = "", Dest = dest)) match {
+        case CloneFailed(_) => IsTrue(t, true)
+        case Cloned(_)      => Fail(t, "an unknown repo must fail to clone")
+    }
+    return ScanOrigin(cloner, GitOrigin("https://github.com/x/missing", ""), dest) match {
+        case OriginUnsupported(_) => IsTrue(tPort, true)
+        case OriginScanned(_, _)  => Fail(tPort, "an unknown repo must be unsupported, not scanned")
+    }
+}
+
+// A LocalPath origin scans in place — dest is ignored and behavior matches the
+// pre-origin local scan (two packages over the simpleproj fixture).
+func TestLocalOriginScansInPlace(t T) T {
+    val root = materializeFixture()
+    return ScanOrigin(EmptyMockRepoCloner(), LocalOrigin(root), "") match {
+        case OriginScanned(p, ws) => {
+            val t1 = Eq(t, p, root)
+            return Eq(t1, ws.Packages.Length(), 2)
+        }
+        case OriginUnsupported(r) => Fail(t, "a local scan must succeed: " + r)
+    }
+}
