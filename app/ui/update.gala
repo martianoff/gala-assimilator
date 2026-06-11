@@ -660,9 +660,9 @@ func depAct(m Model, allowed func(runview.DepRowVM) bool, action engine.DepActio
     case Some(f) => {
         val idx = m.DepCursor
         if (idx < 0 || idx >= f.Deps.Length()) { return noCmd(m) }
-        val row = runview.ProjectForest(f).Rows.Get(idx)
-        if (!allowed(row)) { return noCmd(m) }
-        val id = f.Deps.Get(idx).Node.Id
+        val dep = f.Deps.Get(idx)
+        if (!allowed(runview.ProjectDep(dep))) { return noCmd(m) }
+        val id = dep.Node.Id
         val next = m.Port.ActOnDependency(f, id, action)
         val m2 = m.Copy(Forest = Some(next))
         val cont = if (runview.ForestActionable(next)) forestTickCmd() else NoCmd[Msg]()
@@ -672,17 +672,17 @@ func depAct(m Model, allowed func(runview.DepRowVM) bool, action engine.DepActio
 }
 
 // depSelect moves the tree cursor to a clicked node.
-func depSelect(m Model, i int) Model {
-    val n = depCount(m)
-    val hi = if (n > 0) n - 1 else 0
-    return m.Copy(DepCursor = clampInt(i, 0, hi))
-}
+func depSelect(m Model, i int) Model = setDepCursor(m, i)
 
 // depNav steps the tree cursor (arrow keys / wheel) within S8.
-func depNav(m Model, dir int) Model {
+func depNav(m Model, dir int) Model = setDepCursor(m, m.DepCursor + dir)
+
+// setDepCursor places the S8 tree cursor at idx, clamped to the forest's bounds —
+// the single clamp shared by a click (depSelect) and a step (depNav).
+func setDepCursor(m Model, idx int) Model {
     val n = depCount(m)
     val hi = if (n > 0) n - 1 else 0
-    return m.Copy(DepCursor = clampInt(m.DepCursor + dir, 0, hi))
+    return m.Copy(DepCursor = clampInt(idx, 0, hi))
 }
 
 func depCount(m Model) int = m.Forest match {

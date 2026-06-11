@@ -74,7 +74,7 @@ struct ForestVM(
 // ----- forest projection ----------------------------------------------------
 
 func ProjectForest(f DependencyForest) ForestVM {
-    val rows = f.Deps.Map((d DependencyRun) => projectDep(d))
+    val rows = f.Deps.Map((d DependencyRun) => ProjectDep(d))
     val total = f.Deps.Length()
     val done = CountDepsDone(f)
     val pct = if (total == 0) 0 else (done * 100) / total
@@ -117,12 +117,17 @@ func depRowBase(d DependencyRun) DepRowVM =
         CanExpand     = false,
     )
 
-// projectDep is the single DepResolution pattern-match: it turns ONE forest node
+// ProjectDep is the single DepResolution pattern-match: it turns ONE forest node
 // into its plain row. The off-ramps (skipped / unsupported / failed) carry their
 // reason and a distinguishing flag; the in-flight states are Active (so the UI keeps
 // them out of the "settled" styling); a DepAssimilating node folds in its sub-run's
 // projected progress.
-func projectDep(d DependencyRun) DepRowVM {
+//
+// It is exported so an operator action that only needs ONE node's projected Can*
+// availability (depAct) can project that node alone, instead of building the whole
+// ForestVM (which would re-project every other node — and every in-flight sub-run —
+// to read a single row).
+func ProjectDep(d DependencyRun) DepRowVM {
     val base = depRowBase(d)
     return d.Status match {
         case DepPending()         => base.Copy(Glyph = "○", Status = "pending",      Active = true, CanSkip = true)
