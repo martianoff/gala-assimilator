@@ -36,11 +36,6 @@ frontend/backend — or a new agent backend — plugs in behind stable ports.
   receiver to a `val` first, then `.Copy(...)`.
 - **No `val _ = expr`.** GALA accepts bare expression statements; don't wrap a
   discarded call in `val _ =`.
-- **Known transpiler gotchas** (see `gala_tui/TRANSPILER_BUGS.md` for the canon):
-  `Tuple(a, b)` needs explicit type params; bare lambda params don't always infer
-  from `Map`/`ArrayTabulate`; 3-tuple returns mis-emit a 2-arg signature;
-  expression-bodied `if` inside a `Map` lambda can collapse to `any`. Prefer the
-  documented workarounds over fighting the transpiler.
 - **Internal tests** (`package <name>` matching the lib package) are the standard.
   External `package main` test files next to library sources are invalid Go layout
   and `gala test` rejects them.
