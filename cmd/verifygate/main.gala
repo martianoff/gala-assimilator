@@ -1,0 +1,36 @@
+package main
+
+import (
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "fmt"
+    "os"
+)
+
+// verifygate — a RUNNABLE harness (NOT part of the offline `gala test` suite) that
+// drives the curated reference fixture through the REAL gala toolchain verify gate.
+// It proves three things end to end against the real `gala build`/`gala test`:
+//
+//   1. the golden GALA translation clears the gate                  -> VerifyPass
+//   2. a deliberately wrong translation is rejected with the REAL
+//      toolchain diagnostics                                        -> VerifyFail
+//   3. the fix loop re-translates against those diagnostics and the
+//      unit reaches Done                                            -> fix-loop recovery
+//
+// WHY A SEPARATE CMD (not a test): invoking the real `gala` toolchain from INSIDE
+// `gala test` risks the workspace-contention bug — concurrent `gala build`/`test`
+// share a CWD-local gen/deps workspace and corrupt each other. As a standalone cmd
+// this never runs during the suite. RealVerifier always materializes and builds/tests
+// its scratch module under os.TempDir (never the project workspace), so the run is
+// isolated. Exits non-zero if any proof fails. See docs/verify-gate.md.
+//
+//   Run it:   gala run ./cmd/verifygate
+func main() {
+    val report = engine.RunReferenceVerifyGate(engine.GalaToolchainRunner())
+    fmt.Println(engine.ReferenceGateSummary(report))
+    if engine.ReferenceGateAllPassed(report) {
+        fmt.Println("verify-gate harness: ALL PROOFS HELD")
+    } else {
+        fmt.Println("verify-gate harness: FAILED — see proofs above")
+        os.Exit(1)
+    }
+}

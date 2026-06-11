@@ -125,7 +125,14 @@ func withCoverageFlag(r Result, sourceTests Array[SourceTestRef]) Result {
     )))
 }
 
+// IsUnverifiedFlag reports whether ONE flag is the gate's no-coverage flag (as
+// opposed to a genuine unsupported-construct flag). It is the per-flag classifier
+// over the gate's contract tag — the public read a projection uses to tell a vacuous
+// "no source-test coverage" pass apart from a flagged construct, without re-declaring
+// the tag string outside this gate. IsUnverified is the whole-Result read built on it.
+func IsUnverifiedFlag(f UnsupportedFlag) bool = f.Construct == unverifiedConstruct
+
 // IsUnverified reports whether a Result carries the unverified-coverage flag — the
 // public read for "this translation has no source-test signal behind it".
 func IsUnverified(r Result) bool =
-    r.Flags.Exists((f UnsupportedFlag) => f.Construct == unverifiedConstruct)
+    r.Flags.Exists((f UnsupportedFlag) => IsUnverifiedFlag(f))

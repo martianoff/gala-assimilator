@@ -5,7 +5,11 @@ import (
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
     . "martianoff/gala/test"
+    str "martianoff/gala/strings"
 )
+
+// strContains is a small assertion helper for substring checks on projected lines.
+func strContains(s string, sub string) bool = str.S(s).Contains(sub)
 
 // ============================================================================
 // Direct projection tests for app/runview. These construct engine RunStates by
@@ -225,6 +229,69 @@ func TestProjectRunUnitAttempts(t T) T {
     val vm = ProjectRun(rs)
     val t1 = Eq(t,  vm.Rows.Get(0).Attempts, 1)
     return Eq(t1, vm.Rows.Get(1).Attempts, 3)
+}
+
+// ----- correctness flags: per-unit markers + activity-log lines -------------
+
+func unverifiedFlags() Array[UnsupportedFlag] =
+    ArrayOf[UnsupportedFlag](UnsupportedFlag(
+        Construct = "unverified", Reason = "no 1:1 source test covers this unit"))
+
+func genericsFlags() Array[UnsupportedFlag] =
+    ArrayOf[UnsupportedFlag](UnsupportedFlag(
+        Construct = "generics", Reason = "no faithful target"))
+
+// A Done unit that passed with no source-test coverage projects Unverified (not
+// Flagged): the row is marked unverified, never identical to a clean pass.
+func TestProjectRunRowUnverified(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("app/main", "x", doneStatus("o", "r", unverifiedFlags()))))
+    val row = ProjectRun(rs).Rows.Get(0)
+    val t1 = IsTrue(t,  row.Unverified)
+    return IsFalse(t1, row.Flagged)
+}
+
+// A Done unit that raised an unsupported-construct flag projects Flagged (not
+// Unverified): a construct with no faithful target is surfaced on the row.
+func TestProjectRunRowFlagged(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("core/value", "x", doneStatus("o", "r", genericsFlags()))))
+    val row = ProjectRun(rs).Rows.Get(0)
+    val t1 = IsTrue(t,  row.Flagged)
+    return IsFalse(t1, row.Unverified)
+}
+
+// A non-Done unit carries neither marker (flags only exist on a translation Result).
+func TestProjectRunRowNoFlagsWhenNotDone(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](mkUnit("a", "x", Verifying())))
+    val row = ProjectRun(rs).Rows.Get(0)
+    val t1 = IsFalse(t,  row.Flagged)
+    return IsFalse(t1, row.Unverified)
+}
+
+// Each flag on a Done unit becomes an activity-log line — an unsupported flag and
+// an unverified flag each leave a distinct, visible trace.
+func TestProjectRunFlagLogLines(t T) T {
+    val rs = rsOf(ArrayOf[UnitRun](
+        mkUnit("core/value", "x", doneStatus("o", "r", genericsFlags())),
+        mkUnit("app/main",   "x", doneStatus("o", "r", unverifiedFlags()))))
+    val log = ProjectRun(rs).Log
+    val t1 = IsTrue(t,  log.Exists((ln) => strContains(ln, "flagged generics")))
+    return IsTrue(t1, log.Exists((ln) => strContains(ln, "unverified")))
+}
+
+// The retry log line carries the attempt number and a trimmed, single-line reason:
+// a long multi-line verify diagnostic is collapsed and capped, never dumped whole.
+func TestProjectRunRetryLineTrimmed(t T) T {
+    val long = "first diagnostic line\nsecond line with much more detail that should be cut TAILTOKEN"
+    val rs = RunState(
+        Units = ArrayOf[UnitRun](mkUnit("core/value", "x", Translating())),
+        Log   = ArrayOf[EngineEvent](EvRetry(Unit = UnitId(Value = "core/value"), Attempt = 3, Reason = long)))
+    val line = ProjectRun(rs).Log.Get(0)
+    val t1 = IsTrue(t,  strContains(line, "retry 3"))   // the attempt number
+    val t2 = IsTrue(t1, strContains(line, "…"))          // trimmed marker
+    val t3 = IsFalse(t2, strContains(line, "TAILTOKEN")) // the long tail is cut
+    return IsFalse(t3, strContains(line, "\n"))          // collapsed to one line
 }
 
 // An incomplete run (a transient unit remains) is still iterating → Complete false.

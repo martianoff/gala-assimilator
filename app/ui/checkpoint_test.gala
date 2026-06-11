@@ -72,6 +72,23 @@ func TestSaveThenResumeRestoresDoneCount(t T) T {
     return Eq(t5, doneOf(m1), d)
 }
 
+// With a saved checkpoint present, choosing Start fresh (instead of Resume)
+// dismisses the prompt and drops to the normal new-migration flow (S1), carrying
+// no stale run — the new scan will overwrite the old checkpoint when it saves.
+func TestResumeChoiceStartFreshGoesToNewFlow(t T) T {
+    val root = tempRoot()
+    val port = engine.MockEngine()
+    val mid = midRunState(port, 6)
+    doSave(port, mid, root)
+    val offer = runview.ClassifyLoad(port.LoadCheckpoint(CheckpointPath(root)))
+    val t1 = Eq(t, offer.Kind, "loaded")
+    val m0 = NewModelResume(mockFactory(), offer, false, 110, 30)
+    val t2 = Eq(t1, m0.Screens.Current(), RouteS0())     // resume prompt is up
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MStartFresh()))
+    val t3 = Eq(t2, m1.Screens.Current(), RouteS1())     // falls back to the normal flow
+    return IsTrue(t3, m1.Run.IsEmpty())                  // no stale run carried over
+}
+
 // No checkpoint → normal S1 start (no resume prompt).
 func TestMissingGoesToS1(t T) T {
     val root = tempRoot()   // empty dir → no state.json
