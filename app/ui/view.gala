@@ -88,23 +88,13 @@ func minI(a int, b int) int = if (a < b) a else b
 
 // s1View groups the interview into SOURCE / TARGET / OPTIONS sections, each a
 // cyan heading over indented fields, and closes with a primary scan action and a
-// key-hint footer so the keyboard model (tab/arrows/enter) is discoverable. When
-// wide, retry + agent share one aligned row; when narrow they stack.
+// key-hint footer so the keyboard model (tab/arrows/enter) is discoverable.
 func s1View(m Model) Widget {
-    val combined = m.Cols >= WideCols()
-    val options = if (combined)
-        ArrayOf[LayoutChild](
-            Fixed(1, unsupportedRow(m)),
-            Fixed(1, ambiguityRow(m)),
-            Fixed(1, retryBackendRow(m)),
-        )
-    else
-        ArrayOf[LayoutChild](
-            Fixed(1, unsupportedRow(m)),
-            Fixed(1, ambiguityRow(m)),
-            Fixed(1, retryRow(m)),
-            Fixed(1, backendRow(m)),
-        )
+    val options = ArrayOf[LayoutChild](
+        Fixed(1, unsupportedRow(m)),
+        Fixed(1, ambiguityRow(m)),
+        Fixed(1, retryRow(m)),
+    )
     // The SOURCE block reflows by origin: a local directory shows the picker + the
     // detection readout; a GitHub URL shows the repo-URL + optional-ref fields.
     val sourceChildren = if (m.OriginGit)
@@ -257,51 +247,41 @@ func unsupportedRow(m Model) Widget {
     return subFieldRow("Unsupported", group)
 }
 
-func backendGroup(m Model) Widget {
-    val f = m.Focus.IsFocused(PaneBackend())
-    val isGo     = BackendEq(m.Backend, GoBackend())
-    val isMock   = BackendEq(m.Backend, MockBackend())
-    val isClaude = BackendEq(m.Backend, ClaudeBackend())
-    return Row(ArrayOf[LayoutChild](
-        radioCell(isGo,     f, "Go",     MSetBackend(B = GoBackend())),
-        radioCell(isMock,   f, "Mock",   MSetBackend(B = MockBackend())),
-        radioCell(isClaude, f, "Claude", MSetBackend(B = ClaudeBackend())),
-    ))
-}
-
 func retryControl(m Model) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(7, stepperWidget(m.Retry, m.Focus.IsFocused(PaneRetry()))),
         Fixed(10, TextStyled(" per unit", DefaultStyle().WithDim())),
     ))
 
-// retryBackendRow keeps retry and agent on one row when wide, but anchors the
-// agent group right after its label (a small fixed gap, not a screen-edge Flex)
-// so it reads as part of the form instead of floating off to the right.
-func retryBackendRow(m Model) Widget =
-    Row(ArrayOf[LayoutChild](
-        Fixed(4, Text("")),
-        Fixed(subLabelW(), TextStyled("Retry", DefaultStyle().WithDim())),
-        Fixed(18, retryControl(m)),
-        Fixed(3, Text("")),
-        Fixed(8, TextStyled("Agent", DefaultStyle().WithDim())),
-        Flex(1, backendGroup(m)),
-    ))
-
 func retryRow(m Model) Widget = subFieldRow("Retry", retryControl(m))
-func backendRow(m Model) Widget = subFieldRow("Agent", backendGroup(m))
 
+// scanRow is the primary action, left-aligned under the form (not floating off to
+// the screen edge). With a GitHub origin and no valid repo URL yet, the button is
+// shown disabled next to an inline hint that points back at the Repo URL field —
+// so a blocked scan reads as "fill that in first", not as a stray placeholder.
 func scanRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneScan())
     val valid = !m.OriginGit || looksLikeRepoUrl(m.RepoUrl)
-    val label = if (m.Scanning) "scanning…"
-        else if (!valid) "enter repo url"
-        else "scan project →"
+    val label = if (m.Scanning) "scanning…" else "scan project →"
+    if (valid) {
+        return Row(ArrayOf[LayoutChild](
+            Fixed(4, Text("")),
+            Fixed(20, btnWidget(label, focused, MScanRequested())),
+        ))
+    }
     return Row(ArrayOf[LayoutChild](
+        Fixed(4, Text("")),
+        Fixed(20, disabledBtn("scan project →", focused)),
         Fixed(2, Text("")),
-        Flex(1, Text("")),
-        Fixed(20, btnWidget(label, focused, MScanRequested())),
+        Flex(1, TextStyled("↑ enter a repo URL above first", DefaultStyle().WithFg(BrightYellow()))),
     ))
+}
+
+// disabledBtn renders a button-shaped, non-actionable control: same brackets as
+// btnWidget but dimmed, so it reads as "not ready" rather than clickable.
+func disabledBtn(label string, focused bool) Widget {
+    val style = if (focused) DefaultStyle().WithReverse().WithDim() else DefaultStyle().WithDim()
+    return TextStyled("[ " + label + " ]", style)
 }
 
 // ============================================================================
@@ -893,7 +873,12 @@ func browseRow(b BrowseState, idx int) Widget {
     val marker = if (e.Marker == "") "" else "   (" + e.Marker + ")"
     val text = "  " + caret + name + marker
     val style = browseRowStyle(selected, e.Marker != "")
-    return TextStyled(text, style).OnClick(MBrowseClick(Idx = idx))
+    // Single click highlights the row; double click descends into it (the clicked
+    // index, not the stale cursor — the highlighting single-click is suppressed
+    // when the double fires).
+    return TextStyled(text, style)
+        .OnClick(MBrowseClick(Idx = idx))
+        .OnDoubleClick(MBrowseOpenAt(Idx = idx))
 }
 
 func browseRowStyle(selected bool, isProject bool) Style {

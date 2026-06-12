@@ -38,7 +38,6 @@ func PaneRef() string         = "ref"     // optional branch / tag / commit (git
 func PaneTarget() string      = "target"
 func PaneUnsupported() string = "unsupported"
 func PaneRetry() string       = "retry"
-func PaneBackend() string     = "backend"
 func PaneAmbiguity() string   = "ambiguity"
 func PaneScan() string        = "scan"
 
@@ -57,7 +56,6 @@ func s1Panes() Array[string] =
         PaneTarget(),
         PaneUnsupported(),
         PaneRetry(),
-        PaneBackend(),
         PaneAmbiguity(),
         PaneScan(),
     )
@@ -151,12 +149,11 @@ func browseDirs() Array[string] =
     )
 
 // NewModel builds the initial state for the given engine-port factory and
-// viewport. The default backend is Go (the real scanner), matching the app's
-// prior hardcoded GoEngine; the active Port is built from that and rebuilt from
-// the S1 selection when a scan starts.
+// viewport. Claude is the only user-facing backend, so it is the default; the
+// active Port is built from it once and reused for the whole run.
 func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model {
     val dir = browseDirs().Get(0)
-    val defaultBackend = GoBackend()
+    val defaultBackend = ClaudeBackend()
     return Model(
         Screens  = NewScreenStack(RouteS1()),
         Focus    = NewFocusRing(s1Panes()),

@@ -36,37 +36,22 @@ func UnsupportedEq(a UnsupportedPolicy, b UnsupportedPolicy) bool = a match {
     case StopAll()      => b match { case StopAll()      => true case _ => false }
 }
 
-// AgentBackend selects which engine the run uses. The label is shown in S1; the
-// name is what flows to the engine's `SelectBackend(name)` factory:
-//   Go     → "go"     real Go scanner on the mock translator (default)
-//   Mock   → "mock"   fully offline fixture engine
-//   Claude → "claude" live Claude-backed translator
+// AgentBackend selects which engine the run uses. The name is what flows to the
+// engine's `SelectBackend(name)` factory. Claude is the only user-facing backend
+// (the live Claude-backed translator) and the default; Mock is retained for the
+// offline startup checkpoint probe and the test suite — it is not selectable in
+// the UI.
+//   Mock   → "mock"   fully offline fixture engine (probe / tests)
+//   Claude → "claude" live Claude-backed translator (default)
 sealed type AgentBackend {
-    case GoBackend()
     case MockBackend()
     case ClaudeBackend()
 }
 
-func BackendLabel(b AgentBackend) string = b match {
-    case GoBackend()     => "Go"
-    case MockBackend()   => "Mock"
-    case ClaudeBackend() => "Claude"
-}
-
 // BackendName is the token passed to engine.SelectBackend.
 func BackendName(b AgentBackend) string = b match {
-    case GoBackend()     => "go"
     case MockBackend()   => "mock"
     case ClaudeBackend() => "claude"
-}
-
-func BackendOptions() Array[AgentBackend] =
-    ArrayOf[AgentBackend](GoBackend(), MockBackend(), ClaudeBackend())
-
-func BackendEq(a AgentBackend, b AgentBackend) bool = a match {
-    case GoBackend()     => b match { case GoBackend()     => true case _ => false }
-    case MockBackend()   => b match { case MockBackend()   => true case _ => false }
-    case ClaudeBackend() => b match { case ClaudeBackend() => true case _ => false }
 }
 
 // Target-language options (the cycler). GALA is the first supported target.

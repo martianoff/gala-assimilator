@@ -43,7 +43,9 @@ func NewProgramResume(
 // offers Resume / Start fresh accordingly; auto-save is on for the live run.
 func RunApp(makePort func(string) engine.EnginePort) Model {
     val (w, h) = TermSize()
-    val probePort = makePort(BackendName(GoBackend()))
+    // The launch checkpoint probe only reads a file, so build it on the offline
+    // Mock engine — never spin up the live Claude backend just to read disk.
+    val probePort = makePort(BackendName(MockBackend()))
     val offer = runview.ClassifyLoad(probePort.LoadCheckpoint(CheckpointPath(DefaultSourceDir())))
     val program = NewProgramResume(makePort, offer, w, h)
     return RunWithMouse[Model, Msg](program, (ev) => inputToMsg(ev), NoSubs[Msg]())

@@ -8,45 +8,21 @@ import (
 )
 
 // ============================================================================
-// S1 backend selection → engine factory. A recording factory captures the name
-// the UI passes to engine.SelectBackend when a scan starts, proving the S1
-// choice drives which engine runs. The factory always returns the offline
-// MockEngine, so selecting "claude" still never touches the live backend here.
+// Backend → engine factory. Claude is the only user-facing backend, so a scan
+// always hands "claude" to engine.SelectBackend. A recording factory captures
+// that name (and returns the offline MockEngine, so gala test never touches the
+// live backend), proving the run is wired through the port.
 // ============================================================================
 
-// scanWithBackend selects `b` in S1, starts a scan, and returns the backend
-// name the UI handed to the (recording) factory.
-func scanWithBackend(b AgentBackend) string {
-    var captured = ""
-    val factory = (name string) => {
-        captured = name
-        return engine.MockEngine()
-    }
-    val program = NewProgram(factory, 110, 30)
-    val (_, _) = StepAll(program, ArrayOf[Msg](MSetBackend(B = b), MScanRequested()))
-    return captured
-}
-
-func TestGoSelectionFlowsToFactory(t T) T =
-    Eq(t, scanWithBackend(GoBackend()), "go")
-
-func TestMockSelectionFlowsToFactory(t T) T =
-    Eq(t, scanWithBackend(MockBackend()), "mock")
-
-// "claude" must flow to SelectBackend, but the test factory returns MockEngine,
-// so gala test stays fully offline.
-func TestClaudeSelectionFlowsToFactoryOffline(t T) T =
-    Eq(t, scanWithBackend(ClaudeBackend()), "claude")
-
-// The default backend (no explicit selection) is Go — the real scanner.
-func TestDefaultBackendIsGo(t T) T {
+// The default (and only) backend is Claude; on scan, "claude" flows to the factory.
+func TestDefaultBackendFlowsToFactory(t T) T {
     var captured = ""
     val factory = (name string) => {
         captured = name
         return engine.MockEngine()
     }
     val (_, _) = StepAll(NewProgram(factory, 110, 30), ArrayOf[Msg](MScanRequested()))
-    return Eq(t, captured, "go")
+    return Eq(t, captured, "claude")
 }
 
 // The selected port is installed on the model and drives the rest of the run:
@@ -54,8 +30,7 @@ func TestDefaultBackendIsGo(t T) T {
 // Scanning is set (the Async Scan→Plan Cmd was issued).
 func TestSelectedPortInstalledAndScanning(t T) T {
     val factory = (name string) => engine.MockEngine()
-    val (m1, cmds) = StepAll(NewProgram(factory, 110, 30),
-        ArrayOf[Msg](MSetBackend(B = MockBackend()), MScanRequested()))
+    val (m1, cmds) = StepAll(NewProgram(factory, 110, 30), ArrayOf[Msg](MScanRequested()))
     val t1 = IsTrue(t, m1.Scanning)
     return IsTrue(t1, cmds.NonEmpty())
 }

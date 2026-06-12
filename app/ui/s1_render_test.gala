@@ -9,8 +9,7 @@ import (
 
 // ============================================================================
 // S1 render / snapshot tests at two viewport widths + the below-minimum
-// resize notice. The reflow assertions are the real point: the same Model
-// renders retry+backend combined when wide and stacked when narrow.
+// resize notice.
 // ============================================================================
 
 func TestS1WideRendersEveryControl(t T) T {
@@ -24,10 +23,9 @@ func TestS1WideRendersEveryControl(t T) T {
     val t6 = IsTrue(t5, out.Contains("‹ GALA ›"))
     val t7 = IsTrue(t6, out.Contains("(•) flag & continue"))
     val t8 = IsTrue(t7, out.Contains("( ) skip"))
-    val t9 = IsTrue(t8, out.Contains("(•) Go"))   // Go is the default backend
-    val t10 = IsTrue(t9, out.Contains("‹ prefer immutable + Copy ›"))
-    val t11 = IsTrue(t10, out.Contains("[ scan project → ]"))
-    return IsTrue(t11, out.Contains("tab move"))                      // key-hint footer
+    val t9 = IsTrue(t8, out.Contains("‹ prefer immutable + Copy ›"))
+    val t10 = IsTrue(t9, out.Contains("[ scan project → ]"))
+    return IsTrue(t10, out.Contains("tab move"))                      // key-hint footer
 }
 
 func TestS1NarrowRendersEveryControl(t T) T {
@@ -37,28 +35,16 @@ func TestS1NarrowRendersEveryControl(t T) T {
     val t2 = IsTrue(t1, out.Contains("Language"))
     val t3 = IsTrue(t2, out.Contains("(•) flag & continue"))
     val t4 = IsTrue(t3, out.Contains("Retry"))
-    val t5 = IsTrue(t4, out.Contains("Agent"))
-    return IsTrue(t5, out.Contains("[ scan project → ]"))
+    return IsTrue(t4, out.Contains("[ scan project → ]"))
 }
 
-// Wide: retry + agent share one row.
-func TestS1WideCombinesRetryAndBackend(t T) T {
+// The Agent backend selector was removed — Claude is the only backend now, so S1
+// shows a Retry row and no "Agent" control at either width.
+func TestS1HasRetryButNoAgent(t T) T {
     val m = NewModel(mockFactory(), 110, 20)
-    val lines = str.S(Snapshot(view(m), 110, 20)).Lines()
-    val combined = lines.Exists((ln) => ln.Contains("Retry") && ln.Contains("Agent"))
-    return IsTrue(t, combined)
-}
-
-// Narrow: retry + agent are on separate rows (the layout reflowed).
-func TestS1NarrowStacksRetryAndBackend(t T) T {
-    val m = NewModel(mockFactory(), 72, 20)
-    val lines = str.S(Snapshot(view(m), 72, 20)).Lines()
-    val combined = lines.Exists((ln) => ln.Contains("Retry") && ln.Contains("Agent"))
-    val hasRetry = lines.Exists((ln) => ln.Contains("Retry"))
-    val hasBackend = lines.Exists((ln) => ln.Contains("Agent"))
-    val t1 = IsFalse(t, combined)
-    val t2 = IsTrue(t1, hasRetry)
-    return IsTrue(t2, hasBackend)
+    val out = str.S(Snapshot(view(m), 110, 20))
+    val t1 = IsTrue(t, out.Contains("Retry"))
+    return IsFalse(t1, out.Contains("Agent"))
 }
 
 // Below the declared minimum the layout collapses to a resize notice.

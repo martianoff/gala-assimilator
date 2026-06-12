@@ -63,13 +63,13 @@ func TestLooksLikeRepoUrl(t T) T {
 }
 
 // A git-origin scan with an invalid URL is guarded: it never enters the scanning
-// state (and the button shows the hint instead of "scan project").
+// state, and S1 shows the inline hint pointing back at the Repo URL field.
 func TestGitScanGuardedWhenUrlInvalid(t T) T {
     val m = NewModel(mockFactory(), 110, 30).Copy(OriginGit = true, RepoUrl = "")
     val (m1, _) = StepAll2(m, ArrayOf[Msg](MScanRequested()))
     val t1 = IsFalse(t, m1.Scanning)
     val out = str.S(Snapshot(view(m1), 110, 30))
-    return IsTrue(t1, out.Contains("enter repo url"))
+    return IsTrue(t1, out.Contains("enter a repo URL"))
 }
 
 // A valid URL enables the git scan: it enters the scanning state and emits the
