@@ -128,7 +128,7 @@ func s1View(m Model) Widget {
     val errChildren = if (m.ScanError == "")
         EmptyArray[LayoutChild]()
     else
-        ArrayOf[LayoutChild](Fixed(1, scanErrorRow(m)))
+        scanErrorRows(m)
     val tail = errChildren.AppendAll(ArrayOf[LayoutChild](
         Fixed(1, Text("")),
         Fixed(1, scanRow(m)),
@@ -169,12 +169,23 @@ func refRow(m Model) Widget {
     ))
 }
 
-// scanErrorRow surfaces a git clone/scan failure inline on S1 (never a silent dead end).
-func scanErrorRow(m Model) Widget =
-    Row(ArrayOf[LayoutChild](
-        Fixed(4, Text("")),
-        Flex(1, TextStyled("⚠ " + m.ScanError, DefaultStyle().WithFg(BrightYellow()))),
-    ))
+// scanErrorRows surfaces a git clone/scan failure inline on S1 (never a silent dead
+// end) as a plain-language block: what failed, the underlying reason, and what to
+// try next — instead of a single cryptic warning line.
+func scanErrorRows(m Model) Array[LayoutChild] =
+    ArrayOf[LayoutChild](
+        Fixed(1, errLine("✗ Couldn't start the migration", DefaultStyle().WithBold().WithFg(BrightRed()))),
+        Fixed(1, errLine("  " + m.ScanError, DefaultStyle().WithFg(BrightYellow()))),
+        Fixed(1, errLine(scanErrorHint(m), DefaultStyle().WithDim())),
+    )
+
+func errLine(text string, style Style) Widget =
+    Row(ArrayOf[LayoutChild](Fixed(4, Text("")), Flex(1, TextStyled(text, style))))
+
+// scanErrorHint tells the user the concrete next step for the origin they chose.
+func scanErrorHint(m Model) string =
+    if (m.OriginGit) "  Check the repo URL and branch are correct and reachable, then press Enter to retry."
+    else "  Check the project folder path, then press Enter to retry."
 
 func headerRow(title string) Widget =
     Row(ArrayOf[LayoutChild](
@@ -515,7 +526,7 @@ func savedIndicator(m Model) Widget {
     if (m.LastSaveOk) {
         return TextStyled("  checkpoint saved ✓", DefaultStyle().WithDim().WithFg(BrightGreen()))
     }
-    return TextStyled("  checkpoint save failed ✗", DefaultStyle().WithFg(BrightYellow()))
+    return TextStyled("  ⚠ couldn't save checkpoint — progress may be lost", DefaultStyle().WithFg(BrightYellow()))
 }
 
 func progressBar(rv runview.RunVM) Widget =
