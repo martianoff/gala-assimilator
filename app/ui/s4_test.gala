@@ -44,7 +44,7 @@ func TestS4WideRendersDiffRationaleVerify(t T) T {
     val t6 = IsTrue(t5, out.Contains("mock output"))                // rationale
     val t7 = IsTrue(t6, out.Contains("Verify"))
     val t8 = IsTrue(t7, out.Contains("done"))
-    return IsTrue(t8, out.Contains("a accept"))                     // action bar
+    return IsTrue(t8, out.Contains("accept  a"))                    // action bar
 }
 
 func TestS4NarrowRendersStacked(t T) T {

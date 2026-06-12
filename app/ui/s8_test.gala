@@ -210,11 +210,11 @@ func TestS8SkipViaMouse(t T) T {
     val s0 = s8Harness().Start()
         .SendMsg(MDepsResolved(Forest = oneDepForest(engine.DepPending())))
         .SendMsg(MOpenDeps())
-    val rowOpt = s0.FindRow("s skip")
+    val rowOpt = s0.FindRow("skip  s")
     return rowOpt match {
         case Some(y) => {
             val rowText = str.S(s0.Text()).Lines().Get(y)
-            return rowText.IndexOf("s skip") match {
+            return rowText.IndexOf("skip  s") match {
                 case Some(x) => {
                     val s1 = s0.Click(x + 1, y)
                     return Eq(t, depRowStatus(s1.Model, 0), "skipped")

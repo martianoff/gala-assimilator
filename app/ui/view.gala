@@ -184,7 +184,7 @@ func headerRow(title string) Widget =
     ))
 
 func s1Footer() Widget =
-    TextStyled("  tab move · ←→ change · enter select · q quit", DefaultStyle().WithDim())
+    TextStyled("  Tab next field · ←/→ change value · Enter scan · q quit", DefaultStyle().WithDim())
 
 // sectionRow is a cyan section heading; the fields beneath it indent one level
 // further (subFieldRow) so the grouping reads at a glance.
@@ -364,23 +364,25 @@ func kvRow(label string, value string) Widget =
 func s2Buttons(m Model) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Fixed(14, btnWidget("← back", m.S2Focus == PaneBack(), MBack())),
+        btnKeyW("← back", "esc", m.S2Focus == PaneBack(), MBack()),
         Fixed(2, Text("")),
-        Fixed(22, depsButton(m)),
+        depsChild(m),
         Flex(1, Text("")),
-        Fixed(26, btnWidget("start assimilation →", m.S2Focus == PaneStart(), MStartRun())),
+        btnKeyW("start assimilation", "⏎", m.S2Focus == PaneStart(), MStartRun()),
         Fixed(2, Text("")),
     ))
 
-// depsButton opens the dependency-forest screen (S8). It shows the resolved node
+// depsChild opens the dependency-forest screen (S8). It shows the resolved node
 // count once the background resolve has landed, so the user sees there is a forest
-// to inspect; mouse-clickable here and reachable by 'd' on S2/S3.
-func depsButton(m Model) Widget {
-    val label = m.Forest match {
-        case Some(f) => s"dependencies (${f.Deps.Length()}) →"
-        case None()  => "dependencies →"
+// to inspect; mouse-clickable and reachable by 'd' on S2/S3 (the hotkey is on the
+// button). Auto-sized so the dynamic count never clips.
+func depsChild(m Model) LayoutChild {
+    val n = m.Forest match {
+        case Some(f) => f.Deps.Length()
+        case None()  => 0
     }
-    return btnWidget(label, false, MOpenDeps())
+    val label = if (n > 0) s"dependencies (${n})" else "dependencies"
+    return btnKeyW(label, "d", false, MOpenDeps())
 }
 
 // ============================================================================
@@ -497,11 +499,11 @@ func s3Actions(m Model, rv runview.RunVM) Widget {
         Text("")
     return Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Fixed(16, btnWidget("open unit →", false, MOpenUnit())),
+        btnKeyW("open unit", "⏎", false, MOpenUnit()),
         Fixed(2, Text("")),
-        Fixed(13, btnWidget("report →", false, MOpenReport())),
+        btnKeyW("report", "p", false, MOpenReport()),
         Fixed(2, Text("")),
-        Fixed(18, depsButton(m)),
+        depsChild(m),
         Flex(1, savedIndicator(m)),
         Fixed(20, badge),
         Fixed(1, Text("")),
@@ -558,7 +560,7 @@ func stackedBoard(m Model, rv runview.RunVM) Widget =
     ))
 
 func s3Footer() Widget =
-    TextStyled("  tab switch · ↑↓ navigate · enter open · p report · d deps · esc back · q quit",
+    TextStyled("  Tab switch pane · ↑/↓ move selection · (actions on buttons above) · Esc back · q quit",
         DefaultStyle().WithDim())
 
 // ----- left: unit tree by package -------------------------------------------
@@ -694,7 +696,7 @@ func s4Board(m Model, vm runview.UnitDetailVM) Widget {
         Fixed(1, kvRow("Flags", flags)),
         Fixed(1, kvRow("Verify", vm.Status)),
         Fixed(1, s4ActionBar()),
-        Fixed(1, TextStyled("  a accept · r retry · s skip · e edit (stub) · esc back",
+        Fixed(1, TextStyled("  (actions on buttons above · edit is a stub) · Esc back to dashboard",
             DefaultStyle().WithDim())),
     )))
 }
@@ -735,10 +737,13 @@ func diffStyle(isSource bool, same bool) Style {
 func s4ActionBar() Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Fixed(12, btnWidget("a accept", false, MReviewAccept())),
-        Fixed(11, btnWidget("r retry", false, MReviewRetry())),
-        Fixed(10, btnWidget("s skip", false, MReviewSkip())),
-        Fixed(10, btnWidget("e edit", false, MReviewEdit())),
+        btnKeyW("accept", "a", false, MReviewAccept()),
+        Fixed(1, Text("")),
+        btnKeyW("retry", "r", false, MReviewRetry()),
+        Fixed(1, Text("")),
+        btnKeyW("skip", "s", false, MReviewSkip()),
+        Fixed(1, Text("")),
+        btnKeyW("edit", "e", false, MReviewEdit()),
         Flex(1, Text("")),
     ))
 
@@ -773,7 +778,7 @@ func s5Board(m Model, vm runview.UnitDetailVM) Widget {
             Fixed(14, btnWidget("submit ↵", true, MAnswerSubmit())),
             Flex(1, Text("")),
         ))),
-        Fixed(1, TextStyled("  type to edit · enter submit · esc cancel", DefaultStyle().WithDim())),
+        Fixed(1, TextStyled("  type your answer · Enter submit · Esc cancel", DefaultStyle().WithDim())),
     )))
 }
 
@@ -812,10 +817,10 @@ func s6Board(m Model, rv runview.RunVM) Widget {
         Fixed(1, Text("")),
         Fixed(1, Row(ArrayOf[LayoutChild](
             Fixed(2, Text("")),
-            Fixed(26, btnWidget("resume from checkpoint", true, MResumeFromDisk())),
+            btnKeyW("resume from checkpoint", "r", true, MResumeFromDisk()),
         ))),
         Flex(1, Text("")),
-        Fixed(1, TextStyled("  r resume from checkpoint · esc back · q quit", DefaultStyle().WithDim())),
+        Fixed(1, TextStyled("  (resume on the button above) · Esc back · q quit", DefaultStyle().WithDim())),
     )))
 }
 
@@ -842,7 +847,7 @@ func s7Board(m Model, b BrowseState) Widget =
         Flex(1, browseList(m, b)),
         Fixed(1, Text("")),
         Fixed(1, s7Buttons()),
-        Fixed(1, TextStyled("  ↑↓ move · enter open · s select · ← parent · esc cancel",
+        Fixed(1, TextStyled("  ↑/↓ move · ← parent dir · (open/select on buttons) · Esc cancel",
             DefaultStyle().WithDim())),
     )))
 
@@ -900,11 +905,11 @@ func browseRowStyle(selected bool, isProject bool) Style {
 func s7Buttons() Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Fixed(12, btnWidget("open ▸", false, MBrowseOpen())),
+        btnKeyW("open", "⏎", false, MBrowseOpen()),
         Fixed(2, Text("")),
-        Fixed(14, btnWidget("select ✓", false, MBrowseSelect())),
+        btnKeyW("select", "s", false, MBrowseSelect()),
         Fixed(2, Text("")),
-        Fixed(12, btnWidget("cancel", false, MBack())),
+        btnKeyW("cancel", "esc", false, MBack()),
         Flex(1, Text("")),
     ))
 
@@ -1056,19 +1061,24 @@ func s8Actions(m Model, fv runview.ForestVM) Widget {
     val row = fv.Rows.Get(idx)
     return Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Fixed(13, depActionBtn("o resolve", row.CanResolve, MDepResolve())),
-        Fixed(10, depActionBtn("s skip", row.CanSkip, MDepSkip())),
-        Fixed(11, depActionBtn("r retry", row.CanRetry, MDepRetry())),
-        Fixed(12, depActionBtn("x expand", row.CanExpand, MDepExpand())),
+        depActionChild("resolve", "o", row.CanResolve, MDepResolve()),
+        Fixed(1, Text("")),
+        depActionChild("skip", "s", row.CanSkip, MDepSkip()),
+        Fixed(1, Text("")),
+        depActionChild("retry", "r", row.CanRetry, MDepRetry()),
+        Fixed(1, Text("")),
+        depActionChild("expand", "x", row.CanExpand, MDepExpand()),
         Flex(1, depsSavedIndicator(m)),
     ))
 }
 
-// depActionBtn renders an enabled (clickable) action button, or a dim non-clickable
-// label when the action does not apply to the cursored node.
-func depActionBtn(label string, enabled bool, msg Msg) Widget {
-    if (enabled) { return btnWidget(label, false, msg) }
-    return TextStyled("[ " + label + " ]", DefaultStyle().WithDim())
+// depActionChild renders an enabled (clickable) action button with its hotkey, or a
+// dim non-clickable label when the action does not apply to the cursored node.
+// Auto-sized so labels never clip.
+func depActionChild(label string, keyHint string, enabled bool, msg Msg) LayoutChild {
+    val w = RuneCount(label) + RuneCount(keyHint) + 6
+    if (enabled) { return Fixed(w, btnKey(label, keyHint, false, msg)) }
+    return Fixed(w, TextStyled("[ " + label + "  " + keyHint + " ]", DefaultStyle().WithDim()))
 }
 
 func depsSavedIndicator(m Model) Widget {
@@ -1080,7 +1090,7 @@ func depsSavedIndicator(m Model) Widget {
 }
 
 func s8Footer() Widget =
-    TextStyled("  ↑↓ move · o resolve · s skip · r retry · x expand · esc back · q quit",
+    TextStyled("  ↑/↓ move selection · (actions on buttons above) · Esc back · q quit",
         DefaultStyle().WithDim())
 
 // ============================================================================
@@ -1095,6 +1105,19 @@ func btnWidget(label string, focused bool, msg Msg) Widget {
         DefaultStyle().WithBold().WithFg(BrightGreen())
     return TextStyled(txt, style).OnClick(msg)
 }
+
+// btnKey is btnWidget with the action's keyboard shortcut shown after the label —
+// e.g. "[ report  p ]" — so every action is operable (and discoverable) by
+// keyboard, not just mouse. Use the visible key the update loop listens for
+// ("p", "d", "⏎", "esc", "s", …).
+func btnKey(label string, keyHint string, focused bool, msg Msg) Widget =
+    btnWidget(label + "  " + keyHint, focused, msg)
+
+// btnKeyW is btnKey wrapped in a Fixed cell sized to the rendered text, so callers
+// don't hand-tune column widths when a hotkey is appended. Width = "[ " + label +
+// "  " + key + " ]".
+func btnKeyW(label string, keyHint string, focused bool, msg Msg) LayoutChild =
+    Fixed(RuneCount(label) + RuneCount(keyHint) + 6, btnKey(label, keyHint, focused, msg))
 
 func cyclerWidget(value string, focused bool, msg Msg) Widget {
     val txt = "‹ " + value + " ›"
