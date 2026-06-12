@@ -46,7 +46,6 @@ sealed type Msg {
     case MCycleTarget()
     case MSetUnsupported(P UnsupportedPolicy)
     case MStepRetry(Dir int)
-    case MSetBackend(B AgentBackend)
     case MCycleAmbiguity()
     case MScanRequested()
 
@@ -67,6 +66,7 @@ sealed type Msg {
     case MBrowseLoaded(State BrowseState)      // async listing landed
     case MBrowseClick(Idx int)                 // mouse: highlight a row
     case MBrowseOpen()                         // descend into the highlighted dir
+    case MBrowseOpenAt(Idx int)                // mouse: double-click descends into a row
     case MBrowseSelect()                       // commit the highlighted dir as source
     case MSourceDetected(Info SourceInfo)      // async real detection landed
 
@@ -130,16 +130,13 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
         return (mf.Copy(Unsupported = p), NoCmd[Msg]())
     }
     case MStepRetry(d)      => (stepRetry(focusOn(m, PaneRetry()), d), NoCmd[Msg]())
-    case MSetBackend(b)     => {
-        val mf = focusOn(m, PaneBackend())
-        return (mf.Copy(Backend = b), NoCmd[Msg]())
-    }
     case MCycleAmbiguity()  => (cycleAmbiguity(focusOn(m, PaneAmbiguity()), 1), NoCmd[Msg]())
     case MScanRequested()   => startScan(focusOn(m, PaneScan()))
 
     case MBrowseLoaded(st)     => (browseLoaded(m, st), NoCmd[Msg]())
     case MBrowseClick(i)       => (browseHighlight(m, i), NoCmd[Msg]())
     case MBrowseOpen()         => browseOpen(m)
+    case MBrowseOpenAt(i)      => browseOpen(browseHighlight(m, i))
     case MBrowseSelect()       => browseSelect(m)
     case MSourceDetected(info) => (m.Copy(Source = info), NoCmd[Msg]())
 
@@ -410,7 +407,6 @@ func s1Activate(m Model) Tuple[Model, Cmd[Msg]] {
     if (pane == PaneTarget())      { return noCmd(cycleTarget(m, 1)) }
     if (pane == PaneUnsupported()) { return noCmd(moveUnsupported(m, 1)) }
     if (pane == PaneRetry())       { return noCmd(stepRetry(m, 1)) }
-    if (pane == PaneBackend())     { return noCmd(toggleBackend(m, 1)) }
     if (pane == PaneAmbiguity())   { return noCmd(cycleAmbiguity(m, 1)) }
     if (pane == PaneScan())        { return startScan(m) }
     return noCmd(m)
@@ -437,7 +433,6 @@ func step(m Model, dir int) Model {
     if (pane == PaneTarget())      { return cycleTarget(m, dir) }
     if (pane == PaneUnsupported()) { return moveUnsupported(m, dir) }
     if (pane == PaneRetry())       { return stepRetry(m, dir) }
-    if (pane == PaneBackend())     { return toggleBackend(m, dir) }
     if (pane == PaneAmbiguity())   { return cycleAmbiguity(m, dir) }
     return m
 }
@@ -496,12 +491,6 @@ func moveUnsupported(m Model, dir int) Model {
     val opts = UnsupportedOptions()
     val cur = indexOfUnsupported(opts, m.Unsupported)
     return m.Copy(Unsupported = opts.Get(clampIdx(cur + dir, opts.Length())))
-}
-
-func toggleBackend(m Model, dir int) Model {
-    val opts = BackendOptions()
-    val cur = indexOfBackend(opts, m.Backend)
-    return m.Copy(Backend = opts.Get(clampIdx(cur + dir, opts.Length())))
 }
 
 // ----- engine flow: scan → plan → run → tick --------------------------------
@@ -743,15 +732,6 @@ func indexOfUnsupported(opts Array[UnsupportedPolicy], p UnsupportedPolicy) int 
     return 0
 }
 
-func indexOfBackend(opts Array[AgentBackend], b AgentBackend) int {
-    var i = 0
-    val n = opts.Length()
-    for i < n {
-        if (BackendEq(opts.Get(i), b)) { return i }
-        i = i + 1
-    }
-    return 0
-}
 
 // ----- input adapters --------------------------------------------------------
 

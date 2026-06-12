@@ -71,11 +71,6 @@ func TestSetUnsupportedPolicy(t T) T {
     return IsTrue(t, UnsupportedEq(m1.Unsupported, StopAll()))
 }
 
-func TestSetBackendClaude(t T) T {
-    val (m1, _) = StepAll(prog(), ArrayOf[Msg](MSetBackend(B = ClaudeBackend())))
-    return IsTrue(t, BackendEq(m1.Backend, ClaudeBackend()))
-}
-
 // Browse now opens the S7 directory picker (in a loading state) and emits the
 // async listing Cmd, instead of cycling hardcoded paths.
 func TestBrowseOpensPicker(t T) T {
@@ -109,6 +104,18 @@ func TestBrowseLoadedShowsEntries(t T) T {
     val out = str.S(Snapshot(view(m1), 110, 30))
     val t1 = IsTrue(t, out.Contains("myproject"))
     return IsTrue(t1, out.Contains("go.mod"))
+}
+
+// Double-clicking a row descends into THAT row (not the stale cursor): it
+// highlights the clicked index and emits the listing Cmd for its path.
+func TestBrowseDoubleClickOpensClickedRow(t T) T {
+    val msgs = ArrayOf[Msg](MBrowse(), MBrowseLoaded(State = browseFixture()), MBrowseOpenAt(Idx = 2))
+    val (m1, cmds) = StepAll(prog(), msgs)
+    val t1 = IsTrue(t, cmds.NonEmpty())   // a listing Cmd for the opened dir
+    return m1.Browse match {
+        case Some(b) => Eq(t1, b.Cursor, 2)   // the clicked row became the highlight
+        case None()  => IsTrue(t1, false)
+    }
 }
 
 // Selecting the highlighted directory commits it as the source and returns to S1.
