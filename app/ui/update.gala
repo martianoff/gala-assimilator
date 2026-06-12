@@ -640,8 +640,13 @@ func browseIsLoading(m Model) bool = m.Browse match {
     case None()  => false
 }
 
+// runTicking gates the spinner: it turns from the moment a run starts until the
+// run is COMPLETE — not merely while a unit is "actionable". The first Advance on a
+// real backend blocks for seconds with every unit still queued (AnyActionable would
+// be false then), so gating on completion is what keeps the spinner alive during
+// that first slow translation instead of sitting frozen.
 func runTicking(m Model) bool = m.Run match {
-    case Some(st) => runview.AnyActionable(st)
+    case Some(st) => !runview.ProjectRun(st).Complete
     case None()   => false
 }
 
