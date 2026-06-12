@@ -1,0 +1,43 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    . "martianoff/gala/collection_immutable"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// Spinner animation: a load/run state advances Frame and the timer self-stops
+// once the screen settles, so a busy screen visibly moves and an idle one does
+// not keep repainting.
+// ============================================================================
+
+// The S1 scan button shows an animated spinner while a scan is in flight.
+func TestScanButtonShowsSpinner(t T) T {
+    val m = NewModel(mockFactory(), 100, 30).Copy(Scanning = true, Frame = 3)
+    val out = str.S(Snapshot(view(m), 100, 30))
+    return IsTrue(t, out.Contains("scanning…"))
+}
+
+// MTick advances the frame and, while a load is still in flight, keeps the timer
+// alive (emits the next tick).
+func TestAnimTickAdvancesAndContinuesWhileScanning(t T) T {
+    val m = NewModel(mockFactory(), 100, 30).Copy(Scanning = true, Frame = 0)
+    val (m1, cmds) = StepAll2(m, ArrayOf[Msg](MTick()))
+    val t1 = Eq(t, m1.Frame, 1)
+    return IsTrue(t1, cmds.NonEmpty())   // the spinner keeps turning
+}
+
+// The animation timer is gated on isAnimating, so it self-stops the moment a
+// screen settles — a static menu never enters the idle repaint loop (which is
+// what keeps its mouse clicks working).
+func TestIdleScreenIsNotAnimating(t T) T {
+    val m = NewModel(mockFactory(), 100, 30)   // not scanning, no browser open
+    return IsFalse(t, isAnimating(m))
+}
+
+func TestScanningScreenIsAnimating(t T) T {
+    val m = NewModel(mockFactory(), 100, 30).Copy(Scanning = true)
+    return IsTrue(t, isAnimating(m))
+}

@@ -82,6 +82,14 @@ func s0Corrupt(offer runview.LoadSummary) Widget =
 func maxI(a int, b int) int = if (a > b) a else b
 func minI(a int, b int) int = if (a < b) a else b
 
+// spin returns a braille spinner glyph for the given animation frame, so any
+// in-progress / loading state visibly rotates instead of looking frozen. Pair it
+// with the loading text: s"${spin(m.Frame)} loading…".
+func spinFrames() Array[string] =
+    ArrayOf[string]("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+func spin(frame int) string = spinFrames().Get(clampIdx(frame, spinFrames().Length()))
+
 // ============================================================================
 // S1 — Setup / Interview
 // ============================================================================
@@ -262,7 +270,7 @@ func retryRow(m Model) Widget = subFieldRow("Retry", retryControl(m))
 func scanRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneScan())
     val valid = !m.OriginGit || looksLikeRepoUrl(m.RepoUrl)
-    val label = if (m.Scanning) "scanning…" else "scan project →"
+    val label = if (m.Scanning) s"${spin(m.Frame)} scanning…" else "scan project →"
     if (valid) {
         return Row(ArrayOf[LayoutChild](
             Fixed(4, Text("")),
@@ -389,7 +397,7 @@ func s3Board(m Model, rv runview.RunVM) Widget {
     val board = if (m.Cols >= WideCols()) splitBoard(m, rv) else stackedBoard(m, rv)
     return Border(Column(ArrayOf[LayoutChild](
         Fixed(1, headerRow("Assimilation in progress")),
-        Fixed(1, breadcrumbRow(rv)),
+        Fixed(1, breadcrumbRow(rv, m.Frame)),
         Fixed(1, progressBar(rv)),
         Fixed(1, countsRow(rv)),
         Fixed(1, s3Actions(m, rv)),
@@ -442,7 +450,7 @@ func stageIndex(stages Array[string], label string) int {
 
 // breadcrumbRow renders Scan › Plan › Run › Verify › Report with the current
 // stage highlighted, completed stages green-dim, and not-yet-reached stages dim.
-func breadcrumbRow(rv runview.RunVM) Widget {
+func breadcrumbRow(rv runview.RunVM, frame int) Widget {
     val stages = pipelineStages()
     val curIdx = stageIndex(stages, stageLabelFor(rv.Stage))
     var children = ArrayOf[LayoutChild](Fixed(2, Text("")))
@@ -458,17 +466,18 @@ func breadcrumbRow(rv runview.RunVM) Widget {
         i = i + 1
     }
     val spaced = children.Append(Flex(1, Text("")))
-    return Row(spaced.Append(Fixed(13, iteratingIndicator(rv))))
+    return Row(spaced.Append(Fixed(14, iteratingIndicator(rv, frame))))
 }
 
-// iteratingIndicator surfaces the run-level fix loop: "iterating…" while the loop
-// is still turning, flipping to a settled "complete ✓" once the run reaches a
-// fixpoint (RunVM.Complete, projected from the engine's IsComplete).
-func iteratingIndicator(rv runview.RunVM) Widget {
+// iteratingIndicator surfaces the run-level fix loop: an animated "⠋ iterating…"
+// while the loop is still turning (so a working run visibly differs from a hung
+// one), flipping to a settled "complete ✓" once the run reaches a fixpoint
+// (RunVM.Complete, projected from the engine's IsComplete).
+func iteratingIndicator(rv runview.RunVM, frame int) Widget {
     if (rv.Complete) {
         return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen()))
     }
-    return TextStyled(" iterating…", DefaultStyle().WithFg(BrightYellow()))
+    return TextStyled(s" ${spin(frame)} iterating…", DefaultStyle().WithFg(BrightYellow()))
 }
 
 func stageStyle(i int, curIdx int) Style {
@@ -695,7 +704,8 @@ func s4Board(m Model, vm runview.UnitDetailVM) Widget {
 // green (target); identical lines stay dim — a cheap by-index diff readout.
 func diffArea(m Model, vm runview.UnitDetailVM) Widget {
     val tgt = if (vm.HasResult) vm.TargetLines
-        else ArrayOf[string]("(no output yet — unit not finished)")
+        else ArrayOf[string](s"${spin(m.Frame)} still translating this unit — no output yet.",
+            "", "  This screen will fill in once the agent finishes.")
     val left = diffPane("Source", vm.SourceLines, tgt, true)
     val right = diffPane("Target", tgt, vm.SourceLines, false)
     if (m.Cols >= WideCols()) {
@@ -841,7 +851,7 @@ func s7Board(m Model, b BrowseState) Widget =
 func browseList(m Model, b BrowseState) Widget {
     val total = b.Entries.Length()
     if (total == 0) {
-        val msg = if (b.Loading) "  scanning filesystem…" else "  (no sub-directories here)"
+        val msg = if (b.Loading) s"  ${spin(m.Frame)} reading directory…" else "  (no sub-directories here)"
         return Column(ArrayOf[LayoutChild](Fixed(1, TextStyled(msg, DefaultStyle().WithDim()))))
     }
     val avail = maxI(1, m.Rows - 9)

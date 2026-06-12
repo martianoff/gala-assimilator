@@ -96,6 +96,7 @@ sealed type Msg {
     case MScanPlanned(Workspace engine.WorkspaceModel, Plan engine.MigrationPlan)
     case MRunStarted(State engine.RunState)
     case MRunTick()
+    case MTick()           // animation-only tick (advances the spinner while loading)
     case MResized(W int, H int)
 }
 
@@ -162,6 +163,7 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MScanPlanned(ws, plan) => scanPlanned(m, ws, plan)
     case MRunStarted(st)        => runStarted(m, st)
     case MRunTick()             => runTick(m)
+    case MTick()                => animTick(m)
     case MScanFailed(reason)    => (m.Copy(Scanning = false, ScanError = reason), NoCmd[Msg]())
 
     case MOpenDeps()         => openDeps(m)
@@ -508,7 +510,8 @@ func startScan(m Model) Tuple[Model, Cmd[Msg]] {
         () => port.Scan(engine.ScanRequest(Root = root)),
         (ws) => MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
     )
-    return (m.Copy(Port = port, Scanning = true, ScanError = ""), cmd)
+    val m2 = m.Copy(Port = port, Scanning = true, ScanError = "")
+    return (m2, withAnim(m, m2, cmd))
 }
 
 // startGitScan acquires a remote origin: it builds engine.GitRepo(Url, Ref) and runs
@@ -524,7 +527,8 @@ func startGitScan(m Model, port engine.EnginePort) Tuple[Model, Cmd[Msg]] {
         () => scan(origin, dest),
         (os) => originScanToMsg(port, os),
     )
-    return (m.Copy(Port = port, Scanning = true, ScanError = ""), cmd)
+    val m2 = m.Copy(Port = port, Scanning = true, ScanError = "")
+    return (m2, withAnim(m, m2, cmd))
 }
 
 // originScanToMsg classifies the acquired origin (the sealed-type match lives in
@@ -593,7 +597,7 @@ func runTick(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
     case Some(st) => {
         if (runview.AnyActionable(st)) {
             val next = m.Port.Advance(st)
-            val m2 = m.Copy(Run = Some(next))
+            val m2 = m.Copy(Run = Some(next), Frame = m.Frame + 1)
             val cont = if (runview.AnyActionable(next)) tickCmd() else NoCmd[Msg]()
             return (m2, withSave(m2, next, cont))
         }
@@ -610,6 +614,36 @@ func withSave(m Model, state engine.RunState, base Cmd[Msg]) Cmd[Msg] =
 // tickCmd schedules the next tick off the Update loop (a Future the runtime
 // drains). In tests, MRunTick is sent directly instead.
 func tickCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(60)), () => MRunTick())
+
+// ----- spinner animation while loading --------------------------------------
+
+// isAnimating is true while a screen has a loading state whose spinner needs to
+// keep turning off the loop (a scan in flight, a directory listing). The run has
+// its own MRunTick that advances Frame, so it is not included here.
+func isAnimating(m Model) bool = m.Scanning || browseIsLoading(m)
+
+func browseIsLoading(m Model) bool = m.Browse match {
+    case Some(b) => b.Loading
+    case None()  => false
+}
+
+// animCmd schedules the next animation frame (~12 fps) while something loads.
+func animCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(80)), () => MTick())
+
+// animTick advances the spinner frame and keeps the timer alive only while a load
+// is still in flight, so it self-stops the moment the screen settles (no idle
+// repaint of static menus, which is what kept mouse clicks alive there).
+func animTick(m Model) Tuple[Model, Cmd[Msg]] {
+    val m2 = m.Copy(Frame = m.Frame + 1)
+    if (isAnimating(m2)) { return (m2, animCmd()) }
+    return (m2, NoCmd[Msg]())
+}
+
+// withAnim batches the animation timer ahead of `cmd` when this transition starts
+// a load (rising edge). Because the timer only runs while isAnimating, a rising
+// edge implies no timer is already in flight — so this never double-starts it.
+func withAnim(prev Model, next Model, cmd Cmd[Msg]) Cmd[Msg] =
+    if (isAnimating(next) && !isAnimating(prev)) Batch[Msg](animCmd(), cmd) else cmd
 
 // ----- dependency forest: resolve → advance → fixpoint, operator actions -----
 
