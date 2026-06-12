@@ -20,10 +20,14 @@ func s1Harness() harness.Harness[Model, Msg] {
     return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 20)
 }
 
-// Keyboard: Tab to the target-language cycler, ArrowRight cycles it forward.
+// Keyboard: Tab through the source-origin controls to the target-language cycler
+// (browse → origin → url → ref → target), then ArrowRight cycles it forward.
 func TestKeyboardCyclesTargetLanguage(t T) T {
     val s = s1Harness().Start()
-        .Press(PlainKey(Tab()))         // browse → target
+        .Press(PlainKey(Tab()))         // browse → origin
+        .Press(PlainKey(Tab()))         // origin → url
+        .Press(PlainKey(Tab()))         // url → ref
+        .Press(PlainKey(Tab()))         // ref → target
         .Press(PlainKey(ArrowRight()))  // cycle target forward
     val t1 = Eq(t, s.Model.TargetLang(), "TypeScript")
     // View reflects the new selection.

@@ -1,0 +1,57 @@
+package ui
+
+import (
+    "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/std"
+    "martianoff/gala/path"
+    strings "martianoff/gala/strings"
+)
+
+// ============================================================================
+// S1 source ORIGIN — local directory vs. start-from-GitHub.
+//
+// The local origin scans through the engine port (Port.Scan) exactly as before —
+// no behavior change. The git origin builds engine.GitRepo(Url, Ref) and acquires
+// it through the engine's public source-acquisition bridge (engine.ScanOrigin over
+// a RepoCloner), wired into the Model as ScanGit so the clone IO stays at the
+// engine edge and the UI just selects the origin. Validation here is minimal and
+// UI-side: a non-empty string that looks like a VCS repo URL.
+// ============================================================================
+
+// defaultScanGit is the real git acquisition the app runs: clone the repo (real
+// `git`) into a local folder, then scan it. Constructing the cloner allocates only
+// closures — no `git` runs until a git-origin scan actually invokes Clone, so this
+// default is inert under `gala test` (which only ever drives the local origin or
+// injects a stub). Tests that exercise the git path override Model.ScanGit.
+func defaultScanGit() func(engine.SourceOrigin, string) engine.OriginScan =
+    (origin engine.SourceOrigin, dest string) =>
+        engine.ScanOrigin(engine.RealRepoCloner(engine.GitCliRunner()), origin, dest)
+
+// looksLikeRepoUrl is the minimal pre-scan gate on the URL field: non-empty and
+// shaped like a clonable VCS URL (an https/ssh scheme, an scp-style git@ address,
+// or a bare known-host path). It only enables the scan button — the engine's
+// resolver/cloner is the authority on whether the repo actually clones.
+func looksLikeRepoUrl(url string) bool {
+    val u = strings.TrimSpace(url)
+    if (u == "") { return false }
+    if (strings.Contains(u, "://")) { return true }
+    if (strings.HasPrefix(u, "git@")) { return true }
+    return strings.Contains(u, "github.com/") ||
+        strings.Contains(u, "gitlab.com/") ||
+        strings.Contains(u, "bitbucket.org/")
+}
+
+// gitCloneDest is the local folder a git-origin project is cloned into: a stable,
+// per-URL sibling under a working base, so a re-scan of the same repo reuses one
+// checkout and two different repos never collide.
+func gitCloneDest(url string) string =
+    path.Join("gala_assimilator_src", sanitizeUrl(url))
+
+// sanitizeUrl flattens a repo URL into a single safe path segment (scheme/slashes/
+// colons → underscores), mirroring the engine's destForNode module-path flattening.
+func sanitizeUrl(url string) string {
+    val noScheme = strings.TrimSpace(url)
+    return strings.ReplaceAll(
+        strings.ReplaceAll(
+            strings.ReplaceAll(noScheme, "://", "_"), "/", "_"), ":", "_")
+}

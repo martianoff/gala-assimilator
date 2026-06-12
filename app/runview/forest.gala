@@ -1,0 +1,209 @@
+package runview
+
+import (
+    . "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ============================================================================
+// Dependency-forest → UI projection.
+//
+// Like the run projection in runview.gala, this is the ONLY place the engine's
+// forest sealed types (DepResolution, OriginScan, ForestLoad) are pattern-matched.
+// The UI consumes the plain ForestVM / DepRowVM / OriginSummary / ForestLoadSummary
+// structs below and never touches an engine sealed type itself — that keeps
+// view.gala (which transitively pulls in gala_tui's `state.Done`) clear of the
+// engine's own `Done`/`DepDone` cases.
+//
+// Per-dependency progress REUSES the run projection: a DepAssimilating node's
+// embedded RunState is fed through ProjectRun, so the forest never re-derives the
+// done/total/pct arithmetic the run view already owns.
+// ============================================================================
+
+// DepRowVM is one row of the dependency-forest tree, fully projected: the module
+// coordinate, its Depth in the transitive closure (root deps = 1) for indentation,
+// the OWN folder it clones into (Dest), a status glyph + label, and — for an
+// in-flight sub-run — the projected done/total/pct of its own assimilation.
+//
+// Reason carries the surfaced "why" for the off-ramp states (unsupported / failed /
+// skipped); it is "" for every other state. IsUnsupported / IsFailed are the
+// product-invariant markers: a dependency the engine could not faithfully migrate
+// must render VISUALLY DISTINCT, never folded in with the clean nodes. The Can*
+// flags say which of the four operator actions are meaningful on this node, so the
+// UI can gate / dim a button without re-matching the engine status.
+struct DepRowVM(
+    Module        string,
+    Version       string,
+    Depth         int,
+    Dest          string,
+    Direct        bool,
+    Glyph         string,
+    Status        string,
+    Reason        string,
+    UnitsDone     int,
+    UnitsTotal    int,
+    Pct           int,
+    IsDone        bool,
+    IsSkipped     bool,
+    IsUnsupported bool,
+    IsFailed      bool,
+    Active        bool,   // an in-flight, still-drivable node (pending/cloning/resolved/assimilating)
+    CanResolve    bool,
+    CanSkip       bool,
+    CanRetry      bool,
+    CanExpand     bool,
+)
+
+// ForestVM is the whole dependency forest projected for the Dependencies screen:
+// every node as a DepRowVM (in forest order, so a tree cursor indexes straight into
+// DependencyForest.Deps), plus the roll-up the header shows — total / done / pct and
+// the count of the two surfaced off-ramps (unsupported / failed). Complete mirrors
+// the engine's ForestComplete: every node has settled, so the forest tick loop has
+// stopped.
+struct ForestVM(
+    Rows        Array[DepRowVM],
+    Total       int,
+    Done        int,
+    Pct         int,
+    Unsupported int,
+    Failed      int,
+    Complete    bool,
+)
+
+// ----- forest projection ----------------------------------------------------
+
+func ProjectForest(f DependencyForest) ForestVM {
+    val rows = f.Deps.Map((d DependencyRun) => ProjectDep(d))
+    val total = f.Deps.Length()
+    val done = CountDepsDone(f)
+    val pct = if (total == 0) 0 else (done * 100) / total
+    return ForestVM(
+        Rows        = rows,
+        Total       = total,
+        Done        = done,
+        Pct         = pct,
+        Unsupported = rows.Count((r DepRowVM) => r.IsUnsupported),
+        Failed      = rows.Count((r DepRowVM) => r.IsFailed),
+        Complete    = ForestComplete(f),
+    )
+}
+
+// depRowBase carries the status-independent fields of a node (coordinate, depth,
+// dest) with every status flag zeroed; each DepResolution branch then Copy-overrides
+// just the cells its state changes. `base` is bound to a val before Copy, so the
+// receiver is not re-evaluated per field.
+func depRowBase(d DependencyRun) DepRowVM =
+    DepRowVM(
+        Module        = d.Node.Coord.Module,
+        Version       = d.Node.Coord.Version,
+        Depth         = d.Depth,
+        Dest          = d.Dest,
+        Direct        = d.Node.Direct,
+        Glyph         = "",
+        Status        = "",
+        Reason        = "",
+        UnitsDone     = 0,
+        UnitsTotal    = 0,
+        Pct           = 0,
+        IsDone        = false,
+        IsSkipped     = false,
+        IsUnsupported = false,
+        IsFailed      = false,
+        Active        = false,
+        CanResolve    = false,
+        CanSkip       = false,
+        CanRetry      = false,
+        CanExpand     = false,
+    )
+
+// ProjectDep is the single DepResolution pattern-match: it turns ONE forest node
+// into its plain row. The off-ramps (skipped / unsupported / failed) carry their
+// reason and a distinguishing flag; the in-flight states are Active (so the UI keeps
+// them out of the "settled" styling); a DepAssimilating node folds in its sub-run's
+// projected progress.
+//
+// It is exported so an operator action that only needs ONE node's projected Can*
+// availability (depAct) can project that node alone, instead of building the whole
+// ForestVM (which would re-project every other node — and every in-flight sub-run —
+// to read a single row).
+func ProjectDep(d DependencyRun) DepRowVM {
+    val base = depRowBase(d)
+    return d.Status match {
+        case DepPending()         => base.Copy(Glyph = "○", Status = "pending",      Active = true, CanSkip = true)
+        case DepCloning()         => base.Copy(Glyph = "◐", Status = "cloning",      Active = true, CanSkip = true)
+        case DepResolved(_)       => base.Copy(Glyph = "◐", Status = "resolved",     Active = true, CanSkip = true)
+        case DepAssimilating(run) => depAssimRow(base, run)
+        case DepDone()            => base.Copy(Glyph = "✓", Status = "done",         IsDone = true, CanRetry = true)
+        case DepSkipped()         => base.Copy(Glyph = "⊘", Status = "skipped",
+            Reason = "skipped (depth bound or operator) — expand to grow",
+            IsSkipped = true, CanResolve = true, CanExpand = true)
+        case DepUnsupported(why)  => base.Copy(Glyph = "⚠", Status = "unsupported",
+            Reason = why, IsUnsupported = true, CanSkip = true, CanRetry = true)
+        case DepFailed(why)       => base.Copy(Glyph = "✗", Status = "failed",
+            Reason = why, IsFailed = true, CanSkip = true, CanRetry = true)
+    }
+}
+
+// depAssimRow folds an in-flight sub-run's progress into its row by REUSING the run
+// projection (ProjectRun) — the done / total / pct the run view already computes.
+func depAssimRow(base DepRowVM, run RunState) DepRowVM {
+    val rv = ProjectRun(run)
+    return base.Copy(
+        Glyph      = "◑",
+        Status     = "assimilating",
+        Active     = true,
+        CanSkip    = true,
+        UnitsDone  = rv.Done,
+        UnitsTotal = rv.Total,
+        Pct        = rv.Pct,
+    )
+}
+
+// ForestActionable reports whether the forest still has a drivable node — the
+// forest-tick loop's predicate, the analogue of AnyActionable for a run. It is the
+// negation of the engine's ForestComplete (every node settled), so an empty forest
+// is NOT actionable.
+func ForestActionable(f DependencyForest) bool = !ForestComplete(f)
+
+// ============================================================================
+// Origin acquisition → UI summary (start-from-GitHub)
+// ============================================================================
+
+// OriginSummary is an OriginScan projected for the UI: a plain ok flag, the scanned
+// workspace (when ok), and the surfaced reason a clone/scan failed (when not). The
+// UI switches on Ok, never matching the engine's sealed OriginScan.
+struct OriginSummary(
+    Ok        bool,
+    Path      string,
+    Reason    string,
+    Workspace WorkspaceModel,
+)
+
+func ClassifyOrigin(scan OriginScan) OriginSummary = scan match {
+    case OriginScanned(p, ws)   => OriginSummary(Ok = true,  Path = p,  Reason = "",  Workspace = ws)
+    case OriginUnsupported(why) => OriginSummary(Ok = false, Path = "", Reason = why, Workspace = emptyWorkspace())
+}
+
+func emptyWorkspace() WorkspaceModel =
+    NewWorkspaceModel(EmptyArray[Package](), EmptyArray[DepEdge]())
+
+// ============================================================================
+// Forest checkpoint load → UI summary
+// ============================================================================
+
+// ForestLoadSummary is a ForestLoad projected for the UI: a plain kind token, the
+// reason (when corrupt), and the restored forest (when loaded). Mirrors LoadSummary
+// for the run checkpoint; the UI switches on Kind, never matching the engine's
+// sealed ForestLoad.
+struct ForestLoadSummary(
+    Kind   string,            // "loaded" | "missing" | "corrupt"
+    Reason string,
+    Forest Option[DependencyForest],
+)
+
+func ClassifyForestLoad(load ForestLoad) ForestLoadSummary = load match {
+    case ForestLoaded(f)  => ForestLoadSummary(Kind = "loaded",  Reason = "", Forest = Some(f))
+    case ForestMissing()  => ForestLoadSummary(Kind = "missing", Reason = "", Forest = None[DependencyForest]())
+    case ForestCorrupt(r) => ForestLoadSummary(Kind = "corrupt", Reason = r,  Forest = None[DependencyForest]())
+}

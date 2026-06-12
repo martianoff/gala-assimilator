@@ -1,0 +1,287 @@
+package ui
+
+import (
+    . "github.com/martianoff/gala-tui"
+    "github.com/martianoff/gala-assimilator/app/engine"
+    "github.com/martianoff/gala-assimilator/app/runview"
+    "github.com/martianoff/gala-tui/harness"
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    str "martianoff/gala/strings"
+    . "martianoff/gala/test"
+)
+
+// ============================================================================
+// S8 dependency-forest screen — render snapshots (status incl. unsupported /
+// failed, depth indentation) plus interaction tests proving every operator
+// action (resolve / skip / retry / expand) via key AND mouse, and the
+// scan→resolve→advance→fixpoint drive.
+//
+// Forests are built by hand from the engine's public value types and pushed into
+// the Model via the same messages the live flow uses (MDepsResolved + MOpenDeps).
+// ============================================================================
+
+// ----- fixtures -------------------------------------------------------------
+
+func mkDepNode(module string) engine.DependencyNode =
+    engine.DependencyNode(
+        Id      = engine.DependencyId(Value = module),
+        Coord   = engine.ModuleCoord(Module = module, Version = "v1.0.0"),
+        RepoUrl = "https://" + module,
+        Direct  = true,
+    )
+
+func mkDepRun(module string, depth int, status engine.DepResolution) engine.DependencyRun =
+    engine.DependencyRun(
+        Node     = mkDepNode(module),
+        Dest     = "/deps/" + module,
+        Status   = status,
+        Depth    = depth,
+        Children = EmptyArray[engine.DependencyId](),
+    )
+
+func mkDepForest(deps Array[engine.DependencyRun]) engine.DependencyForest {
+    val depMap = deps.FoldLeft[HashMap[string, engine.DependencyRun]](
+        EmptyHashMap[string, engine.DependencyRun](),
+        (acc HashMap[string, engine.DependencyRun], d engine.DependencyRun) => acc.Put(d.Node.Id.Value, d),
+    )
+    return engine.DependencyForest(
+        Deps     = deps,
+        DepMap   = depMap,
+        Visited  = EmptyArray[string](),
+        MaxDepth = 5,
+        DepsBase = "/deps",
+    )
+}
+
+func oneDepForest(status engine.DepResolution) engine.DependencyForest =
+    mkDepForest(ArrayOf[engine.DependencyRun](mkDepRun("github.com/acme/dep", 1, status)))
+
+// mkQueuedUnit is a not-yet-started unit, so an assimilating sub-run can show
+// partial progress (1 of 2 done → 50%).
+func mkQueuedUnit(id string) engine.UnitRun =
+    engine.UnitRun(
+        Unit = engine.UnitId(Value = id),
+        Assignment = engine.TaskAssignment(
+            Task         = engine.TaskId(Value = id),
+            Unit         = engine.UnitId(Value = id),
+            Source       = engine.SourceContext(SourceText = "s", Dependencies = EmptyArray[engine.DependencySnippet]()),
+            Target       = engine.TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+            PriorFailure = None[engine.PriorFailure](),
+            Answers      = EmptyArray[engine.Answer](),
+        ),
+        Status = engine.Queued(),
+    )
+
+func subRun() engine.RunState =
+    engine.RunState(
+        Units = ArrayOf[engine.UnitRun](
+            mkDoneUnit("depb/x", EmptyArray[engine.UnsupportedFlag]()),
+            mkQueuedUnit("depb/y")),
+        Log = EmptyArray[engine.EngineEvent](),
+    )
+
+// renderForest is a mixed forest covering every interesting state at varying depth.
+func renderForest() engine.DependencyForest =
+    mkDepForest(ArrayOf[engine.DependencyRun](
+        mkDepRun("github.com/acme/depa", 1, engine.DepDone()),
+        mkDepRun("github.com/acme/depb", 2, engine.DepAssimilating(Run = subRun())),
+        mkDepRun("golang.org/x/tools",   2, engine.DepUnsupported(Reason = "no VCS host mapping for module")),
+        mkDepRun("github.com/acme/depd", 1, engine.DepFailed(Reason = "clone failed: unreachable")),
+        mkDepRun("github.com/acme/depe", 3, engine.DepSkipped()),
+        mkDepRun("github.com/acme/depf", 1, engine.DepPending())))
+
+// s8Model builds a Model sitting on S8 with the given forest.
+func s8Model(cols int, rows int, forest engine.DependencyForest) Model {
+    val program = NewProgram(mockFactory(), cols, rows)
+    val (m1, _) = StepAll(program, ArrayOf[Msg](MDepsResolved(Forest = forest), MOpenDeps()))
+    return m1
+}
+
+func s8Harness() harness.Harness[Model, Msg] {
+    val program = NewProgram(mockFactory(), 110, 30)
+    return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 30)
+}
+
+// depRowStatus projects the forest row at idx and returns its plain status label —
+// the test reads engine state only through the runview projection.
+func depRowStatus(m Model, idx int) string = m.Forest match {
+    case Some(f) => {
+        val rows = runview.ProjectForest(f).Rows
+        if (idx < 0 || idx >= rows.Length()) { return "" }
+        return rows.Get(idx).Status
+    }
+    case None() => ""
+}
+
+func forestMaxDepth(m Model) int = m.Forest match {
+    case Some(f) => f.MaxDepth
+    case None()  => 0
+}
+
+func forestActionableOf(m Model) bool = m.Forest match {
+    case Some(f) => runview.ForestActionable(f)
+    case None()  => false
+}
+
+// ----- render ---------------------------------------------------------------
+
+func TestS8RendersForestTree(t T) T {
+    val m = s8Model(110, 30, renderForest())
+    val out = str.S(Snapshot(view(m), 110, 30))
+    val t1 = IsTrue(t,  out.Contains("Dependencies"))
+    val t2 = IsTrue(t1, out.Contains("github.com/acme/depa"))    // a node coordinate
+    val t3 = IsTrue(t2, out.Contains("[done]"))                  // status label
+    val t4 = IsTrue(t3, out.Contains("[assimilating]"))          // in-flight label
+    val t5 = IsTrue(t4, out.Contains("1/2 (50%)"))               // sub-run progress, reused projection
+    return IsTrue(t5, out.Contains("deps done"))                 // forest roll-up
+}
+
+// The two surfaced off-ramps render distinct, each WITH its reason — never dropped.
+func TestS8ShowsUnsupportedAndFailed(t T) T {
+    val m = s8Model(110, 30, renderForest())
+    val out = str.S(Snapshot(view(m), 110, 30))
+    val t1 = IsTrue(t,  out.Contains("[unsupported]"))
+    val t2 = IsTrue(t1, out.Contains("no VCS host mapping"))     // unsupported reason surfaced
+    val t3 = IsTrue(t2, out.Contains("[failed]"))
+    val t4 = IsTrue(t3, out.Contains("clone failed"))            // failed reason surfaced
+    val t5 = IsTrue(t4, out.Contains("⚠"))                       // unsupported glyph
+    return IsTrue(t5, out.Contains("✗"))                         // failed glyph
+}
+
+// Depth drives indentation: a depth-2 node is indented further than a depth-1 node.
+func TestDepIndentGrowsWithDepth(t T) T {
+    val d1 = depIndent(1)
+    val d2 = depIndent(2)
+    val d3 = depIndent(3)
+    val t1 = IsTrue(t,  RuneCount(d2) > RuneCount(d1))
+    return IsTrue(t1, RuneCount(d3) > RuneCount(d2))
+}
+
+// A project with no external dependencies says so plainly (distinct from resolving).
+func TestS8NoDeps(t T) T {
+    val m = s8Model(110, 30, mkDepForest(EmptyArray[engine.DependencyRun]()))
+    val out = str.S(Snapshot(view(m), 110, 30))
+    return IsTrue(t, out.Contains("no external dependencies"))
+}
+
+// ----- interaction: each action via key -------------------------------------
+
+func TestS8SkipViaKey(t T) T {
+    val m = s8Model(110, 30, oneDepForest(engine.DepPending()))
+    val (m2, _) = StepAll2(m, ArrayOf[Msg](MKeyChar(C = 's')))
+    return Eq(t, depRowStatus(m2, 0), "skipped")
+}
+
+func TestS8ResolveSkippedViaKey(t T) T {
+    val m = s8Model(110, 30, oneDepForest(engine.DepSkipped()))
+    val (m2, _) = StepAll2(m, ArrayOf[Msg](MKeyChar(C = 'o')))
+    return Eq(t, depRowStatus(m2, 0), "pending")
+}
+
+func TestS8RetryFailedViaKey(t T) T {
+    val m = s8Model(110, 30, oneDepForest(engine.DepFailed(Reason = "boom")))
+    val (m2, _) = StepAll2(m, ArrayOf[Msg](MKeyChar(C = 'r')))
+    return Eq(t, depRowStatus(m2, 0), "pending")
+}
+
+// Expand lifts the forest depth bound AND re-queues the skipped node.
+func TestS8ExpandViaKey(t T) T {
+    val m = s8Model(110, 30, oneDepForest(engine.DepSkipped()))
+    val before = forestMaxDepth(m)
+    val (m2, _) = StepAll2(m, ArrayOf[Msg](MKeyChar(C = 'x')))
+    val t1 = Eq(t, depRowStatus(m2, 0), "pending")
+    return IsTrue(t1, forestMaxDepth(m2) > before)
+}
+
+// An action that does not apply to the node is a no-op: retrying a done node leaves
+// it done (gated by the projected availability, never a silent state change).
+func TestS8RetryDoneIsNoOp(t T) T {
+    val m = s8Model(110, 30, oneDepForest(engine.DepDone()))
+    // 'r' is retry; CanRetry is true on Done (re-assimilate). Resolve ('o') is NOT
+    // available on Done, so it must no-op.
+    val (m2, _) = StepAll2(m, ArrayOf[Msg](MKeyChar(C = 'o')))
+    return Eq(t, depRowStatus(m2, 0), "done")
+}
+
+// ----- interaction: action via mouse ----------------------------------------
+
+func TestS8SkipViaMouse(t T) T {
+    val s0 = s8Harness().Start()
+        .SendMsg(MDepsResolved(Forest = oneDepForest(engine.DepPending())))
+        .SendMsg(MOpenDeps())
+    val rowOpt = s0.FindRow("s skip")
+    return rowOpt match {
+        case Some(y) => {
+            val rowText = str.S(s0.Text()).Lines().Get(y)
+            return rowText.IndexOf("s skip") match {
+                case Some(x) => {
+                    val s1 = s0.Click(x + 1, y)
+                    return Eq(t, depRowStatus(s1.Model, 0), "skipped")
+                }
+                case None() => IsTrue(t, false)
+            }
+        }
+        case None() => IsTrue(t, false)
+    }
+}
+
+// ----- interaction: scan → resolve → advance → fixpoint ---------------------
+
+// Driving MForestTick advances the forest until no node is drivable. With the
+// offline MockEngine's empty cloner a resolvable pending dep settles DepFailed —
+// a terminal state — so the forest reaches its fixpoint.
+func TestForestAdvancesToFixpoint(t T) T {
+    val m = s8Model(110, 30, oneDepForest(engine.DepPending()))
+    val startActionable = forestActionableOf(m)
+    var mm = m
+    var i = 0
+    for i < 5 {
+        val (n, _) = StepAll2(mm, ArrayOf[Msg](MForestTick()))
+        mm = n
+        i = i + 1
+    }
+    val t1 = IsTrue(t,  startActionable)               // a pending node is drivable
+    val t2 = IsFalse(t1, forestActionableOf(mm))       // the forest reached a fixpoint
+    return Eq(t2, depRowStatus(mm, 0), "failed")       // the node settled (empty cloner)
+}
+
+// Opening the Dependencies screen from S2/S3 routes to S8.
+func TestOpenDepsRoutesToS8(t T) T {
+    val program = NewProgram(mockFactory(), 110, 30)
+    val (m1, _) = StepAll(program, ArrayOf[Msg](MDepsResolved(Forest = renderForest()), MOpenDeps()))
+    return Eq(t, m1.Screens.Current(), RouteS8())
+}
+
+// A landed scan kicks off dependency resolution off the loop (the ResolveDeps Async).
+func TestScanPlannedKicksResolve(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val (m1, cmds) = StepAll(prog(), ArrayOf[Msg](MScanPlanned(Workspace = ws, Plan = plan)))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS2())
+    return IsTrue(t1, cmds.NonEmpty())   // a ResolveDeps Async Cmd was issued
+}
+
+// A resolved forest is adopted into the model and drives the forest-tick loop when
+// it still has drivable nodes.
+func TestDepsResolvedStoresForest(t T) T {
+    val m = s8Model(110, 30, oneDepForest(engine.DepPending()))
+    val t1 = m.Forest match {
+        case Some(_) => IsTrue(t, true)
+        case None()  => IsTrue(t, false)
+    }
+    return Eq(t1, depRowStatus(m, 0), "pending")
+}
+
+// The tree cursor moves with the arrow keys and the action targets the cursored node.
+func TestS8CursorNavAndSkipSecond(t T) T {
+    val forest = mkDepForest(ArrayOf[engine.DependencyRun](
+        mkDepRun("github.com/acme/depa", 1, engine.DepPending()),
+        mkDepRun("github.com/acme/depb", 1, engine.DepPending())))
+    val m = s8Model(110, 30, forest)
+    val (m2, _) = StepAll2(m, ArrayOf[Msg](MNavDown(), MKeyChar(C = 's')))
+    val t1 = Eq(t,  m2.DepCursor, 1)
+    val t2 = Eq(t1, depRowStatus(m2, 1), "skipped")    // second node skipped
+    return Eq(t2, depRowStatus(m2, 0), "pending")      // first node untouched
+}

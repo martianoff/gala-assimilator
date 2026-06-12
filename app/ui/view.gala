@@ -5,6 +5,7 @@ import (
     "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    str "martianoff/gala/strings"
 )
 
 // ============================================================================
@@ -30,6 +31,7 @@ func view(m Model) Widget {
     if (route == RouteS5()) { return s5View(m) }
     if (route == RouteS6()) { return s6View(m) }
     if (route == RouteS7()) { return s7View(m) }
+    if (route == RouteS8()) { return s8View(m) }
     return resizeNotice(m)
 }
 
@@ -103,23 +105,78 @@ func s1View(m Model) Widget {
             Fixed(1, retryRow(m)),
             Fixed(1, backendRow(m)),
         )
+    // The SOURCE block reflows by origin: a local directory shows the picker + the
+    // detection readout; a GitHub URL shows the repo-URL + optional-ref fields.
+    val sourceChildren = if (m.OriginGit)
+        ArrayOf[LayoutChild](
+            Fixed(1, originRow(m)),
+            Fixed(1, urlRow(m)),
+            Fixed(1, refRow(m)),
+        )
+    else
+        ArrayOf[LayoutChild](
+            Fixed(1, originRow(m)),
+            Fixed(1, sourceRow(m)),
+            Fixed(1, detectedRow(m)),
+        )
     val head = ArrayOf[LayoutChild](
         Fixed(1, headerRow("Gala Assimilator — new migration")),
         Fixed(1, sectionRow("SOURCE")),
-        Fixed(1, sourceRow(m)),
-        Fixed(1, detectedRow(m)),
+    ).AppendAll(sourceChildren).AppendAll(ArrayOf[LayoutChild](
         Fixed(1, sectionRow("TARGET")),
         Fixed(1, targetRow(m)),
         Fixed(1, sectionRow("OPTIONS")),
-    )
-    val tail = ArrayOf[LayoutChild](
+    ))
+    val errChildren = if (m.ScanError == "")
+        EmptyArray[LayoutChild]()
+    else
+        ArrayOf[LayoutChild](Fixed(1, scanErrorRow(m)))
+    val tail = errChildren.AppendAll(ArrayOf[LayoutChild](
         Fixed(1, Text("")),
         Fixed(1, scanRow(m)),
         Fixed(1, s1Footer()),
-    )
+    ))
     val children = head.AppendAll(options).AppendAll(tail)
     return Border(Column(children))
 }
+
+// originRow is the source-origin selector: a two-cell radio (local directory vs.
+// GitHub URL), reachable by click and by the focus ring's arrows.
+func originRow(m Model) Widget {
+    val f = m.Focus.IsFocused(PaneOrigin())
+    val group = Row(ArrayOf[LayoutChild](
+        radioCell(!m.OriginGit, f, "local dir",  MSetOrigin(Git = false)),
+        radioCell(m.OriginGit,  f, "GitHub URL", MSetOrigin(Git = true)),
+    ))
+    return subFieldRow("Origin", group)
+}
+
+// urlRow / refRow are the git-origin text fields. The label is clickable (focus by
+// mouse); Tab reaches them too, and a printable key types into the focused field.
+func urlRow(m Model) Widget {
+    val focused = m.Focus.IsFocused(PaneUrl())
+    return Row(ArrayOf[LayoutChild](
+        Fixed(4, Text("")),
+        Fixed(subLabelW(), TextStyled("Repo URL", DefaultStyle().WithDim()).OnClick(MFocusUrl())),
+        Flex(1, Input(m.RepoUrl, RuneCount(m.RepoUrl), "https://github.com/owner/repo", focused)),
+    ))
+}
+
+func refRow(m Model) Widget {
+    val focused = m.Focus.IsFocused(PaneRef())
+    return Row(ArrayOf[LayoutChild](
+        Fixed(4, Text("")),
+        Fixed(subLabelW(), TextStyled("Ref (opt)", DefaultStyle().WithDim()).OnClick(MFocusRef())),
+        Flex(1, Input(m.RepoRef, RuneCount(m.RepoRef), "default branch", focused)),
+    ))
+}
+
+// scanErrorRow surfaces a git clone/scan failure inline on S1 (never a silent dead end).
+func scanErrorRow(m Model) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(4, Text("")),
+        Flex(1, TextStyled("⚠ " + m.ScanError, DefaultStyle().WithFg(BrightYellow()))),
+    ))
 
 func headerRow(title string) Widget =
     Row(ArrayOf[LayoutChild](
@@ -236,7 +293,10 @@ func backendRow(m Model) Widget = subFieldRow("Agent", backendGroup(m))
 
 func scanRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneScan())
-    val label = if (m.Scanning) "scanning…" else "scan project →"
+    val valid = !m.OriginGit || looksLikeRepoUrl(m.RepoUrl)
+    val label = if (m.Scanning) "scanning…"
+        else if (!valid) "enter repo url"
+        else "scan project →"
     return Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
         Flex(1, Text("")),
@@ -317,10 +377,23 @@ func s2Buttons(m Model) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
         Fixed(14, btnWidget("← back", m.S2Focus == PaneBack(), MBack())),
+        Fixed(2, Text("")),
+        Fixed(22, depsButton(m)),
         Flex(1, Text("")),
         Fixed(26, btnWidget("start assimilation →", m.S2Focus == PaneStart(), MStartRun())),
         Fixed(2, Text("")),
     ))
+
+// depsButton opens the dependency-forest screen (S8). It shows the resolved node
+// count once the background resolve has landed, so the user sees there is a forest
+// to inspect; mouse-clickable here and reachable by 'd' on S2/S3.
+func depsButton(m Model) Widget {
+    val label = m.Forest match {
+        case Some(f) => s"dependencies (${f.Deps.Length()}) →"
+        case None()  => "dependencies →"
+    }
+    return btnWidget(label, false, MOpenDeps())
+}
 
 // ============================================================================
 // S3 — Assimilation dashboard (Variant A, split board)
@@ -438,6 +511,8 @@ func s3Actions(m Model, rv runview.RunVM) Widget {
         Fixed(16, btnWidget("open unit →", false, MOpenUnit())),
         Fixed(2, Text("")),
         Fixed(13, btnWidget("report →", false, MOpenReport())),
+        Fixed(2, Text("")),
+        Fixed(18, depsButton(m)),
         Flex(1, savedIndicator(m)),
         Fixed(20, badge),
         Fixed(1, Text("")),
@@ -494,7 +569,7 @@ func stackedBoard(m Model, rv runview.RunVM) Widget =
     ))
 
 func s3Footer() Widget =
-    TextStyled("  tab switch · ↑↓ navigate · enter open · p report · esc back · q quit",
+    TextStyled("  tab switch · ↑↓ navigate · enter open · p report · d deps · esc back · q quit",
         DefaultStyle().WithDim())
 
 // ----- left: unit tree by package -------------------------------------------
@@ -837,6 +912,181 @@ func s7Buttons() Widget =
         Fixed(12, btnWidget("cancel", false, MBack())),
         Flex(1, Text("")),
     ))
+
+// ============================================================================
+// S8 — Dependency forest (tracking + resolution)
+//
+// The resolved DependencyForest as a trackable TREE: each dependency indented by
+// its transitive depth, with a status glyph/label, its own clone folder, and — for
+// an in-flight sub-run — its assimilation progress. The two surfaced off-ramps
+// (unsupported / failed) render in a distinct color so the product invariant stays
+// visible. A selection cursor walks the tree; the four operator actions (resolve /
+// skip / retry / expand) are reachable by both mouse (per-node buttons) and key
+// (o/s/r/x), each gated by the node's projected availability.
+// ============================================================================
+
+func s8View(m Model) Widget = m.Forest match {
+    case Some(f) => s8Board(m, runview.ProjectForest(f))
+    case None()  => s8Empty()
+}
+
+// s8Empty is shown while the background ResolveDeps is still in flight (the screen
+// was opened before the forest landed).
+func s8Empty() Widget =
+    Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Dependencies")),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("  Resolving dependencies…", DefaultStyle().WithDim())),
+        Flex(1, Text("")),
+        Fixed(1, TextStyled("  esc back · q quit", DefaultStyle().WithDim())),
+    )))
+
+func s8Board(m Model, fv runview.ForestVM) Widget {
+    if (fv.Total == 0) { return s8NoDeps() }
+    return Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Dependencies")),
+        Fixed(1, depsSummaryRow(fv)),
+        Fixed(1, depsProgressRow(fv)),
+        Fixed(1, Text("")),
+        Flex(1, depsTree(m, fv)),
+        Fixed(1, s8Actions(m, fv)),
+        Fixed(1, s8Footer()),
+    )))
+}
+
+// s8NoDeps is the honest "scanned, no external dependencies" state — distinct from
+// the still-resolving notice so the user isn't left waiting on a forest that is empty.
+func s8NoDeps() Widget =
+    Border(Column(ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Dependencies — none")),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("  This project declares no external dependencies to assimilate.",
+            DefaultStyle().WithDim())),
+        Flex(1, Text("")),
+        Fixed(1, TextStyled("  esc back · q quit", DefaultStyle().WithDim())),
+    )))
+
+func depsSummaryRow(fv runview.ForestVM) Widget =
+    Row(ArrayOf[LayoutChild](
+        Flex(1, TextStyled(
+            s"  ${fv.Done}/${fv.Total} deps done · unsupported ${fv.Unsupported} · failed ${fv.Failed}",
+            DefaultStyle().WithDim())),
+        Fixed(13, iteratingDeps(fv)),
+    ))
+
+// iteratingDeps mirrors the run's loop indicator: "resolving…" while any node is
+// still drivable, "complete ✓" once the forest reaches its fixpoint.
+func iteratingDeps(fv runview.ForestVM) Widget {
+    if (fv.Complete) {
+        return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen()))
+    }
+    return TextStyled(" resolving…", DefaultStyle().WithFg(BrightYellow()))
+}
+
+func depsProgressRow(fv runview.ForestVM) Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Flex(1, Progress(fv.Pct)),
+        Fixed(16, TextStyled(s"  ${fv.Done}/${fv.Total} (${fv.Pct}%)",
+            DefaultStyle().WithBold().WithFg(BrightGreen()))),
+    ))
+
+// depsTree renders a window of forest rows around the cursor (so a deep forest still
+// scrolls), each indented by its transitive depth.
+func depsTree(m Model, fv runview.ForestVM) Widget {
+    val total = fv.Rows.Length()
+    val avail = maxI(1, m.Rows - 9)
+    val start = browseWindowStart(m.DepCursor, avail, total)
+    val end = minI(total, start + avail)
+    val rows = ArrayTabulate[LayoutChild](end - start, (k int) => {
+        val idx = start + k
+        return Fixed(1, depRowWidget(m, fv.Rows.Get(idx), idx))
+    })
+    return Column(rows)
+}
+
+func depRowWidget(m Model, r runview.DepRowVM, idx int) Widget {
+    val selected = m.DepCursor == idx
+    val coord = r.Module + " " + r.Version
+    val prog = if (r.Status == "assimilating")
+        s"  ${r.UnitsDone}/${r.UnitsTotal} (${r.Pct}%)"
+    else
+        ""
+    val text = depIndent(r.Depth) + r.Glyph + " " + coord + "  [" + r.Status + "]" + prog + depReasonSuffix(r)
+    return TextStyled(text, depRowStyle(r, selected)).OnClick(MDepSelect(Idx = idx))
+}
+
+// depIndent is the transitive-depth indentation: two spaces per level (root deps at
+// depth 1 → one level), so the reconstructed tree reads at a glance.
+func depIndent(depth int) string {
+    var s = "  "
+    var i = 1
+    for i < depth {
+        s = s + "  "
+        i = i + 1
+    }
+    return s
+}
+
+// depReasonSuffix appends the surfaced reason for the off-ramp states, collapsed to
+// one capped line so a long clone/verify diagnostic stays readable.
+func depReasonSuffix(r runview.DepRowVM) string {
+    if (r.Reason == "") { return "" }
+    return "  — " + trimDepReason(r.Reason)
+}
+
+func trimDepReason(reason string) string {
+    val oneLine = str.S(reason).ReplaceAll("\n", " ").Trim()
+    if (oneLine.Length() <= 44) { return oneLine.ToString() }
+    return oneLine.Take(44).ToString() + "…"
+}
+
+// depRowStyle keeps the off-ramps VISUALLY DISTINCT: failed in red, unsupported in
+// bold yellow, skipped dim, done green, an in-flight node cyan — and the selected row
+// reverse-bold over all of it.
+func depRowStyle(r runview.DepRowVM, selected bool) Style {
+    if (selected)         { return DefaultStyle().WithReverse().WithBold() }
+    if (r.IsFailed)       { return DefaultStyle().WithBold().WithFg(BrightRed()) }
+    if (r.IsUnsupported)  { return DefaultStyle().WithBold().WithFg(BrightYellow()) }
+    if (r.IsSkipped)      { return DefaultStyle().WithDim() }
+    if (r.IsDone)         { return DefaultStyle().WithFg(BrightGreen()) }
+    return DefaultStyle().WithFg(BrightCyan())
+}
+
+// s8Actions is the per-node action bar for the cursored dependency: each of the four
+// operator actions, enabled (clickable) only when the projection says it is meaningful
+// on this node's status — so an action is never silently a no-op.
+func s8Actions(m Model, fv runview.ForestVM) Widget {
+    val idx = clampInt(m.DepCursor, 0, maxI(0, fv.Rows.Length() - 1))
+    val row = fv.Rows.Get(idx)
+    return Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(13, depActionBtn("o resolve", row.CanResolve, MDepResolve())),
+        Fixed(10, depActionBtn("s skip", row.CanSkip, MDepSkip())),
+        Fixed(11, depActionBtn("r retry", row.CanRetry, MDepRetry())),
+        Fixed(12, depActionBtn("x expand", row.CanExpand, MDepExpand())),
+        Flex(1, depsSavedIndicator(m)),
+    ))
+}
+
+// depActionBtn renders an enabled (clickable) action button, or a dim non-clickable
+// label when the action does not apply to the cursored node.
+func depActionBtn(label string, enabled bool, msg Msg) Widget {
+    if (enabled) { return btnWidget(label, false, msg) }
+    return TextStyled("[ " + label + " ]", DefaultStyle().WithDim())
+}
+
+func depsSavedIndicator(m Model) Widget {
+    if (!m.Persist) { return Text("") }
+    if (m.ForestSaveOk) {
+        return TextStyled("  forest saved ✓", DefaultStyle().WithDim().WithFg(BrightGreen()))
+    }
+    return TextStyled("  forest save failed ✗", DefaultStyle().WithFg(BrightYellow()))
+}
+
+func s8Footer() Widget =
+    TextStyled("  ↑↓ move · o resolve · s skip · r retry · x expand · esc back · q quit",
+        DefaultStyle().WithDim())
 
 // ============================================================================
 // Shared control primitives
