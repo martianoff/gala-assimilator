@@ -39,12 +39,56 @@ func view(m Model) Widget {
 // S0 — Resume / corrupt-checkpoint launch prompt
 // ============================================================================
 
-func s0View(m Model) Widget = m.ResumeOffer match {
-    case Some(offer) => {
-        if (offer.Kind == "corrupt") { return s0Corrupt(offer) }
-        return s0Resume(offer)
+func s0View(m Model) Widget {
+    if (!m.Recent.IsEmpty()) { return s0Recent(m) }
+    return m.ResumeOffer match {
+        case Some(offer) => {
+            if (offer.Kind == "corrupt") { return s0Corrupt(offer) }
+            return s0Resume(offer)
+        }
+        case None() => resizeNotice(m)
     }
-    case None() => resizeNotice(m)
+}
+
+// s0Recent is the launch recent-projects picker: a selectable list of prior saved
+// sessions ("resume <root> — N/M done"), plus a trailing "[ start new project ]"
+// action. Cursor + actions are both keyboard- and mouse-reachable.
+func s0Recent(m Model) Widget {
+    val head = ArrayOf[LayoutChild](
+        Fixed(1, headerRow("Resume a saved migration")),
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("  Pick a session to resume, or start a new project:", DefaultStyle().WithDim())),
+        Fixed(1, Text("")),
+    )
+    val sessionRows = ArrayTabulate[LayoutChild](m.Recent.Length(), (i int) => {
+        val e = m.Recent.Get(i)
+        return Fixed(1, recentRow(e, i == m.RecentCursor, i))
+    })
+    val newIdx = m.Recent.Length()
+    val tail = ArrayOf[LayoutChild](
+        Fixed(1, Text("")),
+        Fixed(1, recentStartNewRow(newIdx == m.RecentCursor, newIdx)),
+        Flex(1, Text("")),
+        Fixed(1, TextStyled("  ↑/↓ choose · Enter select · q quit", DefaultStyle().WithDim())),
+    )
+    return Border(Column(head.AppendAll(sessionRows).AppendAll(tail)))
+}
+
+func recentRow(e runview.RecentRowVM, selected bool, idx int) Widget {
+    val caret = if (selected) "▸ " else "  "
+    val text = "  " + caret + "resume " + e.Root + s" — ${e.Done}/${e.Total} done"
+    val style = if (selected) DefaultStyle().WithReverse().WithBold() else DefaultStyle().WithFg(BrightGreen())
+    return TextStyled(text, style)
+        .OnClick(MRecentSelect(Idx = idx))
+        .OnDoubleClick(MRecentResume())
+}
+
+func recentStartNewRow(selected bool, idx int) Widget {
+    val caret = if (selected) "▸ " else "  "
+    val style = if (selected) DefaultStyle().WithReverse().WithBold() else DefaultStyle().WithBold().WithFg(BrightCyan())
+    return TextStyled("  " + caret + "[ start new project ]", style)
+        .OnClick(MRecentSelect(Idx = idx))
+        .OnDoubleClick(MRecentStartNew())
 }
 
 func s0Resume(offer runview.LoadSummary) Widget =
@@ -146,7 +190,7 @@ func originRow(m Model) Widget {
         radioCell(!m.OriginGit, f, "local dir",  MSetOrigin(Git = false)),
         radioCell(m.OriginGit,  f, "GitHub URL", MSetOrigin(Git = true)),
     ))
-    return subFieldRow("Origin", group)
+    return subFieldRowF(m, PaneOrigin(), "Origin", group)
 }
 
 // urlRow / refRow are the git-origin text fields. The label is clickable (focus by
@@ -154,7 +198,7 @@ func originRow(m Model) Widget {
 func urlRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneUrl())
     return Row(ArrayOf[LayoutChild](
-        Fixed(4, Text("")),
+        focusCaretCell(m, PaneUrl()),
         Fixed(subLabelW(), TextStyled("Repo URL", DefaultStyle().WithDim()).OnClick(MFocusUrl())),
         Flex(1, Input(m.RepoUrl, RuneCount(m.RepoUrl), "https://github.com/owner/repo", focused)),
     ))
@@ -163,7 +207,7 @@ func urlRow(m Model) Widget {
 func refRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneRef())
     return Row(ArrayOf[LayoutChild](
-        Fixed(4, Text("")),
+        focusCaretCell(m, PaneRef()),
         Fixed(subLabelW(), TextStyled("Ref (opt)", DefaultStyle().WithDim()).OnClick(MFocusRef())),
         Flex(1, Input(m.RepoRef, RuneCount(m.RepoRef), "default branch", focused)),
     ))
@@ -214,10 +258,29 @@ func subFieldRow(label string, control Widget) Widget =
         Flex(1, control),
     ))
 
+// focusCaretCell is the 4-wide leading indent for an S1 field, showing a ▸ marker
+// when this field owns keyboard focus — so the currently-focused control is ALWAYS
+// visible (the first Tab is predictable), even for plain text / button fields whose
+// own highlight is subtle.
+func focusCaretCell(m Model, pane string) LayoutChild {
+    if (m.Focus.IsFocused(pane)) {
+        return Fixed(4, TextStyled("  ▸ ", DefaultStyle().WithBold().WithFg(BrightCyan())))
+    }
+    return Fixed(4, Text(""))
+}
+
+// subFieldRowF is subFieldRow with a focus caret (▸) on the leading indent.
+func subFieldRowF(m Model, pane string, label string, control Widget) Widget =
+    Row(ArrayOf[LayoutChild](
+        focusCaretCell(m, pane),
+        Fixed(subLabelW(), TextStyled(label, DefaultStyle().WithDim())),
+        Flex(1, control),
+    ))
+
 func sourceRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneBrowse())
     return Row(ArrayOf[LayoutChild](
-        Fixed(4, Text("")),
+        focusCaretCell(m, PaneBrowse()),
         Fixed(subLabelW(), TextStyled("Project", DefaultStyle().WithDim())),
         Flex(1, TextStyled(m.SourceDir, DefaultStyle())),
         Fixed(12, btnWidget("browse…", focused, MBrowse())),
@@ -232,25 +295,27 @@ func detectedRow(m Model) Widget {
         "—  (no recognised project)"
     else
         "—  (" + info.Marker + ")"
-    val mark = if (info.Detected) " ✓" else " ✗"
+    val mark = if (info.Detected) "✓ " else "✗ "
     val markStyle = if (info.Detected)
         DefaultStyle().WithFg(BrightGreen())
     else
         DefaultStyle().WithFg(BrightYellow())
+    // The detection mark sits NEXT TO the detection text (not flush-right), so the
+    // ✓/✗ reads as part of the readout it describes.
     return Row(ArrayOf[LayoutChild](
         Fixed(4, Text("")),
         Fixed(subLabelW(), TextStyled("Detected", DefaultStyle().WithDim())),
+        Fixed(2, TextStyled(mark, markStyle)),
         Flex(1, TextStyled(text, DefaultStyle())),
-        Fixed(3, TextStyled(mark, markStyle)),
     ))
 }
 
 func targetRow(m Model) Widget =
-    subFieldRow("Language",
+    subFieldRowF(m, PaneTarget(), "Language",
         cyclerWidget(m.TargetLang(), m.Focus.IsFocused(PaneTarget()), MCycleTarget()))
 
 func ambiguityRow(m Model) Widget =
-    subFieldRow("Ambiguity",
+    subFieldRowF(m, PaneAmbiguity(), "Ambiguity",
         cyclerWidget(m.Ambiguity(), m.Focus.IsFocused(PaneAmbiguity()), MCycleAmbiguity()))
 
 func unsupportedRow(m Model) Widget {
@@ -263,7 +328,7 @@ func unsupportedRow(m Model) Widget {
         radioCell(isSkip, f, "skip",            MSetUnsupported(P = SkipUnit())),
         radioCell(isStop, f, "stop",            MSetUnsupported(P = StopAll())),
     ))
-    return subFieldRow("Unsupported", group)
+    return subFieldRowF(m, PaneUnsupported(), "Unsupported", group)
 }
 
 func retryControl(m Model) Widget =
@@ -272,7 +337,7 @@ func retryControl(m Model) Widget =
         Fixed(10, TextStyled(" per unit", DefaultStyle().WithDim())),
     ))
 
-func retryRow(m Model) Widget = subFieldRow("Retry", retryControl(m))
+func retryRow(m Model) Widget = subFieldRowF(m, PaneRetry(), "Retry", retryControl(m))
 
 // scanRow is the primary action, left-aligned under the form (not floating off to
 // the screen edge). With a GitHub origin and no valid repo URL yet, the button is
@@ -281,16 +346,21 @@ func retryRow(m Model) Widget = subFieldRow("Retry", retryControl(m))
 func scanRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneScan())
     val valid = !m.OriginGit || looksLikeRepoUrl(m.RepoUrl)
-    val label = if (m.Scanning) s"${spin(m.Frame)} scanning…" else "scan project →"
+    if (m.Scanning) {
+        return Row(ArrayOf[LayoutChild](
+            focusCaretCell(m, PaneScan()),
+            Fixed(22, btnWidget(s"${spin(m.Frame)} scanning…", focused, MNoOp())),
+        ))
+    }
     if (valid) {
         return Row(ArrayOf[LayoutChild](
-            Fixed(4, Text("")),
-            Fixed(20, btnWidget(label, focused, MScanRequested())),
+            focusCaretCell(m, PaneScan()),
+            btnKeyW("scan project", "⏎", focused, MScanRequested()),
         ))
     }
     return Row(ArrayOf[LayoutChild](
-        Fixed(4, Text("")),
-        Fixed(20, disabledBtn("scan project →", focused)),
+        focusCaretCell(m, PaneScan()),
+        Fixed(20, disabledBtn("scan project", focused)),
         Fixed(2, Text("")),
         Flex(1, TextStyled("↑ enter a repo URL above first", DefaultStyle().WithFg(BrightYellow()))),
     ))
@@ -320,22 +390,45 @@ func s2Empty(m Model) Widget =
 
 func s2Board(m Model, pv runview.PlanVM) Widget {
     if (pv.Units == 0) { return s2EmptyPlan(m, pv) }
-    val itemRows = pv.Items.Map((id) =>
-        Fixed(1, TextStyled("   • " + id, DefaultStyle())))
+    // Window the unit list so a large project never pushes the action buttons off
+    // screen: show as many rows as the viewport allows, with a "showing N of M" note.
+    val total = pv.Items.Length()
+    // Reserve rows for the header block (~8), the preflight block, footer + buttons.
+    val reserve = if (m.Preflight == "") 12 else 16
+    val avail = maxI(1, m.Rows - reserve)
+    val shown = minI(total, avail)
+    val itemRows = ArrayTabulate[LayoutChild](shown, (i int) =>
+        Fixed(1, TextStyled("   • " + pv.Items.Get(i), DefaultStyle())))
+    val showingNote = ArrayOf[LayoutChild](
+        Fixed(1, TextStyled(s"  showing ${shown} of ${total}", DefaultStyle().WithDim())))
     val head = ArrayOf[LayoutChild](
         Fixed(1, headerRow("Migration plan")),
         Fixed(1, Text("")),
         Fixed(1, kvRow("Source", m.SourceDir)),
+        Fixed(1, kvRow("Output", OutputDir(m.SourceDir))),
         Fixed(1, kvRow("Packages", s"${pv.Packages}     Units ${pv.Units}")),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  Units to migrate:", DefaultStyle().WithDim())),
     )
-    val foot = ArrayOf[LayoutChild](
+    val foot = preflightRows(m).AppendAll(ArrayOf[LayoutChild](
         Fixed(1, Text("")),
         Fixed(1, s2Buttons(m)),
-    )
-    val children = head.AppendAll(itemRows).AppendAll(foot)
+    ))
+    val children = head.AppendAll(itemRows).AppendAll(showingNote).AppendAll(foot)
     return Border(Column(children))
+}
+
+// preflightRows surfaces a BLOCKED start (the checkpoint location isn't writable):
+// what's wrong, the underlying reason, and the concrete next step — so a run that
+// won't start reads as "pick a writable location", never a silent dead click.
+func preflightRows(m Model) Array[LayoutChild] {
+    if (m.Preflight == "") { return EmptyArray[LayoutChild]() }
+    return ArrayOf[LayoutChild](
+        Fixed(1, Text("")),
+        Fixed(1, errLine("✗ Can't save progress here", DefaultStyle().WithBold().WithFg(BrightRed()))),
+        Fixed(1, errLine("  " + CheckpointDir(m.SourceDir) + " — " + m.Preflight, DefaultStyle().WithFg(BrightYellow()))),
+        Fixed(1, errLine("  Choose a writable project location, then start again.", DefaultStyle().WithDim())),
+    )
 }
 
 // s2EmptyPlan is the "we scanned, but there's nothing to migrate" state. The
@@ -408,15 +501,30 @@ func s3View(m Model) Widget = m.Run match {
 func s3Board(m Model, rv runview.RunVM) Widget {
     if (rv.Total == 0) { return s3Empty() }
     val board = if (m.Cols >= WideCols()) splitBoard(m, rv) else stackedBoard(m, rv)
-    return Border(Column(ArrayOf[LayoutChild](
+    val head = ArrayOf[LayoutChild](
         Fixed(1, headerRow("Assimilation in progress")),
         Fixed(1, breadcrumbRow(rv, m.Frame)),
         Fixed(1, progressBar(rv)),
-        Fixed(1, countsRow(rv)),
-        Fixed(1, s3Actions(m, rv)),
+    ).AppendAll(countsRow(rv, m.Cols))
+     .AppendAll(ArrayOf[LayoutChild](Fixed(1, s3Actions(m, rv))))
+     .AppendAll(saveErrorRows(m))
+    val children = head.AppendAll(ArrayOf[LayoutChild](
         Flex(1, board),
         Fixed(1, s3Footer()),
-    )))
+    ))
+    return Border(Column(children))
+}
+
+// saveErrorRows surfaces a FAILED checkpoint save on its own full-width line (so the
+// reason isn't clipped by the action row) — the operator sees exactly why progress
+// couldn't be saved. A clean save shows nothing here (the ✓ indicator suffices).
+func saveErrorRows(m Model) Array[LayoutChild] {
+    if (!m.Persist || m.LastSaveOk) { return EmptyArray[LayoutChild]() }
+    val why = if (m.SaveReason == "") "" else " — " + m.SaveReason
+    return ArrayOf[LayoutChild](
+        Fixed(1, errLine("⚠ couldn't save checkpoint" + why + " (progress may be lost)",
+            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+    )
 }
 
 // s3Empty guards the degenerate run (no units — e.g. a resumed empty checkpoint):
@@ -526,25 +634,39 @@ func savedIndicator(m Model) Widget {
     if (m.LastSaveOk) {
         return TextStyled("  checkpoint saved ✓", DefaultStyle().WithDim().WithFg(BrightGreen()))
     }
-    return TextStyled("  ⚠ couldn't save checkpoint — progress may be lost", DefaultStyle().WithFg(BrightYellow()))
+    // The full reason renders on its own row (saveErrorRows); keep this compact.
+    return TextStyled("  ⚠ save failed", DefaultStyle().WithBold().WithFg(BrightYellow()))
 }
 
 func progressBar(rv runview.RunVM) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
         Flex(1, Progress(rv.Pct)),
-        Fixed(18, TextStyled(s"  ${rv.Done}/${rv.Total} units (${rv.Pct}%)",
+        // Width 20 fits the widest label "  NN/NN units (100%)" without overrunning
+        // the right border (18 clipped the trailing ")" at 100%).
+        Fixed(20, TextStyled(s"  ${rv.Done}/${rv.Total} units (${rv.Pct}%)",
             DefaultStyle().WithBold().WithFg(BrightGreen()))),
     ))
 
-func countsRow(rv runview.RunVM) Widget {
+// countsRow stacks the status tally and the tests counter on the SAME row only when
+// the viewport is wide enough; at narrow widths the Flex(1) counts + Fixed(22) tests
+// cells collided (rendering "skitests 1/1"), so the tests counter drops to its own
+// row below. The caller (s3Board / s6Board) lays this out as one or two Fixed rows.
+func countsRow(rv runview.RunVM, cols int) Array[LayoutChild] {
     val c = rv.Counts
-    return Row(ArrayOf[LayoutChild](
-        Flex(1, TextStyled(
-            s"  queued ${c.Queued} · active ${c.Active} · done ${c.Done} · blocked ${c.Blocked} · skipped ${c.Skipped} · failed ${c.Failed}",
-            DefaultStyle().WithDim())),
-        Fixed(22, testsCounter(rv)),
-    ))
+    val countsText = TextStyled(
+        s"  queued ${c.Queued} · active ${c.Active} · done ${c.Done} · blocked ${c.Blocked} · skipped ${c.Skipped} · failed ${c.Failed}",
+        DefaultStyle().WithDim())
+    if (cols >= WideCols()) {
+        return ArrayOf[LayoutChild](Fixed(1, Row(ArrayOf[LayoutChild](
+            Flex(1, countsText),
+            Fixed(22, testsCounter(rv)),
+        ))))
+    }
+    return ArrayOf[LayoutChild](
+        Fixed(1, countsText),
+        Fixed(1, Row(ArrayOf[LayoutChild](Fixed(2, Text("")), Flex(1, testsCounter(rv))))),
+    )
 }
 
 // testsCounter renders the parity readout (e.g. "tests 7/12 passing"), green and
@@ -571,7 +693,7 @@ func stackedBoard(m Model, rv runview.RunVM) Widget =
     ))
 
 func s3Footer() Widget =
-    TextStyled("  Tab switch pane · ↑/↓ move selection · (actions on buttons above) · Esc back · q quit",
+    TextStyled("  Tab switch pane · ↑/↓ move · ⏎ open unit · p report · d deps · Esc back · q quit",
         DefaultStyle().WithDim())
 
 // ----- left: unit tree by package -------------------------------------------
@@ -702,41 +824,87 @@ func s4Board(m Model, vm runview.UnitDetailVM) Widget {
     val flags = if (vm.Flags.IsEmpty()) "(none)" else joinStrings(vm.Flags, "; ")
     return Border(Column(ArrayOf[LayoutChild](
         Fixed(1, headerRow("Review — " + vm.Id)),
+        Fixed(1, diffLegend()),
         Flex(1, diffArea(m, vm)),
+        Fixed(1, diffCaveat()),
         Fixed(1, kvRow("Rationale", rationale)),
         Fixed(1, kvRow("Flags", flags)),
         Fixed(1, kvRow("Verify", vm.Status)),
         Fixed(1, s4ActionBar()),
-        Fixed(1, TextStyled("  (actions on buttons above · edit is a stub) · Esc back to dashboard",
+        Fixed(1, TextStyled("  a accept · r retry · s skip · ↑/↓ scroll · Esc back to dashboard",
             DefaultStyle().WithDim())),
     )))
 }
 
-// diffArea shows source vs emitted target side-by-side (wide) or stacked
-// (narrow). Lines that differ at the same index are tinted red (source) /
-// green (target); identical lines stay dim — a cheap by-index diff readout.
+// diffLegend names the per-line tints so the colors are self-explanatory.
+func diffLegend() Widget =
+    Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        Fixed(20, TextStyled("red = source", DefaultStyle().WithFg(BrightRed()))),
+        Fixed(20, TextStyled("green = target", DefaultStyle().WithFg(BrightGreen()))),
+        Flex(1, TextStyled("dim = unchanged", DefaultStyle().WithDim())),
+    ))
+
+// diffCaveat is the honest disclaimer for the cheap by-index comparison: after any
+// insertion/deletion the lines no longer align, so "changed" tints can be spurious.
+// Surfacing this is the no-silent-drift discipline applied to the UI itself.
+func diffCaveat() Widget =
+    TextStyled("  ⓘ by-index compare: after an inserted/removed line, later lines may show as changed though they're not.",
+        DefaultStyle().WithDim().WithFg(BrightYellow()))
+
+// diffArea shows source vs emitted target side-by-side (wide) or stacked (narrow),
+// each pane line-numbered and scrolled by S4Scroll (↑/↓). Lines that differ at the
+// same index are tinted red (source) / green (target); identical lines stay dim.
 func diffArea(m Model, vm runview.UnitDetailVM) Widget {
     val tgt = if (vm.HasResult) vm.TargetLines
         else ArrayOf[string](s"${spin(m.Frame)} still translating this unit — no output yet.",
             "", "  This screen will fill in once the agent finishes.")
-    val left = diffPane("Source", vm.SourceLines, tgt, true)
-    val right = diffPane("Target", tgt, vm.SourceLines, false)
+    val avail = maxI(1, m.Rows - 11)
+    val left = diffPane(m, "Source", vm.SourceLines, tgt, true, avail)
+    val right = diffPane(m, "Target", tgt, vm.SourceLines, false, avail)
     if (m.Cols >= WideCols()) {
         return Row(ArrayOf[LayoutChild](Flex(1, left), Flex(1, right)))
     }
     return Column(ArrayOf[LayoutChild](Flex(1, left), Flex(1, right)))
 }
 
-func diffPane(title string, lines Array[string], other Array[string], isSource bool) Widget {
-    val rows = ArrayTabulate[LayoutChild](lines.Length(), (i int) => {
+func diffPane(m Model, title string, lines Array[string], other Array[string], isSource bool, avail int) Widget {
+    val total = lines.Length()
+    val start = clampInt(m.S4Scroll, 0, maxI(0, total))
+    val end = minI(total, start + avail)
+    val rows = ArrayTabulate[LayoutChild](maxI(0, end - start), (k int) => {
+        val i = start + k
         val ln = lines.Get(i)
         val same = i < other.Length() && other.Get(i) == ln
-        return Fixed(1, TextStyled(" " + ln, diffStyle(isSource, same)))
+        val num = lineNo(i + 1)
+        return Fixed(1, Row(ArrayOf[LayoutChild](
+            Fixed(5, TextStyled(num, DefaultStyle().WithDim())),
+            Flex(1, TextStyled(ln, diffStyle(isSource, same))),
+        )))
     })
+    val more = if (end < total) s"  … ${total - end} more lines (↓)" else ""
+    val moreRow = if (more == "") Text("") else TextStyled(more, DefaultStyle().WithDim())
     return Border(Column(ArrayOf[LayoutChild](
         Fixed(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan()))),
         Flex(1, Column(rows)),
+        Fixed(1, moreRow),
     )))
+}
+
+// lineNo right-pads a 1-based line number into a 4-wide gutter ("  12 ").
+func lineNo(n int) string {
+    val s = str.S(intToStr(n))
+    val pad = maxI(0, 4 - s.Length())
+    return spaces(pad) + s.ToString() + " "
+}
+
+func intToStr(n int) string = s"${n}"
+
+func spaces(n int) string {
+    var out = ""
+    var i = 0
+    for i < n { out = out + " "; i = i + 1 }
+    return out
 }
 
 func diffStyle(isSource bool, same bool) Style {
@@ -745,6 +913,9 @@ func diffStyle(isSource bool, same bool) Style {
     return DefaultStyle().WithFg(BrightGreen())
 }
 
+// s4ActionBar exposes the three real review actions plus a clearly DISABLED "edit"
+// (the edit flow is a stub this round) — so it reads as "not available yet", not a
+// clickable action that silently does nothing.
 func s4ActionBar() Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
@@ -754,7 +925,7 @@ func s4ActionBar() Widget =
         Fixed(1, Text("")),
         btnKeyW("skip", "s", false, MReviewSkip()),
         Fixed(1, Text("")),
-        btnKeyW("edit", "e", false, MReviewEdit()),
+        Fixed(16, disabledBtn("edit (soon)", false)),
         Flex(1, Text("")),
     ))
 
@@ -772,12 +943,15 @@ func s5View(m Model) Widget = m.Run match {
 
 func s5Board(m Model, vm runview.UnitDetailVM) Widget {
     val question = if (vm.Question == "") "(no question)" else vm.Question
-    return Border(Column(ArrayOf[LayoutChild](
+    val head = ArrayOf[LayoutChild](
         Fixed(1, headerRow("Blocker — " + vm.Id)),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  The agent needs a clarification:", DefaultStyle().WithDim())),
         Fixed(1, TextStyled("    " + question, DefaultStyle().WithBold().WithFg(BrightYellow()))),
         Fixed(1, Text("")),
+    )
+    val snippet = s5SnippetRows(vm)
+    val tail = ArrayOf[LayoutChild](
         Fixed(1, TextStyled("  Your answer:", DefaultStyle().WithDim())),
         Fixed(1, Row(ArrayOf[LayoutChild](
             Fixed(2, Text("")),
@@ -786,11 +960,36 @@ func s5Board(m Model, vm runview.UnitDetailVM) Widget {
         Fixed(1, Text("")),
         Fixed(1, Row(ArrayOf[LayoutChild](
             Fixed(2, Text("")),
-            Fixed(14, btnWidget("submit ↵", true, MAnswerSubmit())),
+            btnKeyW("submit", "⏎", true, MAnswerSubmit()),
+            Fixed(2, Text("")),
+            // The off-ramp: abandon this unit instead of answering. Mouse-clickable
+            // (a letter hotkey would type into the answer field) and Esc-reachable.
+            Fixed(19, btnWidget("skip this unit", false, MReviewSkip())),
             Flex(1, Text("")),
         ))),
-        Fixed(1, TextStyled("  type your answer · Enter submit · Esc cancel", DefaultStyle().WithDim())),
-    )))
+        Fixed(1, TextStyled("  type your answer · Enter submit · click skip to abandon · Esc cancel",
+            DefaultStyle().WithDim())),
+    )
+    return Border(Column(head.AppendAll(snippet).AppendAll(tail)))
+}
+
+// s5SnippetRows shows the first few lines of the unit's source, so the operator can
+// answer the clarification with the relevant code in view rather than from memory.
+func s5SnippetRows(vm runview.UnitDetailVM) Array[LayoutChild] {
+    if (vm.SourceLines.IsEmpty()) { return EmptyArray[LayoutChild]() }
+    val shown = minI(vm.SourceLines.Length(), 6)
+    val rows = ArrayTabulate[LayoutChild](shown, (i int) =>
+        Fixed(1, Row(ArrayOf[LayoutChild](
+            Fixed(5, TextStyled(lineNo(i + 1), DefaultStyle().WithDim())),
+            Flex(1, TextStyled(vm.SourceLines.Get(i), DefaultStyle().WithDim())),
+        ))))
+    val more = if (vm.SourceLines.Length() > shown)
+        ArrayOf[LayoutChild](Fixed(1, TextStyled(s"     … ${vm.SourceLines.Length() - shown} more lines",
+            DefaultStyle().WithDim())))
+    else EmptyArray[LayoutChild]()
+    return ArrayOf[LayoutChild](
+        Fixed(1, TextStyled("  Source:", DefaultStyle().WithDim())),
+    ).AppendAll(rows).AppendAll(more).AppendAll(ArrayOf[LayoutChild](Fixed(1, Text(""))))
 }
 
 func joinStrings(arr Array[string], sep string) string {
@@ -815,24 +1014,110 @@ func s6View(m Model) Widget = m.Run match {
 }
 
 func s6Board(m Model, rv runview.RunVM) Widget {
-    val complete = rv.Done >= rv.Total
-    val title = if (complete) "Migration report — complete" else "Migration report — in progress"
-    return Border(Column(ArrayOf[LayoutChild](
+    val c = rv.Counts
+    val problems = c.Failed + c.Blocked
+    val allDone = rv.Done >= rv.Total && rv.Total > 0
+    // The title must reflect failures — don't claim "complete" when units failed or
+    // are still blocked. A clean run that reached 100% is the only "complete".
+    val title =
+        if (allDone && problems == 0) "Migration report — complete"
+        else if (rv.Complete && problems > 0) "Migration report — finished with issues"
+        else "Migration report — in progress"
+    val children = ArrayOf[LayoutChild](
         Fixed(1, headerRow(title)),
         Fixed(1, Text("")),
         Fixed(1, kvRow("Source", m.SourceDir)),
         Fixed(1, kvRow("Progress", s"${rv.Done}/${rv.Total} units (${rv.Pct}%)")),
-        Fixed(1, countsRow(rv)),
+    ).AppendAll(countsRow(rv, m.Cols))
+     .AppendAll(s6IssueRows(c))
+     .AppendAll(s6FlagRows(rv))
+     .AppendAll(s6OutputRows(m))
+     .AppendAll(ArrayOf[LayoutChild](
         Fixed(1, Text("")),
         Fixed(1, TextStyled(s"  Checkpoint: ${CheckpointPath(m.SourceDir)}", DefaultStyle().WithDim())),
         Fixed(1, Text("")),
-        Fixed(1, Row(ArrayOf[LayoutChild](
-            Fixed(2, Text("")),
-            btnKeyW("resume from checkpoint", "r", true, MResumeFromDisk()),
-        ))),
+        Fixed(1, s6Actions(m, rv, problems)),
         Flex(1, Text("")),
-        Fixed(1, TextStyled("  (resume on the button above) · Esc back · q quit", DefaultStyle().WithDim())),
-    )))
+        Fixed(1, s6Footer(rv, problems)),
+    ))
+    return Border(Column(children))
+}
+
+// s6IssueRows foregrounds the failures/blocked counts and points the user at them
+// (S3's tree, via back) — so a report with problems never reads as a clean success.
+func s6IssueRows(c runview.StatusCounts) Array[LayoutChild] {
+    if (c.Failed == 0 && c.Blocked == 0) { return EmptyArray[LayoutChild]() }
+    return ArrayOf[LayoutChild](
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled(
+            s"  ⚠ ${c.Failed} failed · ${c.Blocked} blocked — review them on the dashboard (Esc).",
+            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+    )
+}
+
+// s6FlagRows foregrounds the correctness markers — flagged (unsupported-construct)
+// and unverified (no 1:1 source-test coverage) units — counted from the run rows, so
+// a report that "completed" but left questionable translations behind says so, and
+// points the operator at the dashboard to review them.
+func s6FlagRows(rv runview.RunVM) Array[LayoutChild] {
+    val flagged    = rv.Rows.Count((r runview.UnitRowVM) => r.Flagged)
+    val unverified = rv.Rows.Count((r runview.UnitRowVM) => r.Unverified)
+    if (flagged == 0 && unverified == 0) { return EmptyArray[LayoutChild]() }
+    return ArrayOf[LayoutChild](
+        Fixed(1, TextStyled(
+            s"  ⚑ ${flagged} flagged · ⚠ ${unverified} unverified — open them on the dashboard (Esc) to check.",
+            DefaultStyle().WithFg(BrightYellow()))),
+    )
+}
+
+// s6OutputRows surfaces WHERE the migrated project was written once integration has
+// run (or the failure reason) — the whole point of the run is the emitted output.
+func s6OutputRows(m Model) Array[LayoutChild] = m.Integrated match {
+    case Some(sum) => {
+        if (sum.Ok) {
+            return ArrayOf[LayoutChild](
+                Fixed(1, Text("")),
+                Fixed(1, TextStyled(s"  ✓ Results written to ${OutputDir(m.SourceDir)}  (${sum.Files} files)",
+                    DefaultStyle().WithBold().WithFg(BrightGreen()))))
+        }
+        return ArrayOf[LayoutChild](
+            Fixed(1, Text("")),
+            Fixed(1, TextStyled(s"  ✗ Couldn't write output: ${sum.Reason}",
+                DefaultStyle().WithBold().WithFg(BrightRed()))))
+    }
+    case None() => EmptyArray[LayoutChild]()
+}
+
+// s6Actions chooses the context-appropriate primary action. With problems, route
+// the operator back to review them; on a clean complete run there is nothing to
+// resume, so offer "done"; otherwise (genuinely partial) offer resume-from-disk.
+func s6Actions(m Model, rv runview.RunVM, problems int) Widget {
+    if (problems > 0) {
+        return Row(ArrayOf[LayoutChild](
+            Fixed(2, Text("")),
+            btnKeyW("review on dashboard", "esc", true, MBack()),
+        ))
+    }
+    if (rv.Done >= rv.Total && rv.Total > 0) {
+        return Row(ArrayOf[LayoutChild](
+            Fixed(2, Text("")),
+            btnKeyW("done", "esc", true, MBack()),
+        ))
+    }
+    return Row(ArrayOf[LayoutChild](
+        Fixed(2, Text("")),
+        btnKeyW("resume from checkpoint", "r", true, MResumeFromDisk()),
+    ))
+}
+
+func s6Footer(rv runview.RunVM, problems int) Widget {
+    if (problems > 0) {
+        return TextStyled("  Esc review on dashboard · q quit", DefaultStyle().WithDim())
+    }
+    if (rv.Done >= rv.Total && rv.Total > 0) {
+        return TextStyled("  Esc back · q quit", DefaultStyle().WithDim())
+    }
+    return TextStyled("  r resume from checkpoint · Esc back · q quit", DefaultStyle().WithDim())
 }
 
 // ============================================================================
@@ -858,7 +1143,7 @@ func s7Board(m Model, b BrowseState) Widget =
         Flex(1, browseList(m, b)),
         Fixed(1, Text("")),
         Fixed(1, s7Buttons()),
-        Fixed(1, TextStyled("  ↑/↓ move · ← parent dir · (open/select on buttons) · Esc cancel",
+        Fixed(1, TextStyled("  ↑/↓ move · ← parent dir · ⏎ open · s select · Esc cancel",
             DefaultStyle().WithDim())),
     )))
 
@@ -938,16 +1223,17 @@ func s7Buttons() Widget =
 
 func s8View(m Model) Widget = m.Forest match {
     case Some(f) => s8Board(m, runview.ProjectForest(f))
-    case None()  => s8Empty()
+    case None()  => s8Empty(m)
 }
 
 // s8Empty is shown while the background ResolveDeps is still in flight (the screen
-// was opened before the forest landed).
-func s8Empty() Widget =
+// was opened before the forest landed) — with an animated spinner so it reads as
+// working, not hung.
+func s8Empty(m Model) Widget =
     Border(Column(ArrayOf[LayoutChild](
         Fixed(1, headerRow("Dependencies")),
         Fixed(1, Text("")),
-        Fixed(1, TextStyled("  Resolving dependencies…", DefaultStyle().WithDim())),
+        Fixed(1, TextStyled(s"  ${spin(m.Frame)} Resolving dependencies…", DefaultStyle().WithDim())),
         Flex(1, Text("")),
         Fixed(1, TextStyled("  esc back · q quit", DefaultStyle().WithDim())),
     )))
@@ -956,13 +1242,23 @@ func s8Board(m Model, fv runview.ForestVM) Widget {
     if (fv.Total == 0) { return s8NoDeps() }
     return Border(Column(ArrayOf[LayoutChild](
         Fixed(1, headerRow("Dependencies")),
-        Fixed(1, depsSummaryRow(fv)),
+        Fixed(1, depsSummaryRow(fv, m.Frame)),
         Fixed(1, depsProgressRow(fv)),
         Fixed(1, Text("")),
         Flex(1, depsTree(m, fv)),
+        Fixed(1, s8CursorRow(m, fv)),
         Fixed(1, s8Actions(m, fv)),
         Fixed(1, s8Footer()),
     )))
+}
+
+// s8CursorRow echoes the cursored node above the action bar ("Actions for <node>:"),
+// so it is unambiguous which dependency the buttons / keys will act on.
+func s8CursorRow(m Model, fv runview.ForestVM) Widget {
+    val idx = clampInt(m.DepCursor, 0, maxI(0, fv.Rows.Length() - 1))
+    val r = fv.Rows.Get(idx)
+    return TextStyled(s"  Actions for ${r.Module} ${r.Version}  [${r.Status}]:",
+        DefaultStyle().WithBold().WithFg(BrightCyan()))
 }
 
 // s8NoDeps is the honest "scanned, no external dependencies" state — distinct from
@@ -977,21 +1273,22 @@ func s8NoDeps() Widget =
         Fixed(1, TextStyled("  esc back · q quit", DefaultStyle().WithDim())),
     )))
 
-func depsSummaryRow(fv runview.ForestVM) Widget =
+func depsSummaryRow(fv runview.ForestVM, frame int) Widget =
     Row(ArrayOf[LayoutChild](
         Flex(1, TextStyled(
             s"  ${fv.Done}/${fv.Total} deps done · unsupported ${fv.Unsupported} · failed ${fv.Failed}",
             DefaultStyle().WithDim())),
-        Fixed(13, iteratingDeps(fv)),
+        Fixed(15, iteratingDeps(fv, frame)),
     ))
 
-// iteratingDeps mirrors the run's loop indicator: "resolving…" while any node is
-// still drivable, "complete ✓" once the forest reaches its fixpoint.
-func iteratingDeps(fv runview.ForestVM) Widget {
+// iteratingDeps mirrors the run's loop indicator: an animated "⠋ resolving…" while
+// any node is still drivable (so a working forest visibly differs from a hung one),
+// flipping to "complete ✓" once the forest reaches its fixpoint.
+func iteratingDeps(fv runview.ForestVM, frame int) Widget {
     if (fv.Complete) {
         return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen()))
     }
-    return TextStyled(" resolving…", DefaultStyle().WithFg(BrightYellow()))
+    return TextStyled(s" ${spin(frame)} resolving…", DefaultStyle().WithFg(BrightYellow()))
 }
 
 func depsProgressRow(fv runview.ForestVM) Widget =
@@ -1084,12 +1381,19 @@ func s8Actions(m Model, fv runview.ForestVM) Widget {
 }
 
 // depActionChild renders an enabled (clickable) action button with its hotkey, or a
-// dim non-clickable label when the action does not apply to the cursored node.
-// Auto-sized so labels never clip.
+// clearly INERT disabled control when the action does not apply to the cursored node.
+// The disabled form uses parenthesis brackets + a dim strike-through dash and no
+// click contract — visibly different from the actionable square-bracket buttons, so
+// an unavailable action never looks clickable. Auto-sized so labels never clip.
 func depActionChild(label string, keyHint string, enabled bool, msg Msg) LayoutChild {
-    val w = RuneCount(label) + RuneCount(keyHint) + 6
-    if (enabled) { return Fixed(w, btnKey(label, keyHint, false, msg)) }
-    return Fixed(w, TextStyled("[ " + label + "  " + keyHint + " ]", DefaultStyle().WithDim()))
+    if (enabled) {
+        val w = RuneCount(label) + RuneCount(keyHint) + 6
+        return Fixed(w, btnKey(label, keyHint, false, msg))
+    }
+    // Inert form: a ⊘ prefix + parenthesis brackets + no click contract, so it reads
+    // as "not available", visibly distinct from the clickable [ … ] buttons.
+    val txt = "(⊘ " + label + "  " + keyHint + " )"
+    return Fixed(RuneCount(label) + RuneCount(keyHint) + 8, TextStyled(txt, DefaultStyle().WithDim()))
 }
 
 func depsSavedIndicator(m Model) Widget {
@@ -1101,7 +1405,7 @@ func depsSavedIndicator(m Model) Widget {
 }
 
 func s8Footer() Widget =
-    TextStyled("  ↑/↓ move selection · (actions on buttons above) · Esc back · q quit",
+    TextStyled("  ↑/↓ move · o resolve · s skip · r retry · x expand · Esc back · q quit",
         DefaultStyle().WithDim())
 
 // ============================================================================

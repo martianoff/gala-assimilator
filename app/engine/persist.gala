@@ -29,10 +29,12 @@ package engine
 
 import (
     "os"
+    "strconv"
     . "martianoff/gala/std"
     . "martianoff/gala/collection_immutable"
     "martianoff/gala/fs"
     json "martianoff/gala/json"
+    tu "martianoff/gala/time_utils"
 )
 
 // CheckpointLoad is the sealed result of reading a checkpoint from disk: the
@@ -48,20 +50,57 @@ sealed type CheckpointLoad {
 // Save / load (the IO edge)
 // ----------------------------------------------------------------------------
 
+// SaveResult is the outcome of a checkpoint save: it succeeded, or it failed with
+// a plain-language Reason the UI can show. The bare bool the old port returned
+// could only say "couldn't save"; this carries WHY so the operator can act on it.
+struct SaveResult(
+    Ok     bool,
+    Reason string,
+)
+
 // saveCheckpoint serializes the run's checkpoint and writes it atomically: encode
-// -> write a sibling temp file -> os.Rename over the target. Returns false on any
-// IO failure rather than throwing, so the caller can surface a save failure.
-func saveCheckpoint(state RunState, path string) bool {
+// -> write a per-process-unique sibling temp file -> os.Rename over the target.
+// Returns a SaveResult carrying the failure reason rather than throwing, so the
+// caller can surface exactly why a save failed.
+//
+// Windows robustness: the atomic os.Rename can transiently fail (an antivirus /
+// indexer briefly locks the target), so it is retried a few times with a tiny
+// backoff. The temp name is per-process-unique (pid + nanos) so two concurrent
+// saves never collide on the same sibling file.
+func saveCheckpoint(state RunState, path string) SaveResult {
     val cp   = Checkpoint(Units = state.Units, Log = state.Log)
     val body = encodeCheckpoint(cp)
-    val tmp  = path + ".tmp"
-    if fs.WriteFileString(tmp, body, 420).IsFailure() { return false }
-    if atomicRename(tmp, path).IsFailure() {
-        // Rename failed — remove the orphan temp so a failed save leaves no litter.
+    val tmp  = path + uniqueSuffix()
+    val wr   = fs.WriteFileString(tmp, body, 420)
+    if wr.IsFailure() { return SaveResult(Ok = false, Reason = "write failed: " + wr.Err.Error()) }
+    val renamed = renameWithRetry(tmp, path, 5)
+    if renamed.IsFailure() {
+        // Rename kept failing — remove the orphan temp so a failed save leaves no litter.
         fs.RemoveAll(tmp)
-        return false
+        return SaveResult(Ok = false, Reason = "rename failed: " + renamed.Err.Error())
     }
-    return true
+    return SaveResult(Ok = true, Reason = "")
+}
+
+// uniqueSuffix is a per-save unique temp-file suffix (pid + monotonic nanos) so two
+// concurrent saves to the same checkpoint never write the same sibling temp.
+func uniqueSuffix() string =
+    ".tmp." + strconv.Itoa(os.Getpid()) + "." + strconv.FormatInt(nowNanos(), 10)
+
+func nowNanos() int64 = tu.Now().Since(tu.UnixEpoch()).ToNanos()
+
+// renameWithRetry retries the atomic rename a few times with a small backoff,
+// smoothing over a transient lock on Windows (AV / search indexer) that would
+// otherwise fail an otherwise-fine save.
+func renameWithRetry(from string, to string, attempts int) Try[bool] {
+    var i = 0
+    var last = atomicRename(from, to)
+    for last.IsFailure() && i < attempts - 1 {
+        tu.Sleep(tu.Milliseconds(int64(20)))
+        last = atomicRename(from, to)
+        i = i + 1
+    }
+    return last
 }
 
 // loadCheckpoint reads a checkpoint back. Missing file -> Missing; unreadable or

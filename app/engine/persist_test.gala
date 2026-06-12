@@ -28,7 +28,7 @@ func TestCheckpointRoundTripExact(t T) T {
     val p   = path.Join(tempCkptDir(), "cp.json")
     val eng = MockEngine()
     val mid = eng.Advance(eng.Advance(scanned(eng)))
-    val t1  = Eq(t, eng.SaveCheckpoint(mid, p), true)
+    val t1  = Eq(t, eng.SaveCheckpoint(mid, p).Ok, true)
     return eng.LoadCheckpoint(p) match {
         case Loaded(cp) => {
             val original = encodeCheckpoint(Checkpoint(Units = mid.Units, Log = mid.Log))
@@ -49,7 +49,7 @@ func TestCheckpointRoundTripRealSource(t T) T {
     val port = GoEngine()
     val root = materializeFixture()
     val mid  = RunToCompletion(port, port.Run(port.Plan(port.Scan(ScanRequest(Root = root)))))
-    val t1   = Eq(t, port.SaveCheckpoint(mid, p), true)
+    val t1   = Eq(t, port.SaveCheckpoint(mid, p).Ok, true)
     return port.LoadCheckpoint(p) match {
         case Loaded(cp) =>
             Eq(t1, encodeCheckpoint(cp), encodeCheckpoint(Checkpoint(Units = mid.Units, Log = mid.Log)))
@@ -73,7 +73,7 @@ func TestKillAndResumeSkipsDoneUnits(t T) T {
     val eng = MockEngine()
     val mid = eng.Advance(eng.Advance(eng.Advance(scanned(eng))))
     val t1  = Eq(t, CountByDone(mid), 1)               // unit 0 reached Done
-    val t2  = Eq(t1, eng.SaveCheckpoint(mid, p), true)
+    val t2  = Eq(t1, eng.SaveCheckpoint(mid, p).Ok, true)
 
     val failEng = MockEngineWith(ScriptedRunner(abortOutcome("must not re-run a Done unit"), cancelledAck()))
     return failEng.LoadCheckpoint(p) match {
@@ -96,7 +96,7 @@ func TestResumeCompletesRun(t T) T {
     val p   = path.Join(tempCkptDir(), "resume.json")
     val eng = MockEngine()
     val mid = eng.Advance(eng.Advance(eng.Advance(scanned(eng))))
-    val t1  = Eq(t, eng.SaveCheckpoint(mid, p), true)
+    val t1  = Eq(t, eng.SaveCheckpoint(mid, p).Ok, true)
     return eng.LoadCheckpoint(p) match {
         case Loaded(cp) => Eq(t1, CountByDone(RunToCompletion(eng, eng.Resume(cp))), 4)
         case Missing()  => Fail(t1, "expected Loaded, got Missing")

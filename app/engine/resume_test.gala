@@ -58,7 +58,7 @@ func TestDiskRestartPreservesDoneFrontier(t T) T {
     val mid0 = findRunUnit(mid, id0)                         // the Done unit, looked up once
     val doneText0 = mid0.FlatMap((u UnitRun) => doneTarget(u)).GetOrElse("<not-done>")
     val attempts0 = mid0.Map((u UnitRun) => u.Attempts).GetOrElse(-1)
-    val t2 = Eq(t1, eng.SaveCheckpoint(mid, p), true)
+    val t2 = Eq(t1, eng.SaveCheckpoint(mid, p).Ok, true)
 
     // A fresh process: a new engine value whose runner aborts ANY submission, so a
     // re-translation of the Done unit would be visible as a Failed status.
@@ -98,7 +98,7 @@ func TestDiskRestartResumesFrontierToCompletion(t T) T {
     val id0 = firstUnitId(mid)
     val doneText0 = findRunUnit(mid, id0).FlatMap((u UnitRun) => doneTarget(u)).GetOrElse("<not-done>")
     val total = mid.Units.Length()
-    val t1 = Eq(t, eng.SaveCheckpoint(mid, p), true)
+    val t1 = Eq(t, eng.SaveCheckpoint(mid, p).Ok, true)
 
     return eng.LoadCheckpoint(p) match {
         case Loaded(cp) => {

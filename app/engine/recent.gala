@@ -1,0 +1,143 @@
+package engine
+
+// RECENT-PROJECTS INDEX — a small, user-level (not per-project) registry of the
+// projects this tool has saved a checkpoint for, so the launch screen can offer to
+// RESUME any of them, not just one hardcoded path. Without it a real project can
+// never be recovered: the only resume probe checked a single default location.
+//
+// Location: <os.UserConfigDir>/gala-assimilator/recent.json (falls back to a temp
+// dir if the OS config dir is unavailable). One entry per project root, carrying the
+// last-known progress (done/total) and a save timestamp, kept most-recent-first.
+//
+// Serialization: hand-rolled JSON over GALA std's low-level streaming codec (the same
+// faithful approach persist.gala uses), so arbitrary string roots (with separators /
+// quotes) round-trip exactly. A read of a missing/garbage file yields an EMPTY index
+// rather than a crash — a stale registry must never block the launch.
+//
+// IO lives at this deliberate edge (like persist.gala); NO gala_tui, NO app/ui, no
+// acp.* crosses the new port methods.
+
+import (
+    "os"
+    . "martianoff/gala/std"
+    . "martianoff/gala/collection_immutable"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+    json "martianoff/gala/json"
+    tu "martianoff/gala/time_utils"
+)
+
+// NowMillis is the current wall-clock time as Unix milliseconds — the timestamp
+// stamped on a recent-projects entry so the launch list orders most-recent-first.
+func NowMillis() int64 = tu.Now().Since(tu.UnixEpoch()).ToMillis()
+
+// RecentEntry is one remembered project: its root, the last-saved progress, and a
+// Unix-millis timestamp of that save (for most-recent-first ordering).
+struct RecentEntry(
+    Root    string,
+    Done    int,
+    Total   int,
+    SavedAt int64,
+)
+
+// RecentIndex is the whole registry — a most-recent-first list of entries.
+struct RecentIndex(
+    Entries Array[RecentEntry],
+)
+
+// recentConfigDir is the user-level directory holding the index. It prefers the OS
+// config dir (e.g. %AppData% / ~/.config); if that's unavailable it falls back to a
+// stable temp location so the registry still works rather than vanishing.
+func recentConfigDir() string {
+    val dir, err = os.UserConfigDir()
+    if err != nil { return path.Join(os.TempDir(), "gala-assimilator") }
+    return path.Join(dir, "gala-assimilator")
+}
+
+// RecentIndexPath is the stable on-disk location of the recent-projects index.
+func RecentIndexPath() string = path.Join(recentConfigDir(), "recent.json")
+
+// LoadRecent reads the recent-projects index from its user-level path.
+func LoadRecent() RecentIndex = LoadRecentFrom(RecentIndexPath())
+
+func emptyRecent() RecentIndex = RecentIndex(Entries = EmptyArray[RecentEntry]())
+
+// RecordRecent upserts a project into the user-level index and writes it back.
+func RecordRecent(root string, done int, total int, savedAtMillis int64) bool =
+    RecordRecentTo(RecentIndexPath(), root, done, total, savedAtMillis)
+
+// upsertRecent floats the given entry to the front, dropping any prior entry for the
+// same root — so each project appears once, newest first.
+func upsertRecent(idx RecentIndex, entry RecentEntry) RecentIndex {
+    val without = idx.Entries.Filter((e RecentEntry) => e.Root != entry.Root)
+    return RecentIndex(Entries = ArrayOf[RecentEntry](entry).AppendAll(without))
+}
+
+// ----------------------------------------------------------------------------
+// Path-injectable IO (the engine wires the real path; tests use a temp file).
+// ----------------------------------------------------------------------------
+
+// LoadRecentFrom reads the index at `p`. A missing or unreadable/garbage file yields
+// an EMPTY index (never a crash) — a stale or corrupt registry must not block launch.
+func LoadRecentFrom(p string) RecentIndex {
+    if !fs.Exists(p) { return emptyRecent() }
+    val read = fs.ReadFileString(p)
+    if read.IsFailure() { return emptyRecent() }
+    return Try[RecentIndex](() => decodeRecent(read.Get())).GetOrElse(emptyRecent())
+}
+
+// SaveRecentTo writes the index to `p` (creating its parent dir). Best-effort: a
+// failure is reported as false, never thrown.
+func SaveRecentTo(p string, idx RecentIndex) bool {
+    fs.MkdirAll(path.Dir(p), 493)
+    return fs.WriteFileString(p, encodeRecent(idx), 420).GetOrElse(false)
+}
+
+// RecordRecentTo upserts an entry into the index at `p` and writes it back.
+func RecordRecentTo(p string, root string, done int, total int, savedAtMillis int64) bool {
+    val cur = LoadRecentFrom(p)
+    val next = upsertRecent(cur, RecentEntry(Root = root, Done = done, Total = total, SavedAt = savedAtMillis))
+    return SaveRecentTo(p, next)
+}
+
+// ----------------------------------------------------------------------------
+// Encode / decode (low-level streaming JSON, mirroring persist.gala)
+// ----------------------------------------------------------------------------
+
+func encodeRecent(idx RecentIndex) string {
+    val w = json.NewJsonEncoder()
+    w.WriteStartObject()
+    w.WriteKey("v");       w.WriteInt(1)
+    w.WriteKey("entries"); encArray[RecentEntry](w, idx.Entries, encRecentEntry)
+    w.WriteEndObject()
+    return w.String()
+}
+
+func encRecentEntry(w *json.JsonEncoderImpl, e RecentEntry) {
+    w.WriteStartObject()
+    w.WriteKey("root");    w.WriteString(e.Root)
+    w.WriteKey("done");    w.WriteInt(e.Done)
+    w.WriteKey("total");   w.WriteInt(e.Total)
+    w.WriteKey("savedAt"); w.WriteInt64(e.SavedAt)
+    w.WriteEndObject()
+}
+
+func decodeRecent(s string) RecentIndex {
+    val d = json.NewJsonDecoder(s)
+    d.StartObject()
+    d.ReadKey(); val v = d.ReadInt()
+    if v != 1 { panic("unsupported recent-index version") }
+    d.ReadKey(); val entries = decArray[RecentEntry](d, decRecentEntry)
+    d.EndObject()
+    return RecentIndex(Entries = entries)
+}
+
+func decRecentEntry(d *json.JsonDecoderImpl) RecentEntry {
+    d.StartObject()
+    d.ReadKey(); val root    = d.ReadString()
+    d.ReadKey(); val done    = d.ReadInt()
+    d.ReadKey(); val total   = d.ReadInt()
+    d.ReadKey(); val savedAt = d.ReadInt64()
+    d.EndObject()
+    return RecentEntry(Root = root, Done = done, Total = total, SavedAt = savedAt)
+}

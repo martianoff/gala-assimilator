@@ -78,6 +78,33 @@ func TestBlockerBadgeOpensS5(t T) T {
     return IsTrue(t1, s.Contains("Is x nullable?"))
 }
 
+// P2.9: the blocker screen shows the source snippet and a skip-this-unit off-ramp.
+func TestS5ShowsSourceAndSkip(t T) T {
+    val port = blockingEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val st = port.Run(port.Plan(ws))
+    val s = NewHarnessOnRun(port, ws, st)
+        .SendMsg(MRunTick()).SendMsg(MRunTick()).SendMsg(MRunTick())
+        .SendMsg(MOpenBlocker())
+    val t1 = Eq(t, s.Model.Screens.Current(), RouteS5())
+    val t2 = IsTrue(t1, s.Contains("Source:"))
+    return IsTrue(t2, s.Contains("skip this unit"))
+}
+
+// P2.9: clicking "skip this unit" on the blocker abandons it (Skipped) and returns
+// to the dashboard.
+func TestS5SkipAbandonsUnit(t T) T {
+    val port = blockingEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val st = port.Run(port.Plan(ws))
+    val s = NewHarnessOnRun(port, ws, st)
+        .SendMsg(MRunTick()).SendMsg(MRunTick()).SendMsg(MRunTick())
+        .SendMsg(MOpenBlocker())
+        .SendMsg(MReviewSkip())
+    val t1 = Eq(t, s.Model.Screens.Current(), RouteS3())
+    return IsFalse(t1, blockedAt(s.Model, 0))   // no longer blocked (abandoned)
+}
+
 func NewHarnessOnRun(port engine.EnginePort, ws engine.WorkspaceModel, st engine.RunState) harness.Session[Model, Msg] {
     val h = harness.NewHarnessFull[Model, Msg](NewProgram(blockingFactory(), 100, 20), (e) => inputToMsg(e), 100, 20)
     return h.Start()

@@ -416,3 +416,39 @@ func ClassifyLoad(load CheckpointLoad) LoadSummary = load match {
 
 func doneInUnits(units Array[UnitRun]) int =
     units.Count((u UnitRun) => isDone(u.Status))
+
+// ============================================================================
+// Integrate result → UI summary
+// ============================================================================
+
+// IntegrateSummary is an engine IntegrateResult projected for the UI: did the
+// emit succeed, how many files were written, and (on failure) the reason. The UI
+// switches on Ok (a bool), never matching the engine's sealed IntegrateResult.
+struct IntegrateSummary(
+    Ok     bool,
+    Files  int,
+    Reason string,
+)
+
+func ClassifyIntegrate(res IntegrateResult) IntegrateSummary = res match {
+    case Integrated(files)      => IntegrateSummary(Ok = true,  Files = files.Length(), Reason = "")
+    case IntegrateFailed(why)   => IntegrateSummary(Ok = false, Files = 0,              Reason = why)
+}
+
+// ============================================================================
+// Recent-projects index → UI rows
+// ============================================================================
+
+// RecentRowVM is one selectable row of the launch screen's recent-sessions list:
+// the project root and its last-known progress, projected from a RecentEntry so the
+// UI never touches the engine's index type directly.
+struct RecentRowVM(
+    Root  string,
+    Done  int,
+    Total int,
+)
+
+// ProjectRecent projects the engine's recent-projects index into the UI's row list
+// (already most-recent-first as stored).
+func ProjectRecent(idx RecentIndex) Array[RecentRowVM] =
+    idx.Entries.Map((e RecentEntry) => RecentRowVM(Root = e.Root, Done = e.Done, Total = e.Total))

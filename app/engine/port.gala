@@ -144,7 +144,7 @@ struct EnginePort(
     AnswerBlocker  func(RunState, UnitId, Answer) RunState,
     Checkpoint     func(RunState) Checkpoint,
     Resume         func(Checkpoint) RunState,
-    SaveCheckpoint func(RunState, string) bool,
+    SaveCheckpoint func(RunState, string) SaveResult,
     LoadCheckpoint func(string) CheckpointLoad,
     Integrate      func(RunState, WorkspaceModel, string) IntegrateResult,
     // Dependency forest (assimilate a project AND its dependencies — each dep is a

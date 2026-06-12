@@ -57,6 +57,18 @@ func TestS4NarrowRendersStacked(t T) T {
     return IsTrue(t4, out.Contains("done"))
 }
 
+// P2.5: the diff shows a red/green legend, line numbers, the by-index caveat, and a
+// disabled (non-clickable) edit button.
+func TestS4DiffLegendNumbersCaveatDisabledEdit(t T) T {
+    val m = onS4Done(100, 20)
+    val out = str.S(Snapshot(view(m), 100, 20))
+    val t1 = IsTrue(t,  out.Contains("red = source"))
+    val t2 = IsTrue(t1, out.Contains("green = target"))
+    val t3 = IsTrue(t2, out.Contains("by-index compare"))    // honest diff caveat
+    val t4 = IsTrue(t3, out.Contains("edit (soon)"))         // edit rendered disabled
+    return IsTrue(t4, out.Contains("1 //"))                  // line-numbered gutter
+}
+
 // Accept (key 'a') runs through ActOnUnit and returns to S3; the unit stays Done.
 func TestS4AcceptReturnsToS3(t T) T {
     val m0 = onS4Done(100, 20)

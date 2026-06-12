@@ -87,10 +87,16 @@ sealed type Msg {
     // checkpoint / resume
     case MResumeAccept()                       // S0: resume from the offered checkpoint
     case MStartFresh()                         // S0: discard the offer, go to S1
+    // S0 recent-projects picker
+    case MRecentSelect(Idx int)                // highlight a recent session row
+    case MRecentResume()                       // resume the highlighted recent session
+    case MRecentStartNew()                     // leave the picker for the new-migration flow (S1)
     case MOpenReport()                         // S3 → S6 report
     case MResumeFromDisk()                     // S6: reload the checkpoint and resume
     case MResumeLoaded(Load engine.CheckpointLoad)
-    case MCheckpointSaved(Ok bool)
+    case MCheckpointSaved(Ok bool, Reason string)
+    case MIntegrated(Result engine.IntegrateResult)   // migrated output written (or failed)
+    case MSavePreflight(Reason string)                // pre-flight writability probe result
 
     // engine + runtime
     case MScanPlanned(Workspace engine.WorkspaceModel, Plan engine.MigrationPlan)
@@ -156,10 +162,15 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
 
     case MResumeAccept()    => resumeAccept(m)
     case MStartFresh()      => (m.Copy(Screens = m.Screens.Pop(), ResumeOffer = None[runview.LoadSummary]()), NoCmd[Msg]())
+    case MRecentSelect(i)   => (recentSelect(m, i), NoCmd[Msg]())
+    case MRecentResume()    => recentResume(m)
+    case MRecentStartNew()  => (m.Copy(Screens = m.Screens.Pop(), Recent = EmptyArray[runview.RecentRowVM]()), NoCmd[Msg]())
     case MOpenReport()      => (m.Copy(Screens = m.Screens.Push(RouteS6())), NoCmd[Msg]())
     case MResumeFromDisk()  => (m, loadCmd(m.Port, m.SourceDir))
     case MResumeLoaded(load) => resumeLoaded(m, load)
-    case MCheckpointSaved(ok) => (m.Copy(LastSaveOk = ok), NoCmd[Msg]())
+    case MCheckpointSaved(ok, reason) => (m.Copy(LastSaveOk = ok, SaveReason = reason), NoCmd[Msg]())
+    case MIntegrated(res)     => (m.Copy(Integrated = Some(runview.ClassifyIntegrate(res))), NoCmd[Msg]())
+    case MSavePreflight(reason) => savePreflight(m, reason)
 
     case MScanPlanned(ws, plan) => scanPlanned(m, ws, plan)
     case MRunStarted(st)        => runStarted(m, st)
@@ -216,13 +227,38 @@ func activate(m Model) Tuple[Model, Cmd[Msg]] {
     return noCmd(m)
 }
 
-// s0Activate: Enter resumes when a checkpoint loaded, else starts fresh.
-func s0Activate(m Model) Tuple[Model, Cmd[Msg]] = m.ResumeOffer match {
-    case Some(offer) => {
-        if (offer.Kind == "loaded") { return resumeAccept(m) }
-        return (m.Copy(Screens = m.Screens.Pop(), ResumeOffer = None[runview.LoadSummary]()), NoCmd[Msg]())
+// s0Activate: Enter resumes the highlighted recent session (recent picker), else
+// resumes the single offered checkpoint, else starts fresh.
+func s0Activate(m Model) Tuple[Model, Cmd[Msg]] {
+    if (!m.Recent.IsEmpty()) { return recentResume(m) }
+    return m.ResumeOffer match {
+        case Some(offer) => {
+            if (offer.Kind == "loaded") { return resumeAccept(m) }
+            return (m.Copy(Screens = m.Screens.Pop(), ResumeOffer = None[runview.LoadSummary]()), NoCmd[Msg]())
+        }
+        case None() => (m.Copy(Screens = m.Screens.Pop()), NoCmd[Msg]())
     }
-    case None() => (m.Copy(Screens = m.Screens.Pop()), NoCmd[Msg]())
+}
+
+// recentSelect moves the S0 picker cursor (clamped). The last row is the "start new
+// project" action; rows before it are resumable sessions.
+func recentSelect(m Model, idx int) Model {
+    val n = m.Recent.Length() + 1   // +1 for the "start new project" row
+    val hi = if (n > 0) n - 1 else 0
+    return m.Copy(RecentCursor = clampInt(idx, 0, hi))
+}
+
+// recentResume acts on the cursored S0 row: the trailing row leaves the picker for
+// the new-migration flow; a session row sets that project as the source and reloads
+// its checkpoint off the loop (MResumeLoaded then routes to S3).
+func recentResume(m Model) Tuple[Model, Cmd[Msg]] {
+    val n = m.Recent.Length()
+    if (m.RecentCursor >= n) {
+        return (m.Copy(Screens = m.Screens.Pop(), Recent = EmptyArray[runview.RecentRowVM]()), NoCmd[Msg]())
+    }
+    val root = m.Recent.Get(m.RecentCursor).Root
+    val m2 = m.Copy(SourceDir = root)
+    return (m2, loadCmd(m2.Port, root))
 }
 
 // ----- S4 / S5: open, review, answer ----------------------------------------
@@ -235,7 +271,7 @@ func openUnit(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
         if (runview.IsBlockedAt(rs, idx)) {
             return (m.Copy(AnswerText = "", Screens = m.Screens.Push(RouteS5())), NoCmd[Msg]())
         }
-        return (m.Copy(Screens = m.Screens.Push(RouteS4())), NoCmd[Msg]())
+        return (m.Copy(S4Scroll = 0, Screens = m.Screens.Push(RouteS4())), NoCmd[Msg]())
     }
     case None() => noCmd(m)
 }
@@ -441,11 +477,14 @@ func step(m Model, dir int) Model {
     return m
 }
 
-// nav is ArrowUp/Down — S3 tree/log, the S7 picker cursor, or the S8 forest cursor.
+// nav is ArrowUp/Down — S0 recent picker, S3 tree/log, the S7 picker cursor, or the
+// S8 forest cursor.
 func nav(m Model, dir int) Model {
     val r = m.Screens.Current()
+    if (r == RouteS0() && !m.Recent.IsEmpty()) { return recentSelect(m, m.RecentCursor + dir) }
     if (r == RouteS7()) { return browseMove(m, dir) }
     if (r == RouteS8()) { return depNav(m, dir) }
+    if (r == RouteS4()) { return m.Copy(S4Scroll = clampInt(m.S4Scroll + dir, 0, s4MaxScroll(m))) }
     if (r != RouteS3()) { return m }
     if (m.S3Focus == PaneLog()) { return scrollLog(m, -dir) }
     val n = unitCount(m)
@@ -567,10 +606,24 @@ func resolveDepsCmd(port engine.EnginePort, ws engine.WorkspaceModel) Cmd[Msg] =
         (f) => MDepsResolved(Forest = f),
     )
 
-// startRun materializes the run and routes to S3, kicking the first tick.
+// startRun is the "start assimilation" path. When persisting (the live app) it
+// first runs an off-loop PRE-FLIGHT writability probe of the checkpoint location:
+// a run that could never be saved must not start and silently lose work. The probe
+// result lands as MSavePreflight, which either materializes the run (writable) or
+// shows a blocking error on S2 (not writable). Tests (Persist=false) skip the probe
+// and start immediately, preserving the existing deterministic flow.
 func startRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
     case Some(plan) => {
         if (plan.Items.IsEmpty()) { return noCmd(m) }   // nothing to migrate — no empty run
+        if (m.Persist) { return (m.Copy(Preflight = ""), saveProbeCmd(m.SourceDir)) }
+        return launchRun(m)
+    }
+    case None() => noCmd(m)
+}
+
+// launchRun materializes the run off the loop and routes (via MRunStarted) to S3.
+func launchRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
+    case Some(plan) => {
         val port = m.Port
         val cmd = Async[engine.RunState, Msg](
             () => port.Run(plan),
@@ -579,6 +632,14 @@ func startRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
         return (m, cmd)
     }
     case None() => noCmd(m)
+}
+
+// savePreflight handles the pre-flight probe result: an empty reason means the
+// location is writable so the run launches; a non-empty reason BLOCKS the run on
+// S2 with a plain-language error (we never enter S3 with no place to save).
+func savePreflight(m Model, reason string) Tuple[Model, Cmd[Msg]] {
+    if (reason == "") { return launchRun(m.Copy(Preflight = "")) }
+    return (m.Copy(Preflight = reason), NoCmd[Msg]())
 }
 
 func runStarted(m Model, st engine.RunState) Tuple[Model, Cmd[Msg]] {
@@ -613,13 +674,25 @@ func advanceCmd(m Model, st engine.RunState) Cmd[Msg] =
 
 // applyAdvance installs a freshly-advanced run state, auto-saves it (when
 // persisting), and chains the next advance off the loop while work remains. Shared
-// by the sync (test) and async (live) advance paths.
+// by the sync (test) and async (live) advance paths. When this advance is the one
+// that COMPLETES the run, it also writes the migrated output to disk (integrate)
+// off the loop, so a finished migration always produces .gala files.
 func applyAdvance(m Model, next engine.RunState) Tuple[Model, Cmd[Msg]] {
     val m2 = m.Copy(Run = Some(next))
     if (runview.AnyActionable(next)) {
         return (m2, withSave(m2, next, withAnim(m, m2, advanceCmd(m2, next))))
     }
-    return (m2, withSave(m2, next, NoCmd[Msg]()))
+    // Run just reached a fixpoint — persist the checkpoint AND write the migrated
+    // project (only when we have a real source root + workspace to write from).
+    return (m2, withSave(m2, next, withIntegrate(m2, next)))
+}
+
+// withIntegrate fires the output-write Cmd when a completed run has a scanned
+// workspace to emit from (and we're persisting to a real root). Off (tests, or no
+// workspace) it is a no-op.
+func withIntegrate(m Model, state engine.RunState) Cmd[Msg] = m.Workspace match {
+    case Some(ws) => if (m.Persist) integrateCmd(m.Port, state, ws, m.SourceDir) else NoCmd[Msg]()
+    case None()   => NoCmd[Msg]()
 }
 
 // withSave batches an auto-checkpoint Cmd before `base` when persistence is on.
@@ -757,6 +830,22 @@ func withForestSave(m Model, forest engine.DependencyForest, base Cmd[Msg]) Cmd[
 
 // forestTickCmd schedules the next forest tick off the Update loop.
 func forestTickCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(60)), () => MForestTick())
+
+// s4MaxScroll bounds the S4 diff scroll to the longest pane's overflow past the
+// visible window, so scrolling never runs off the end of both panes.
+func s4MaxScroll(m Model) int = m.Run match {
+    case Some(rs) => runview.UnitAt(rs, m.TreeCursor) match {
+        case Some(vm) => {
+            val longest = maxInt(vm.SourceLines.Length(), vm.TargetLines.Length())
+            val avail = maxInt(1, m.Rows - 11)
+            return maxInt(0, longest - avail)
+        }
+        case None() => 0
+    }
+    case None() => 0
+}
+
+func maxInt(a int, b int) int = if (a > b) a else b
 
 func unitCount(m Model) int = m.Run match {
     case Some(rs) => rs.Units.Length()

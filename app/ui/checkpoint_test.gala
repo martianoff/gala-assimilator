@@ -45,7 +45,7 @@ func TestDoSaveWritesLoadableCheckpoint(t T) T {
     val port = engine.MockEngine()
     val mid = midRunState(port, 6)
     val saved = doSave(port, mid, root)
-    val t1 = IsTrue(t, saved)
+    val t1 = IsTrue(t, saved.Ok)
     return IsTrue(t1, fs.Exists(CheckpointPath(root)))
 }
 
@@ -57,7 +57,7 @@ func TestSaveThenResumeRestoresDoneCount(t T) T {
     val mid = midRunState(port, 6)
     val d = engine.CountByDone(mid)
     val saved = doSave(port, mid, root)
-    val t1 = IsTrue(t, saved)
+    val t1 = IsTrue(t, saved.Ok)
 
     // "Relaunch": classify what's on disk, seed the model (S0 offer).
     val offer = runview.ClassifyLoad(port.LoadCheckpoint(CheckpointPath(root)))
@@ -117,14 +117,209 @@ func TestCorruptShowsNoticeThenStartFresh(t T) T {
     return Eq(t3, m1.Screens.Current(), RouteS1())
 }
 
-// S3 → report (S6) shows the summary and a resume-from-checkpoint affordance.
+// S3 → report (S6): a CLEAN completed run shows the summary, says "complete", and
+// offers a context-appropriate "done" action (not "resume" — there is nothing left
+// to resume on a finished, problem-free run).
 func TestReportScreenRendersResume(t T) T {
-    val m = midRunModel(110, 24, 40)   // completed run on S3
+    val m = midRunModel(110, 24, 40)   // completed run on S3 (no failures/blocks)
     val (m1, _) = StepAll2(m, ArrayOf[Msg](MOpenReport()))
     val t1 = Eq(t, m1.Screens.Current(), RouteS6())
     val out = str.S(Snapshot(view(m1), 110, 24))
     val t2 = IsTrue(t1, out.Contains("Migration report"))
-    return IsTrue(t2, out.Contains("resume from checkpoint"))
+    val t3 = IsTrue(t2, out.Contains("complete"))
+    return IsTrue(t3, out.Contains("done"))
+}
+
+// ============================================================================
+// P0.1 — output integration: a completed run writes the migrated project and the
+// path is surfaced on S6.
+// ============================================================================
+
+// OutputDir sits beside the checkpoint, under .assimilator/out.
+func TestOutputDirShape(t T) T {
+    val p = str.S(OutputDir("/workdir/proj"))
+    val t1 = IsTrue(t, p.Contains(".assimilator"))
+    return IsTrue(t1, p.Contains("out"))
+}
+
+// doIntegrate (the function the integrate Cmd runs) writes the migrated output to
+// <root>/.assimilator/out and reports the files written.
+func TestDoIntegrateWritesOutput(t T) T {
+    val root = tempRoot()
+    val port = engine.MockEngine()
+    val ws   = port.Scan(engine.ScanRequest(Root = "/x"))
+    val st   = engine.RunToCompletion(port, port.Run(port.Plan(ws)))
+    val res  = doIntegrate(port, st, ws, root)
+    val sum  = runview.ClassifyIntegrate(res)
+    val t1 = IsTrue(t, sum.Ok)
+    val t2 = IsTrue(t1, sum.Files > 0)        // some .gala / gala.mod files emitted
+    return IsTrue(t2, fs.Exists(OutputDir(root)))
+}
+
+// Once a completed run integrates, the S6 report shows WHERE the output landed.
+func TestReportShowsOutputPath(t T) T {
+    val m  = midRunModel(110, 30, 40)   // completed run on S3
+    val sum = runview.IntegrateSummary(Ok = true, Files = 4, Reason = "")
+    val m1 = m.Copy(Integrated = Some(sum))
+    val (m2, _) = StepAll2(m1, ArrayOf[Msg](MOpenReport()))
+    val out = str.S(Snapshot(view(m2), 110, 30))
+    val t1 = IsTrue(t, out.Contains("Results written to"))
+    return IsTrue(t1, out.Contains("out"))
+}
+
+// Completing a run (while persisting) emits the integrate Cmd: the live applyAdvance
+// path fires an output write off the loop when the run reaches its fixpoint.
+func TestCompleteRunEmitsIntegrateCmd(t T) T {
+    val port = engine.MockEngine()
+    val ws   = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    // One Advance short of completion, persisting, with the workspace seeded.
+    val nearDone = advanceN(port, port.Run(plan), 60)
+    val m0 = NewModel(mockFactory(), 110, 30).Copy(
+        Persist = true, Workspace = Some(ws), Plan = Some(plan), Run = Some(nearDone),
+        Screens = NewScreenStack(RouteS1()).Push(RouteS3()))
+    // Drive the final advance through applyAdvance via MRunAdvanced.
+    val done = engine.RunToCompletion(port, nearDone)
+    val (_, cmds) = StepAll2(m0, ArrayOf[Msg](MRunAdvanced(State = done)))
+    return IsTrue(t, cmds.NonEmpty())   // a save + integrate batch was emitted
+}
+
+// P2.4: a report with a flagged/unverified unit foregrounds those markers and does
+// NOT claim "complete" — it points the operator back to review.
+func TestReportForegroundsFlagsNotComplete(t T) T {
+    val m = flagRunModel(110, 30)   // settled run: one flagged, one unverified
+    val (m1, _) = StepAll2(m, ArrayOf[Msg](MOpenReport()))
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    val t1 = IsTrue(t, out.Contains("flagged"))
+    return IsTrue(t1, out.Contains("unverified"))
+}
+
+// ============================================================================
+// P0.2 — pre-flight save gate: a run whose checkpoint location is unwritable must
+// not start; it stays on S2 with a blocking error.
+// ============================================================================
+
+// An empty-reason pre-flight result launches the run.
+func TestPreflightOkLaunchesRun(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val m0 = NewModel(mockFactory(), 110, 30).Copy(
+        Persist = true, Workspace = Some(ws), Plan = Some(plan),
+        Screens = NewScreenStack(RouteS1()).Push(RouteS2()))
+    val (m1, cmds) = StepAll2(m0, ArrayOf[Msg](MSavePreflight(Reason = "")))
+    val t1 = Eq(t, m1.Preflight, "")
+    return IsTrue(t1, cmds.NonEmpty())   // the run-materialize Cmd was emitted
+}
+
+// A failed pre-flight blocks the run: it stays on S2 and shows the error.
+func TestPreflightFailureBlocksRun(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val m0 = NewModel(mockFactory(), 110, 30).Copy(
+        Persist = true, Workspace = Some(ws), Plan = Some(plan),
+        Screens = NewScreenStack(RouteS1()).Push(RouteS2()))
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MSavePreflight(Reason = "the folder isn't writable")))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS2())    // never entered S3
+    val t2 = IsTrue(t1, m1.Run.IsEmpty())              // no run started
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    val t3 = IsTrue(t2, out.Contains("Can't save progress"))
+    return IsTrue(t3, out.Contains("writable"))
+}
+
+// startRun (while persisting) does NOT enter S3 directly — it defers to the probe.
+func TestStartRunDefersToPreflight(t T) T {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val m0 = NewModel(mockFactory(), 110, 30).Copy(
+        Persist = true, Workspace = Some(ws), Plan = Some(plan),
+        Screens = NewScreenStack(RouteS1()).Push(RouteS2()))
+    val (m1, cmds) = StepAll2(m0, ArrayOf[Msg](MStartRun()))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS2())   // still on S2 pending the probe
+    return IsTrue(t1, cmds.NonEmpty())                // the probe Cmd was emitted
+}
+
+// A real probe against a writable temp dir reports OK (empty reason).
+func TestSaveProbeWritableDir(t T) T {
+    val root = tempRoot()
+    return Eq(t, doSaveProbe(root), "")
+}
+
+// ============================================================================
+// P0.3 — the real save-failure reason surfaces.
+// ============================================================================
+
+// MCheckpointSaved carries the reason through to the model, and the S3 indicator
+// renders it.
+func TestSaveFailureReasonSurfaces(t T) T {
+    val m = midRunModel(110, 30, 5).Copy(Persist = true)
+    val (m1, _) = StepAll2(m, ArrayOf[Msg](MCheckpointSaved(Ok = false, Reason = "rename failed: locked")))
+    val t1 = Eq(t, m1.SaveReason, "rename failed: locked")
+    val out = str.S(Snapshot(view(m1), 110, 30))
+    val t2 = IsTrue(t1, out.Contains("couldn't save checkpoint"))
+    return IsTrue(t2, out.Contains("rename failed"))
+}
+
+// ============================================================================
+// P1.1 — recent-projects launch picker (S0).
+// ============================================================================
+
+// recentFixture is a deterministic two-session recent list (no IO).
+func recentFixture() Array[runview.RecentRowVM] =
+    ArrayOf[runview.RecentRowVM](
+        runview.RecentRowVM(Root = "/workdir/fyne-mines", Done = 3, Total = 7),
+        runview.RecentRowVM(Root = "/workdir/sample-lib", Done = 1, Total = 4),
+    )
+
+// With recent sessions present, launch opens S0 as a selectable list with the
+// resume rows AND a start-new action.
+func TestRecentPickerRenders(t T) T {
+    val m0 = NewModelWithRecent(mockFactory(), recentFixture(), false, 110, 30)
+    val t1 = Eq(t, m0.Screens.Current(), RouteS0())
+    val out = str.S(Snapshot(view(m0), 110, 30))
+    val t2 = IsTrue(t1, out.Contains("fyne-mines"))
+    val t3 = IsTrue(t2, out.Contains("3/7 done"))
+    return IsTrue(t3, out.Contains("start new project"))
+}
+
+// No recent sessions → straight to the new-migration flow (S1), no picker.
+func TestRecentEmptyGoesToS1(t T) T {
+    val m0 = NewModelWithRecent(mockFactory(), EmptyArray[runview.RecentRowVM](), false, 110, 30)
+    return Eq(t, m0.Screens.Current(), RouteS1())
+}
+
+// Arrow-down moves the picker cursor; the trailing "start new project" row is the
+// last selectable index.
+func TestRecentCursorMovesAndStartsNew(t T) T {
+    val m0 = NewModelWithRecent(mockFactory(), recentFixture(), false, 110, 30)
+    // 2 sessions + 1 start-new = indices 0,1,2; step to the start-new row.
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MNavDown(), MNavDown()))
+    val t1 = Eq(t, m1.RecentCursor, 2)
+    // Activating the start-new row leaves the picker for S1.
+    val (m2, _) = StepAll2(m1, ArrayOf[Msg](MActivate()))
+    return Eq(t1, m2.Screens.Current(), RouteS1())
+}
+
+// Selecting a session row sets it as the source and reloads its checkpoint; the
+// loaded checkpoint resumes onto S3. Real IO is confined to a temp project root.
+func TestRecentResumeLoadsThatProject(t T) T {
+    val root = tempRoot()
+    val port = engine.MockEngine()
+    val mid = midRunState(port, 6)
+    doSave(port, mid, root)   // a real checkpoint for THIS root
+    val d = engine.CountByDone(mid)
+    val recent = ArrayOf[runview.RecentRowVM](
+        runview.RecentRowVM(Root = root, Done = d, Total = mid.Units.Length()))
+    val m0 = NewModelWithRecent(mockFactory(), recent, false, 110, 30)
+    // Highlight the (only) session and resume; the load lands as MResumeLoaded.
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MRecentResume()))
+    val t1 = Eq(t, m1.SourceDir, root)        // the chosen project became the source
+    val load = port.LoadCheckpoint(CheckpointPath(root))
+    val (m2, _) = StepAll2(m1, ArrayOf[Msg](MResumeLoaded(Load = load)))
+    val t2 = Eq(t1, m2.Screens.Current(), RouteS3())
+    return Eq(t2, doneOf(m2), d)              // resumed with the saved done-count
 }
 
 // The S0 resume prompt shows the done/total figures.

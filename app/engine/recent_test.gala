@@ -1,0 +1,52 @@
+package engine
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/test"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// Tests for the recent-projects index: a path-injected round-trip, most-recent-first
+// upsert semantics, and the graceful EMPTY fallback on missing / garbage files — all
+// against a fresh temp dir (NO touching the user's real config location).
+
+func tempRecentPath() string = path.Join(fs.MkdirTemp("", "gala_recent").GetOrElse(""), "recent.json")
+
+// A recorded project round-trips exactly through save/load.
+func TestRecentRoundTrip(t T) T {
+    val p = tempRecentPath()
+    val ok = RecordRecentTo(p, "/workdir/fyne-mines", 3, 7, int64(1000))
+    val t1 = IsTrue(t, ok)
+    val idx = LoadRecentFrom(p)
+    val t2 = Eq(t1, idx.Entries.Length(), 1)
+    val e = idx.Entries.Get(0)
+    val t3 = Eq(t2, e.Root, "/workdir/fyne-mines")
+    val t4 = Eq(t3, e.Done, 3)
+    return Eq(t4, e.Total, 7)
+}
+
+// Recording the SAME root twice keeps one entry (updated), floated to the front.
+func TestRecentUpsertDedupesAndFloats(t T) T {
+    val p = tempRecentPath()
+    RecordRecentTo(p, "/a", 1, 4, int64(1))
+    RecordRecentTo(p, "/b", 2, 4, int64(2))
+    RecordRecentTo(p, "/a", 3, 4, int64(3))   // update /a, float it to front
+    val idx = LoadRecentFrom(p)
+    val t1 = Eq(t, idx.Entries.Length(), 2)              // /a deduped, not duplicated
+    val t2 = Eq(t1, idx.Entries.Get(0).Root, "/a")       // most-recent first
+    return Eq(t2, idx.Entries.Get(0).Done, 3)            // carries the latest progress
+}
+
+// A missing index loads as EMPTY (never a crash) — a fresh install has no registry.
+func TestRecentMissingIsEmpty(t T) T {
+    val p = path.Join(fs.MkdirTemp("", "gala_recent_missing").GetOrElse(""), "none.json")
+    return Eq(t, LoadRecentFrom(p).Entries.Length(), 0)
+}
+
+// A present-but-garbage index loads as EMPTY (surface, don't crash the launch).
+func TestRecentGarbageIsEmpty(t T) T {
+    val p = tempRecentPath()
+    fs.WriteFileString(p, "{ not a recent index", 420)
+    return Eq(t, LoadRecentFrom(p).Entries.Length(), 0)
+}

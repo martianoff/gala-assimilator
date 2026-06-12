@@ -22,6 +22,11 @@ func CheckpointDir(root string) string = path.Join(root, ".assimilator")
 // CheckpointPath is the stable per-project checkpoint file.
 func CheckpointPath(root string) string = path.Join(CheckpointDir(root), "state.json")
 
+// OutputDir is where the migrated project is written once a run completes —
+// a stable per-project location beside the checkpoint (<root>/.assimilator/out)
+// so the user always knows where to find the translated sources.
+func OutputDir(root string) string = path.Join(CheckpointDir(root), "out")
+
 // ForestCheckpointPath is the stable per-project DEPENDENCY-FOREST checkpoint, the
 // forest-scoped sibling of CheckpointPath. A transitive multi-dependency migration
 // is exactly the run that must survive quit/crash without re-cloning finished deps,
@@ -29,19 +34,34 @@ func CheckpointPath(root string) string = path.Join(CheckpointDir(root), "state.
 func ForestCheckpointPath(root string) string = path.Join(CheckpointDir(root), "forest.json")
 
 // doSave ensures the state dir exists, then persists the run via the port.
-// Returns the port's success flag (false on any IO failure — never throws).
-func doSave(port engine.EnginePort, state engine.RunState, root string) bool {
+// Returns the port's SaveResult (Ok=false carrying the reason on any IO failure —
+// never throws), so the UI can surface exactly WHY a save failed.
+func doSave(port engine.EnginePort, state engine.RunState, root string) engine.SaveResult {
     fs.MkdirAll(CheckpointDir(root), 493)   // 0755; ignore result — SaveCheckpoint reports failure
     return port.SaveCheckpoint(state, CheckpointPath(root))
 }
 
 // saveCmd persists the run off the Update loop; the result surfaces as
-// MCheckpointSaved so the UI can show a save indicator.
+// MCheckpointSaved so the UI can show a save indicator (and the failure reason). On
+// a successful save it ALSO records the project in the user-level recent-projects
+// index (best-effort), so a later launch can offer to resume THIS project — not just
+// one hardcoded default path.
 func saveCmd(port engine.EnginePort, state engine.RunState, root string) Cmd[Msg] =
-    Async[bool, Msg](
-        () => doSave(port, state, root),
-        (ok) => MCheckpointSaved(Ok = ok),
+    Async[engine.SaveResult, Msg](
+        () => saveAndRecord(port, state, root),
+        (res) => MCheckpointSaved(Ok = res.Ok, Reason = res.Reason),
     )
+
+// saveAndRecord persists the checkpoint and, on success, upserts the recent-projects
+// index entry for this root with the latest progress. The recent write is best-effort
+// — it never changes the save's own success/failure.
+func saveAndRecord(port engine.EnginePort, state engine.RunState, root string) engine.SaveResult {
+    val res = doSave(port, state, root)
+    if (res.Ok) {
+        engine.RecordRecent(root, engine.CountByDone(state), state.Units.Length(), engine.NowMillis())
+    }
+    return res
+}
 
 // loadCmd reads the checkpoint off the loop; the result surfaces as
 // MResumeLoaded (used by the S6 resume affordance).
@@ -49,6 +69,44 @@ func loadCmd(port engine.EnginePort, root string) Cmd[Msg] =
     Async[engine.CheckpointLoad, Msg](
         () => port.LoadCheckpoint(CheckpointPath(root)),
         (load) => MResumeLoaded(Load = load),
+    )
+
+// doIntegrate writes the completed migration to <root>/.assimilator/out via the
+// engine port, returning the IntegrateResult (file list or failure reason). The
+// output root is created as part of the engine's emit (writeOne mkdir's parents).
+func doIntegrate(port engine.EnginePort, state engine.RunState, model engine.WorkspaceModel, root string) engine.IntegrateResult =
+    port.Integrate(state, model, OutputDir(root))
+
+// integrateCmd writes the migrated project off the Update loop once a run is
+// complete; the result surfaces as MIntegrated so the UI can show WHERE the output
+// landed (or the failure reason).
+func integrateCmd(port engine.EnginePort, state engine.RunState, model engine.WorkspaceModel, root string) Cmd[Msg] =
+    Async[engine.IntegrateResult, Msg](
+        () => doIntegrate(port, state, model, root),
+        (res) => MIntegrated(Result = res),
+    )
+
+// doSaveProbe verifies the checkpoint location is WRITABLE before a run starts:
+// it creates <root>/.assimilator and writes-then-removes a tiny probe file. It
+// returns an empty string on success, or a plain-language reason on failure — so a
+// run that could never be saved is stopped up front rather than after lost work.
+func doSaveProbe(root string) string {
+    val dir = CheckpointDir(root)
+    val mk = fs.MkdirAll(dir, 493)
+    if mk.IsFailure() { return "couldn't create the folder (" + mk.Err.Error() + ")" }
+    val probe = path.Join(dir, ".write-probe")
+    val wr = fs.WriteFileString(probe, "ok", 420)
+    if wr.IsFailure() { return "the folder isn't writable (" + wr.Err.Error() + ")" }
+    fs.RemoveAll(probe)
+    return ""
+}
+
+// saveProbeCmd runs the pre-flight writability check off the Update loop; the
+// result surfaces as MSavePreflight.
+func saveProbeCmd(root string) Cmd[Msg] =
+    Async[string, Msg](
+        () => doSaveProbe(root),
+        (reason) => MSavePreflight(Reason = reason),
     )
 
 // doSaveForest ensures the state dir exists, then persists the forest via the port.

@@ -111,6 +111,16 @@ func TestS3ReachesFullProgress(t T) T {
     return IsTrue(t, out.Contains("(100%)"))
 }
 
+// Narrow reflow (P2.1): at <86 cols the counts row and tests counter must NOT
+// collide into "skitests", and the 100% progress label must not overrun the border.
+func TestS3NarrowReflowNoCorruption(t T) T {
+    val m = midRunModel(72, 24, 40)   // completed run, narrow width
+    val out = str.S(Snapshot(view(m), 72, 24))
+    val t1 = IsFalse(t, out.Contains("skitests"))      // counts no longer collide
+    val t2 = IsTrue(t1, out.Contains("tests 1/1 passing"))
+    return IsTrue(t2, out.Contains("(100%)"))          // full label rendered, not clipped
+}
+
 // The breadcrumb (Scan › Plan › Run › Verify › Report) and the tests-passing
 // counter both render in the S3 header — at wide and narrow widths.
 func TestS3BreadcrumbAndTestsWide(t T) T {

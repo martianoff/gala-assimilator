@@ -3,6 +3,7 @@ package ui
 import (
     . "github.com/martianoff/gala-tui"
     "github.com/martianoff/gala-assimilator/app/engine"
+    . "martianoff/gala/collection_immutable"
     str "martianoff/gala/strings"
     . "martianoff/gala/test"
 )
@@ -24,7 +25,7 @@ func TestS1WideRendersEveryControl(t T) T {
     val t7 = IsTrue(t6, out.Contains("(•) flag & continue"))
     val t8 = IsTrue(t7, out.Contains("( ) skip"))
     val t9 = IsTrue(t8, out.Contains("‹ prefer immutable + Copy ›"))
-    val t10 = IsTrue(t9, out.Contains("[ scan project → ]"))
+    val t10 = IsTrue(t9, out.Contains("[ scan project  ⏎ ]"))
     return IsTrue(t10, out.Contains("Tab next field"))               // key-hint footer
 }
 
@@ -35,7 +36,19 @@ func TestS1NarrowRendersEveryControl(t T) T {
     val t2 = IsTrue(t1, out.Contains("Language"))
     val t3 = IsTrue(t2, out.Contains("(•) flag & continue"))
     val t4 = IsTrue(t3, out.Contains("Retry"))
-    return IsTrue(t4, out.Contains("[ scan project → ]"))
+    return IsTrue(t4, out.Contains("[ scan project  ⏎ ]"))
+}
+
+// P2.7: the focused S1 field shows a ▸ caret (so the first Tab is predictable), and
+// the caret moves with focus.
+func TestS1FocusCaretRendersAndMoves(t T) T {
+    val m0 = NewModel(mockFactory(), 110, 20)
+    val out0 = str.S(Snapshot(view(m0), 110, 20))
+    val t1 = IsTrue(t, out0.Contains("▸ Project"))     // initial focus (browse pane)
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MFocusNext(), MFocusNext(), MFocusNext(), MFocusNext()))
+    val out1 = str.S(Snapshot(view(m1), 110, 20))
+    val t2 = IsTrue(t1, out1.Contains("▸ Language"))   // caret moved to Language
+    return IsFalse(t2, out1.Contains("▸ Project"))     // no longer on Project
 }
 
 // The Agent backend selector was removed — Claude is the only backend now, so S1

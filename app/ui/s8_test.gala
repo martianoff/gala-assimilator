@@ -158,6 +158,13 @@ func TestDepIndentGrowsWithDepth(t T) T {
     return IsTrue(t1, RuneCount(d3) > RuneCount(d2))
 }
 
+// P2.8: the cursored node is echoed above the action bar ("Actions for <node>:").
+func TestS8EchoesCursoredNode(t T) T {
+    val m = s8Model(110, 30, renderForest())
+    val out = str.S(Snapshot(view(m), 110, 30))
+    return IsTrue(t, out.Contains("Actions for"))
+}
+
 // A project with no external dependencies says so plainly (distinct from resolving).
 func TestS8NoDeps(t T) T {
     val m = s8Model(110, 30, mkDepForest(EmptyArray[engine.DependencyRun]()))

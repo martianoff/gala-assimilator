@@ -133,12 +133,21 @@ struct Model(
     LogScroll  int,   // lines scrolled up from the tail (0 = following latest)
     // S5 clarification answer buffer (the unit under review/answer is TreeCursor)
     AnswerText string,
+    // S4 diff scroll offset (lines scrolled down from the top of the diff panes)
+    S4Scroll   int,
     // S7 directory picker (None unless the browser is open)
     Browse Option[BrowseState],
     // checkpoint / resume
     Persist     bool,                         // auto-save the run during ticks (app: on; tests: off)
     ResumeOffer Option[runview.LoadSummary],  // a checkpoint found at launch (S0 prompt)
     LastSaveOk  bool,                         // last auto-save result (S3 indicator)
+    SaveReason  string,                       // last save failure reason ("" when clear)
+    // output integration (write the migrated project once the run completes)
+    Integrated   Option[runview.IntegrateSummary], // result of writing the migrated output
+    Preflight    string,                            // blocking pre-flight save error ("" when clear)
+    // recent-projects picker (S0): a selectable list of prior sessions to resume
+    Recent       Array[runview.RecentRowVM],
+    RecentCursor int,
 )
 
 // browseDirs is the small set of sample project paths the Browse control cycles.
@@ -187,10 +196,16 @@ func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model
         TreeCursor = 0,
         LogScroll  = 0,
         AnswerText = "",
+        S4Scroll   = 0,
         Browse      = None[BrowseState](),
         Persist     = false,
         ResumeOffer = None[runview.LoadSummary](),
         LastSaveOk  = true,
+        SaveReason  = "",
+        Integrated  = None[runview.IntegrateSummary](),
+        Preflight   = "",
+        Recent       = EmptyArray[runview.RecentRowVM](),
+        RecentCursor = 0,
     )
 }
 
@@ -216,6 +231,29 @@ func NewModelResume(
         Persist     = persist,
         ResumeOffer = Some(offer),
         Screens     = base.Screens.Push(RouteS0()),
+    )
+}
+
+// NewModelWithRecent seeds the model with the recent-projects list and opens the S0
+// launch picker when there is at least one remembered session. With no recent
+// sessions it falls back to the plain new-migration flow (S1). `persist` enables
+// auto-save during the run (app: true; tests: false).
+func NewModelWithRecent(
+    makePort func(string) engine.EnginePort,
+    recent Array[runview.RecentRowVM],
+    persist bool,
+    cols int,
+    rows int,
+) Model {
+    val base = NewModel(makePort, cols, rows)
+    if (recent.IsEmpty()) {
+        return base.Copy(Persist = persist)
+    }
+    return base.Copy(
+        Persist      = persist,
+        Recent       = recent,
+        RecentCursor = 0,
+        Screens      = base.Screens.Push(RouteS0()),
     )
 }
 
