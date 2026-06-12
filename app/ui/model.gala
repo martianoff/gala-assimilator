@@ -104,6 +104,7 @@ struct Model(
     ScanGit  func(engine.SourceOrigin, string) engine.OriginScan,
     Cols     int,
     Rows     int,
+    Frame    int,   // animation frame counter — advanced by ticks while loading/running
     // S1 interview
     SourceDir    string,
     Source       SourceInfo,
@@ -162,6 +163,7 @@ func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model
         ScanGit  = defaultScanGit(),
         Cols     = cols,
         Rows     = rows,
+        Frame    = 0,
         SourceDir    = dir,
         Source       = detectSource(dir),
         OriginGit    = false,

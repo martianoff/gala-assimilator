@@ -297,3 +297,27 @@ func TestS3TabTogglesPaneFocus(t T) T {
         .Press(PlainKey(Tab()))
     return Eq(t, s.Model.S3Focus, PaneLog())
 }
+
+// The run advances OFF the Update loop: MRunStarted installs the run on S3 and
+// emits an (async) advance Cmd instead of blocking on Advance inline — so a slow
+// backend can never freeze keys/mouse on the dashboard.
+func TestRunStartsWithAsyncAdvanceCmd(t T) T {
+    val port = engine.MockEngine()
+    val st = port.Run(port.Plan(port.Scan(engine.ScanRequest(Root = "/x"))))
+    val (m1, cmds) = StepAll2(NewModel(mockFactory(), 100, 30),
+        ArrayOf[Msg](MRunStarted(State = st)))
+    val t1 = Eq(t, m1.Screens.Current(), RouteS3())
+    val t2 = IsFalse(t1, completeOf(m1))   // still iterating — not advanced inline
+    return IsTrue(t2, cmds.NonEmpty())     // an advance Cmd (+ anim) was emitted
+}
+
+// MRunAdvanced installs a freshly-advanced state from the async result.
+func TestRunAdvancedInstallsState(t T) T {
+    val port = engine.MockEngine()
+    val st0 = port.Run(port.Plan(port.Scan(engine.ScanRequest(Root = "/x"))))
+    val s = s3Harness().Start()
+        .SendMsg(MRunStarted(State = st0))
+    val before = testsPassingOf(s.Model)
+    val s2 = s.SendMsg(MRunAdvanced(State = port.Advance(port.Advance(st0))))
+    return IsTrue(t, testsPassingOf(s2.Model) >= before)   // newer state installed
+}

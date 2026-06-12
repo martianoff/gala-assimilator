@@ -37,7 +37,7 @@ func openBrowse(m Model) Tuple[Model, Cmd[Msg]] {
         Focus   = m.Focus.FocusOn(PaneBrowse()),
         Screens = m.Screens.Push(RouteS7()),
     )
-    return (m2, openBrowseCmd(m.SourceDir))
+    return (m2, withAnim(m, m2, openBrowseCmd(m.SourceDir)))
 }
 
 // browseLoaded swaps in a completed listing.

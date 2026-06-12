@@ -25,7 +25,7 @@ func TestS1WideRendersEveryControl(t T) T {
     val t8 = IsTrue(t7, out.Contains("( ) skip"))
     val t9 = IsTrue(t8, out.Contains("‹ prefer immutable + Copy ›"))
     val t10 = IsTrue(t9, out.Contains("[ scan project → ]"))
-    return IsTrue(t10, out.Contains("tab move"))                      // key-hint footer
+    return IsTrue(t10, out.Contains("Tab next field"))               // key-hint footer
 }
 
 func TestS1NarrowRendersEveryControl(t T) T {

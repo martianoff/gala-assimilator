@@ -95,7 +95,9 @@ sealed type Msg {
     // engine + runtime
     case MScanPlanned(Workspace engine.WorkspaceModel, Plan engine.MigrationPlan)
     case MRunStarted(State engine.RunState)
-    case MRunTick()
+    case MRunTick()                            // synchronous one-step advance (tests)
+    case MRunAdvanced(State engine.RunState)   // async advance result (real run, off-loop)
+    case MTick()           // animation-only tick (advances the spinner while loading)
     case MResized(W int, H int)
 }
 
@@ -162,6 +164,8 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MScanPlanned(ws, plan) => scanPlanned(m, ws, plan)
     case MRunStarted(st)        => runStarted(m, st)
     case MRunTick()             => runTick(m)
+    case MRunAdvanced(next)     => applyAdvance(m, next)
+    case MTick()                => animTick(m)
     case MScanFailed(reason)    => (m.Copy(Scanning = false, ScanError = reason), NoCmd[Msg]())
 
     case MOpenDeps()         => openDeps(m)
@@ -255,7 +259,7 @@ func applyReview(m Model, action engine.UnitAction) Tuple[Model, Cmd[Msg]] = m.R
         case Some(id) => {
             val next = m.Port.ActOnUnit(rs, id, action)
             val m2 = m.Copy(Run = Some(next), Screens = m.Screens.Pop())
-            if (runview.AnyActionable(next)) { return (m2, tickCmd()) }
+            if (runview.AnyActionable(next)) { return (m2, withAnim(m, m2, advanceCmd(m2, next))) }
             return (m2, NoCmd[Msg]())
         }
         case None() => noCmd(m)
@@ -271,7 +275,7 @@ func submitAnswer(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
             val ans = engine.Answer(Task = engine.TaskId(Value = id.Value), Response = m.AnswerText)
             val next = m.Port.AnswerBlocker(rs, id, ans)
             val m2 = m.Copy(Run = Some(next), AnswerText = "", Screens = m.Screens.Pop())
-            if (runview.AnyActionable(next)) { return (m2, tickCmd()) }
+            if (runview.AnyActionable(next)) { return (m2, withAnim(m, m2, advanceCmd(m2, next))) }
             return (m2, NoCmd[Msg]())
         }
         case None() => noCmd(m)
@@ -307,7 +311,7 @@ func resumeWith(m Model, offer runview.LoadSummary) Tuple[Model, Cmd[Msg]] = off
             LogScroll   = 0,
             Screens     = NewScreenStack(RouteS1()).Push(RouteS3()),
         )
-        val cont = if (runview.AnyActionable(st)) tickCmd() else NoCmd[Msg]()
+        val cont = if (runview.AnyActionable(st)) withAnim(m, m2, advanceCmd(m2, st)) else NoCmd[Msg]()
         val resumeCmd = withSave(m2, st, cont)
         // Resume the dependency forest alongside the run (when persisting): a long
         // transitive migration restores its cloned/assimilated deps from disk too.
@@ -508,7 +512,8 @@ func startScan(m Model) Tuple[Model, Cmd[Msg]] {
         () => port.Scan(engine.ScanRequest(Root = root)),
         (ws) => MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
     )
-    return (m.Copy(Port = port, Scanning = true, ScanError = ""), cmd)
+    val m2 = m.Copy(Port = port, Scanning = true, ScanError = "")
+    return (m2, withAnim(m, m2, cmd))
 }
 
 // startGitScan acquires a remote origin: it builds engine.GitRepo(Url, Ref) and runs
@@ -524,7 +529,8 @@ func startGitScan(m Model, port engine.EnginePort) Tuple[Model, Cmd[Msg]] {
         () => scan(origin, dest),
         (os) => originScanToMsg(port, os),
     )
-    return (m.Copy(Port = port, Scanning = true, ScanError = ""), cmd)
+    val m2 = m.Copy(Port = port, Scanning = true, ScanError = "")
+    return (m2, withAnim(m, m2, cmd))
 }
 
 // originScanToMsg classifies the acquired origin (the sealed-type match lives in
@@ -583,23 +589,37 @@ func runStarted(m Model, st engine.RunState) Tuple[Model, Cmd[Msg]] {
         LogScroll  = 0,
         Screens    = m.Screens.Push(RouteS3()),
     )
-    return (m2, tickCmd())
+    return (m2, withAnim(m, m2, advanceCmd(m2, st)))
 }
 
-// runTick advances one engine step; re-schedules itself while work remains, and
-// (when persisting) auto-checkpoints the changed state off the loop, so a long
-// run is continuously saved.
+// runTick is the SYNCHRONOUS one-step advance used by the test suite (which sends
+// MRunTick directly). The live app never sends MRunTick — it advances off the loop
+// via advanceCmd/MRunAdvanced so the UI never blocks on a slow backend.
 func runTick(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
     case Some(st) => {
-        if (runview.AnyActionable(st)) {
-            val next = m.Port.Advance(st)
-            val m2 = m.Copy(Run = Some(next))
-            val cont = if (runview.AnyActionable(next)) tickCmd() else NoCmd[Msg]()
-            return (m2, withSave(m2, next, cont))
-        }
+        if (runview.AnyActionable(st)) { return applyAdvance(m, m.Port.Advance(st)) }
         return (m, NoCmd[Msg]())
     }
     case None() => (m, NoCmd[Msg]())
+}
+
+// advanceCmd computes the next run step OFF the Update loop. The engine's Advance
+// blocks on the backend (a live translation can take seconds), so running it inline
+// would freeze keys + mouse on the dashboard — the cause of the sluggish view
+// switches and dead clicks. The result lands as MRunAdvanced; the spinner keeps
+// turning meanwhile on the independent anim timer.
+func advanceCmd(m Model, st engine.RunState) Cmd[Msg] =
+    Async[engine.RunState, Msg](() => m.Port.Advance(st), (next) => MRunAdvanced(State = next))
+
+// applyAdvance installs a freshly-advanced run state, auto-saves it (when
+// persisting), and chains the next advance off the loop while work remains. Shared
+// by the sync (test) and async (live) advance paths.
+func applyAdvance(m Model, next engine.RunState) Tuple[Model, Cmd[Msg]] {
+    val m2 = m.Copy(Run = Some(next))
+    if (runview.AnyActionable(next)) {
+        return (m2, withSave(m2, next, withAnim(m, m2, advanceCmd(m2, next))))
+    }
+    return (m2, withSave(m2, next, NoCmd[Msg]()))
 }
 
 // withSave batches an auto-checkpoint Cmd before `base` when persistence is on.
@@ -607,9 +627,41 @@ func runTick(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
 func withSave(m Model, state engine.RunState, base Cmd[Msg]) Cmd[Msg] =
     if (m.Persist) Batch[Msg](saveCmd(m.Port, state, m.SourceDir), base) else base
 
-// tickCmd schedules the next tick off the Update loop (a Future the runtime
-// drains). In tests, MRunTick is sent directly instead.
-func tickCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(60)), () => MRunTick())
+// ----- spinner animation while loading --------------------------------------
+
+// isAnimating is true while a screen has work in flight whose spinner needs to keep
+// turning off the loop: a scan, a directory listing, or an actively-iterating run
+// (whose Advance now runs asynchronously, so the frame timer — not the advance —
+// drives the animation).
+func isAnimating(m Model) bool = m.Scanning || browseIsLoading(m) || runTicking(m)
+
+func browseIsLoading(m Model) bool = m.Browse match {
+    case Some(b) => b.Loading
+    case None()  => false
+}
+
+func runTicking(m Model) bool = m.Run match {
+    case Some(st) => runview.AnyActionable(st)
+    case None()   => false
+}
+
+// animCmd schedules the next animation frame (~12 fps) while something loads.
+func animCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(80)), () => MTick())
+
+// animTick advances the spinner frame and keeps the timer alive only while a load
+// is still in flight, so it self-stops the moment the screen settles (no idle
+// repaint of static menus, which is what kept mouse clicks alive there).
+func animTick(m Model) Tuple[Model, Cmd[Msg]] {
+    val m2 = m.Copy(Frame = m.Frame + 1)
+    if (isAnimating(m2)) { return (m2, animCmd()) }
+    return (m2, NoCmd[Msg]())
+}
+
+// withAnim batches the animation timer ahead of `cmd` when this transition starts
+// a load (rising edge). Because the timer only runs while isAnimating, a rising
+// edge implies no timer is already in flight — so this never double-starts it.
+func withAnim(prev Model, next Model, cmd Cmd[Msg]) Cmd[Msg] =
+    if (isAnimating(next) && !isAnimating(prev)) Batch[Msg](animCmd(), cmd) else cmd
 
 // ----- dependency forest: resolve → advance → fixpoint, operator actions -----
 
