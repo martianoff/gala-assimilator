@@ -1,0 +1,194 @@
+package engine
+
+// PROJECT-GATE FEEDBACK + DRIVER — the "gate, then feed back into the loop" half of
+// the whole-project evaluation. EvaluateProject (projectverify.gala) says whether the
+// migrated project compiles and its tests pass; this file decides what to do when it
+// does NOT: re-queue the implicated translations with the real compile/test
+// diagnostics attached, and drive translate -> evaluate -> re-translate to a fixpoint
+// (bounded), so a project that doesn't build is actually FIXED rather than just
+// reported.
+//
+// ATTRIBUTION IS DELIBERATELY COARSE. The GALA transpiler bundles a module's sources
+// before reporting, so a build error names the bundle, not the originating unit — per-
+// unit line attribution isn't recoverable. So feedback attributes by unit-id substring
+// when the diagnostics happen to name a unit, and otherwise re-translates EVERY Done
+// unit with the whole project diagnostics as shared context. Blunt, but honest (per
+// the product invariant: surface, don't guess) — and it converges, because each
+// re-translation sees the exact toolchain output that rejected the project.
+//
+// The ProjectGate value bundles the two operations the port exposes (Evaluate +
+// Feedback) so the engine can wire either the real toolchain gate (live backend) or a
+// deterministic always-green stub (offline mock/suite) behind the same shape.
+//
+// Transport-neutral (CLAUDE.md / architecture.md): pure data + the injected
+// runner/profile; NO gala_tui, NO app/ui, no acp.* crosses out.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    strings "martianoff/gala/strings"
+)
+
+// ----------------------------------------------------------------------------
+// Feedback — re-queue the implicated translations with real diagnostics
+// ----------------------------------------------------------------------------
+
+// applyProjectFeedback turns a non-green ProjectEvaluation into the next run state:
+// it re-queues the implicated Done units (Status -> Queued, Attempts reset, the
+// compile/test diagnostics threaded on as a PriorFailure the re-translation reads),
+// emitting an EvRetry + EvStatus per re-queued unit. A green evaluation is a fixpoint
+// — the state is returned unchanged. When the diagnostics name no unit (the common
+// bundled-build case), EVERY Done unit is re-queued.
+func applyProjectFeedback(state RunState, e ProjectEvaluation) RunState {
+    if ProjectGreen(e) { return state }
+    val diag    = feedbackDiag(e)
+    val reason  = projectFeedbackReason(e, diag)
+    val named   = state.Units.Filter((u UnitRun) => isDoneUnit(u) && strings.Contains(diag, u.Unit.Value))
+    val targets = if (named.IsEmpty()) state.Units.Filter((u UnitRun) => isDoneUnit(u)) else named
+    return requeueUnits(state, targets.Map((u UnitRun) => u.Unit.Value), reason)
+}
+
+// requeueUnits rebuilds the run with the named units re-queued (carrying the feedback
+// reason as a PriorFailure) and the matching EvRetry/EvStatus events appended — the
+// project-level analogue of retryOrFail's per-unit re-translate.
+func requeueUnits(state RunState, ids Array[string], reason string) RunState {
+    val newUnits = state.Units.Map((u UnitRun) => idListContains(ids, u.Unit.Value) match {
+        case true  => requeueOne(u, reason)
+        case false => u
+    })
+    val events = state.Units.FlatMap((u UnitRun) => idListContains(ids, u.Unit.Value) match {
+        case true  => requeueEvents(u, reason)
+        case false => EmptyArray[EngineEvent]()
+    })
+    return RunState(Units = newUnits, Log = state.Log.AppendAll(events))
+}
+
+func requeueOne(u UnitRun, reason string) UnitRun {
+    val asn = u.Assignment
+    val retried = asn.Copy(PriorFailure = Some[PriorFailure](
+        PriorFailure(Summary = reason, Flags = EmptyArray[UnsupportedFlag]()),
+    ))
+    return u.Copy(Assignment = retried, Status = Queued(), Attempts = 0)
+}
+
+func requeueEvents(u UnitRun, reason string) Array[EngineEvent] =
+    ArrayOf[EngineEvent](
+        EvRetry(Unit = u.Unit, Attempt = u.Attempts, Reason = reason),
+        EvStatus(Unit = u.Unit, Status = Queued()),
+    )
+
+func idListContains(ids Array[string], s string) bool =
+    ids.Exists((x string) => x == s)
+
+// feedbackDiag is the diagnostics text the re-translation gets: the build output when
+// compilation failed, else the test output, falling back to the structural Note when a
+// stage produced none.
+func feedbackDiag(e ProjectEvaluation) string {
+    if !e.Compiled {
+        if e.CompileOutput != "" { return e.CompileOutput }
+        return e.Note
+    }
+    if e.TestOutput != "" { return e.TestOutput }
+    return e.Note
+}
+
+// projectFeedbackReason names the failing STAGE (compile vs test) and target language
+// ahead of the verbatim diagnostics, so the re-translation knows whether it broke the
+// build or a test, and the activity log reads clearly.
+func projectFeedbackReason(e ProjectEvaluation, diag string) string {
+    val stage = if (!e.Compiled) "project compilation failed" else "project tests failed"
+    return "project gate: " + stage + " (target " + e.Language + "):\n" + diag
+}
+
+// ----------------------------------------------------------------------------
+// ProjectGate — the two operations the port exposes, wired per backend
+// ----------------------------------------------------------------------------
+
+// ProjectGate bundles the whole-project gate's two port operations: Evaluate (compile
+// + test the project) and Feedback (re-queue on failure). A backend wires either the
+// real toolchain gate or the offline stub behind this single shape — the port and the
+// UI driver depend only on it.
+struct ProjectGate(
+    Evaluate func(RunState, WorkspaceModel) ProjectEvaluation,
+    Feedback func(RunState, ProjectEvaluation) RunState,
+)
+
+// MockProjectGate is the OFFLINE default: a deterministic always-green evaluation and
+// an identity feedback (nothing to fix). The offline mock/go engines wire it so the
+// suite and the offline UI never spawn a real toolchain — and, because it is green,
+// the run proceeds straight to integrate/report exactly as before this gate existed.
+func MockProjectGate() ProjectGate =
+    ProjectGate(
+        Evaluate = (s RunState, m WorkspaceModel) => greenEvaluation(s),
+        Feedback = (s RunState, e ProjectEvaluation) => s,
+    )
+
+// ToolchainProjectGate is the LIVE gate: it really materializes the project and runs
+// the target toolchain (via the injected runner + profile), and feeds failures back
+// into the loop. The live ClaudeEngine wires this.
+func ToolchainProjectGate(runner ToolchainRunner, profile ToolchainProfile) ProjectGate =
+    ProjectGate(
+        Evaluate = (s RunState, m WorkspaceModel) => EvaluateProject(runner, profile, s, m),
+        Feedback = (s RunState, e ProjectEvaluation) => applyProjectFeedback(s, e),
+    )
+
+// greenEvaluation is the offline stub's verdict: materialized + compiled + tests
+// passed, with a Note making clear NO real toolchain ran (so the report never claims a
+// real compile happened offline). UnitsEmitted/Excluded still reflect the real run.
+func greenEvaluation(state RunState) ProjectEvaluation =
+    ProjectEvaluation(
+        Language = "(offline mock gate)", Materialized = true,
+        Compiled = true, CompileOutput = "", TestsRun = true, TestsPassed = true, TestOutput = "",
+        UnitsEmitted = CountByDone(state), UnitsExcluded = excludedUnitIds(state),
+        Note = "offline mock gate — the project was NOT compiled or tested",
+    )
+
+// ----------------------------------------------------------------------------
+// Driver — translate -> evaluate -> re-translate, bounded
+// ----------------------------------------------------------------------------
+
+// ProjectRunOutcome is a project-gated run's result: the final run state, the final
+// project evaluation (the report's detail), and how many gate rounds it took.
+struct ProjectRunOutcome(
+    State      RunState,
+    Evaluation ProjectEvaluation,
+    Attempts   int,
+)
+
+// DefaultMaxProjectAttempts caps the project-gate loop: the whole project is
+// re-translated against fresh build/test diagnostics at most this many times before
+// the run settles with whatever evaluation it has. Two — one initial pass plus one
+// diagnostics-driven retry — is the conventional default: enough for a feedback round
+// to fix the common case, bounded so a project that won't converge surfaces quickly
+// rather than re-translating forever (each round can re-run every unit).
+func DefaultMaxProjectAttempts() int = 2
+
+// RunWithProjectGate runs the WHOLE migration under the project gate: drive the per-
+// unit loop to its fixpoint, evaluate the integrated project (compile + test), and —
+// while it is not green and budget and Done units remain — feed the diagnostics back
+// and re-run. It returns the final state, the final evaluation, and the round count.
+// The live runtime (cmd/smoke) calls this; the offline suite drives it with a fake
+// runner. It always terminates: each round either turns the project green or consumes
+// one of the bounded attempts.
+func RunWithProjectGate(
+    port EnginePort, runner ToolchainRunner, profile ToolchainProfile,
+    model WorkspaceModel, state0 RunState, maxProjectAttempts int,
+) ProjectRunOutcome {
+    var s = RunToCompletion(port, state0)
+    var eval = EvaluateProject(runner, profile, s, model)
+    var attempts = 1
+    var more = projectGateMore(eval, attempts, maxProjectAttempts, s)
+    for more {
+        s = RunToCompletion(port, applyProjectFeedback(s, eval))
+        eval = EvaluateProject(runner, profile, s, model)
+        attempts = attempts + 1
+        more = projectGateMore(eval, attempts, maxProjectAttempts, s)
+    }
+    return ProjectRunOutcome(State = s, Evaluation = eval, Attempts = attempts)
+}
+
+// projectGateMore is the driver's continuation test: keep going only while the project
+// is not green, the attempt budget is not spent, AND there is at least one Done unit to
+// re-translate (no Done units means nothing the feedback could fix).
+func projectGateMore(eval ProjectEvaluation, attempts int, maxProjectAttempts int, s RunState) bool =
+    !ProjectGreen(eval) && attempts < maxProjectAttempts && CountByDone(s) > 0

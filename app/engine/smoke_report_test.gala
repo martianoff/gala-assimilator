@@ -46,3 +46,26 @@ func TestSmokeReportShowsRetryAndEmitted(t T) T {
     val t3 = IsTrue(t2, strings.Contains(rep, "--- emitted GALA ---"))
     return IsTrue(t3, strings.Contains(rep, "// fixed translation"))
 }
+
+// The evaluation report spells out HOW the project was verified: a compile failure
+// shows compilation FAIL with the real diagnostics, and the verdict reads NOT GREEN —
+// so a non-compiling migration can never be presented as a success.
+func TestEvaluationReportSurfacesCompileFailure(t T) T {
+    val ev = EvaluateProject(fakeRunner(false, "bundled.gala:10:22 missing '{'", true, ""),
+        GalaProfile(), finishedRun(), stubModel())
+    val rep = EvaluationReport(ev, 2)
+    val t1 = IsTrue(t,  strings.Contains(rep, "compilation:     FAIL"))
+    val t2 = IsTrue(t1, strings.Contains(rep, "missing '{'"))              // real diagnostics shown
+    val t3 = IsTrue(t2, strings.Contains(rep, "unit tests:      NOT RUN (compilation failed)"))
+    val t4 = IsTrue(t3, strings.Contains(rep, "gate rounds:     2"))
+    return IsTrue(t4, strings.Contains(rep, "NOT GREEN"))
+}
+
+// A green evaluation reports compilation PASS, unit tests PASS, and a GREEN verdict.
+func TestEvaluationReportGreen(t T) T {
+    val ev = EvaluateProject(fakeRunner(true, "", true, ""), GalaProfile(), finishedRun(), stubModel())
+    val rep = EvaluationReport(ev, 1)
+    val t1 = IsTrue(t,  strings.Contains(rep, "compilation:     PASS"))
+    val t2 = IsTrue(t1, strings.Contains(rep, "unit tests:      PASS"))
+    return IsTrue(t2, strings.Contains(rep, "GREEN — the migrated project compiles"))
+}

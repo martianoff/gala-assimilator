@@ -1,0 +1,167 @@
+package engine
+
+// Tests for the WHOLE-PROJECT gate (projectverify.gala) and its feedback + driver
+// (projectfeedback.gala), driven through an INJECTED FAKE toolchain runner — NO real
+// `gala` process is spawned, so the suite stays offline and deterministic and never
+// risks the nested-`gala test` workspace-contention bug. Materialization does real
+// (cheap, isolated, auto-removed) temp-dir IO; only the toolchain exec is faked.
+//
+// fakeRunner / GalaProfile are shared with realverify_test.gala (same package): the
+// fake answers `build` and `test` independently, and the GALA profile supplies the
+// build/test arg vectors so isBuildArgs keys correctly.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    strings "martianoff/gala/strings"
+)
+
+// a finished run: every stub unit translated to Done (mock output), the input the
+// project gate evaluates.
+func finishedRun() RunState {
+    val eng = MockEngine()
+    return RunToCompletion(eng, scanned(eng))
+}
+
+func stubModel() WorkspaceModel = ScanGoWorkspaceStub()
+
+// ----------------------------------------------------------------------------
+// EvaluateProject: green compile + green tests -> ProjectGreen.
+// ----------------------------------------------------------------------------
+
+func TestEvaluateProjectGreenPasses(t T) T {
+    val ev = EvaluateProject(fakeRunner(true, "", true, ""), GalaProfile(), finishedRun(), stubModel())
+    val t1 = IsTrue(t, ProjectGreen(ev))
+    val t2 = IsTrue(t1, ev.Compiled)
+    val t3 = IsTrue(t2, ev.TestsRun && ev.TestsPassed)
+    // all four stub units reached Done, so all four went into the build.
+    return Eq(t3, ev.UnitsEmitted, 4)
+}
+
+// ----------------------------------------------------------------------------
+// A compile error short-circuits: tests are NOT run, diagnostics carried verbatim.
+// ----------------------------------------------------------------------------
+
+func TestEvaluateProjectCompileFailSkipsTests(t T) T {
+    val diag = "bundled.gala:10:22 missing '{' at '('"
+    val ev = EvaluateProject(fakeRunner(false, diag, true, ""), GalaProfile(), finishedRun(), stubModel())
+    val t1 = IsTrue(t, !ProjectGreen(ev))
+    val t2 = IsTrue(t1, !ev.Compiled)
+    val t3 = IsTrue(t2, !ev.TestsRun)                              // tests skipped on a compile error
+    return IsTrue(t3, strings.Contains(ev.CompileOutput, "missing '{'"))
+}
+
+// ----------------------------------------------------------------------------
+// Compiles but a test fails -> not green, test output carried.
+// ----------------------------------------------------------------------------
+
+func TestEvaluateProjectTestFailIsNotGreen(t T) T {
+    val diag = "--- FAIL: TestValue (0.00s)\n    want 42, got 41"
+    val ev = EvaluateProject(fakeRunner(true, "", false, diag), GalaProfile(), finishedRun(), stubModel())
+    val t1 = IsTrue(t, ev.Compiled)
+    val t2 = IsTrue(t1, ev.TestsRun && !ev.TestsPassed)
+    val t3 = IsTrue(t2, !ProjectGreen(ev))
+    return IsTrue(t3, strings.Contains(ev.TestOutput, "want 42, got 41"))
+}
+
+// ----------------------------------------------------------------------------
+// No Done translations -> not green, never a vacuous "compiled" pass over nothing.
+// ----------------------------------------------------------------------------
+
+func TestEvaluateProjectNoUnitsIsNotGreen(t T) T {
+    val eng = MockEngine()
+    val ev = EvaluateProject(fakeRunner(true, "", true, ""), GalaProfile(), scanned(eng), stubModel())
+    val t1 = IsTrue(t, !ProjectGreen(ev))
+    val t2 = Eq(t1, ev.UnitsEmitted, 0)
+    return IsTrue(t2, strings.Contains(ev.Note, "no Done translations"))
+}
+
+// ----------------------------------------------------------------------------
+// Feedback: a failure naming no unit re-queues EVERY Done unit (bundled-build case).
+// ----------------------------------------------------------------------------
+
+func TestFeedbackRequeuesAllWhenUnattributed(t T) T {
+    val finished = finishedRun()
+    val ev = EvaluateProject(fakeRunner(false, "bundled.gala:1:1 boom", true, ""), GalaProfile(), finished, stubModel())
+    val fed = applyProjectFeedback(finished, ev)
+    // every unit is back to Queued for re-translation, none left Done.
+    val t1 = Eq(t, CountByDone(fed), 0)
+    val t2 = Eq(t1, queuedCount(fed), 4)
+    // an EvRetry was logged for the project-gate re-translate.
+    return IsTrue(t2, fed.Log.Exists((e EngineEvent) => isRetryEvent(e)))
+}
+
+// ----------------------------------------------------------------------------
+// Feedback: when the diagnostics NAME a unit, only that unit is re-queued.
+// ----------------------------------------------------------------------------
+
+func TestFeedbackRequeuesNamedUnitOnly(t T) T {
+    val finished = finishedRun()
+    val ev = ProjectEvaluation(
+        Language = "GALA", Materialized = true,
+        Compiled = false, CompileOutput = "error in core/value: undefined Frobnicate",
+        TestsRun = false, TestsPassed = false, TestOutput = "",
+        UnitsEmitted = 4, UnitsExcluded = EmptyArray[UnitId](), Note = "",
+    )
+    val fed = applyProjectFeedback(finished, ev)
+    // only core/value was named -> only it re-queued; the other three stay Done.
+    val t1 = Eq(t, queuedCount(fed), 1)
+    val t2 = Eq(t1, CountByDone(fed), 3)
+    return IsTrue(t2, unitIsQueued(fed, "core/value"))
+}
+
+// A green evaluation is a fixpoint — feedback changes nothing.
+func TestFeedbackOnGreenIsNoOp(t T) T {
+    val finished = finishedRun()
+    val ev = EvaluateProject(fakeRunner(true, "", true, ""), GalaProfile(), finished, stubModel())
+    val fed = applyProjectFeedback(finished, ev)
+    return Eq(t, fed.Log.Length(), finished.Log.Length())
+}
+
+// ----------------------------------------------------------------------------
+// Driver: green on the first round -> exactly one attempt, no feedback.
+// ----------------------------------------------------------------------------
+
+func TestRunWithProjectGateGreenFirstRound(t T) T {
+    val eng = MockEngine()
+    val out = RunWithProjectGate(eng, fakeRunner(true, "", true, ""), GalaProfile(),
+        stubModel(), scanned(eng), DefaultMaxProjectAttempts())
+    val t1 = IsTrue(t, ProjectGreen(out.Evaluation))
+    return Eq(t1, out.Attempts, 1)
+}
+
+// ----------------------------------------------------------------------------
+// Driver: a project that never compiles is bounded — it re-translates up to the cap
+// and settles non-green rather than looping forever.
+// ----------------------------------------------------------------------------
+
+func TestRunWithProjectGateBoundedOnPersistentFailure(t T) T {
+    val eng = MockEngine()
+    val out = RunWithProjectGate(eng, fakeRunner(false, "always broken", true, ""), GalaProfile(),
+        stubModel(), scanned(eng), 2)
+    val t1 = Eq(t, out.Attempts, 2)                       // initial + one feedback round, then stop
+    val t2 = IsTrue(t1, !ProjectGreen(out.Evaluation))
+    // the feedback round re-translated, so the units settle Done again at the fixpoint.
+    return Eq(t2, CountByDone(out.State), 4)
+}
+
+// ----- local helpers --------------------------------------------------------
+
+func queuedCount(s RunState) int =
+    s.Units.Count((u UnitRun) => u.Status match {
+        case Queued() => true
+        case _        => false
+    })
+
+func unitIsQueued(s RunState, id string) bool =
+    s.Units.Exists((u UnitRun) => u.Unit.Value == id && (u.Status match {
+        case Queued() => true
+        case _        => false
+    }))
+
+func isRetryEvent(e EngineEvent) bool = e match {
+    case EvRetry(_, _, _) => true
+    case EvStatus(_, _)   => false
+    case EvProgress(_, _) => false
+}

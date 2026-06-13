@@ -34,18 +34,27 @@ import (
     . "github.com/martianoff/gala-acp/agent"
 )
 
-// ClaudeEngine is the real Go frontend driven by the LIVE Claude translator (and
-// the still-deterministic verify gate). The backend the "Claude" option selects.
-func ClaudeEngine() EnginePort = GoEngineWithVerifier(ClaudeTranslator(), MockVerifier())
+// ClaudeEngine is the real Go frontend driven by the LIVE Claude translator, with the
+// REAL WHOLE-PROJECT gate wired in: the per-unit pass-through verifier (MockVerifier)
+// just admits each emitted translation, and ToolchainProjectGate then actually
+// `gala build ./...`s and `gala test`s the INTEGRATED project and feeds any compile/
+// test failure back into the loop. This is the backend the "Claude" option selects —
+// so a live migration can no longer report a project that doesn't compile as complete.
+// (A per-unit RealVerifier is the wrong gate here: a real project's units reference
+// each other, so a unit only type-checks in the context of the whole project.)
+func ClaudeEngine() EnginePort =
+    GoEngineWithGate(ClaudeTranslator(), MockVerifier(), DefaultMaxAttempts(),
+        ToolchainProjectGate(GalaToolchainRunner(), GalaProfile()))
 
-// ClaudeEngineRealVerify is ClaudeEngine with the REAL toolchain verify gate
-// (RealVerifier over the default GalaToolchainRunner) instead of the deterministic
-// mock — the live translator's GALA actually gets `gala build`/`gala test`'d, and a
-// red result feeds the fix loop real diagnostics. Opt-in (the mock verifier stays
-// the default) because it is only meaningful once the backend emits real GALA: under
-// the mock translator the target won't compile. See realverify.gala.
+// ClaudeEngineRealVerify additionally gates EACH unit with the per-unit RealVerifier
+// (RealVerifier over the default GalaToolchainRunner) on top of the whole-project
+// gate. The per-unit gate compiles a unit in isolation, so it is stricter (and can
+// over-reject on cross-unit references) — opt-in for when the extra per-unit signal is
+// wanted; the plain ClaudeEngine's project gate is the one the UI drives. See
+// realverify.gala / projectverify.gala.
 func ClaudeEngineRealVerify() EnginePort =
-    GoEngineWithVerifier(ClaudeTranslator(), RealVerifier(GalaToolchainRunner()))
+    GoEngineWithGate(ClaudeTranslator(), RealVerifier(GalaToolchainRunner()), DefaultMaxAttempts(),
+        ToolchainProjectGate(GalaToolchainRunner(), GalaProfile()))
 
 // SelectBackend maps a backend name to an EnginePort — the composition-root
 // selector the UI's "Claude" / offline options drive:
@@ -216,19 +225,34 @@ func abortTranscript(reason string) acp.RunTranscript[Result, Clarification] =
         Final = abortOutcome(reason),
     )
 
-// buildPrompt renders the translation instruction for one unit: emit ONLY GALA
-// source, with the unit's real source text and its imported-dependency context,
-// plus the prior rejection summary on a retry.
+// buildPrompt renders the translation instruction for one unit. The migration's value
+// is an IDIOMATIC translation, not a transliteration: the prompt instructs the agent to
+// re-express the source in the TARGET language's own paradigm and best practices —
+// applying the per-target convention notes (a.Target.Notes) — while preserving the
+// source's observable semantics exactly. It carries the unit's real source text, its
+// imported-dependency context, and (on a retry) the prior rejection — which, with the
+// project gate wired in, is the actual `gala build`/`gala test` diagnostics that
+// rejected the output, so each retry translates against real compiler/test feedback.
 func buildPrompt(a TaskAssignment) string {
+    val lang = a.Target.Language
     val deps = a.Source.Dependencies.Map((d DependencySnippet) => "- " + d.Name).MkString("\n")
     val depsBlock = if (deps == "") "(none)" else deps
+    val notes = a.Target.Notes.Map((n string) => "- " + n).MkString("\n")
+    val notesBlock = if (notes == "") "(apply idiomatic " + lang + " conventions and best practices)" else notes
     val priorBlock = a.PriorFailure match {
-        case Some(pf) => "\n=== PREVIOUS ATTEMPT REJECTED ===\n" + pf.Summary + "\n"
+        case Some(pf) => "\n=== PREVIOUS ATTEMPT REJECTED (fix exactly these and re-emit) ===\n" + pf.Summary + "\n"
         case None()   => ""
     }
-    return "You are migrating one source unit to GALA. Output ONLY the translated GALA source code — no prose, no explanation, no markdown fences.\n\n" +
+    return "You are migrating one source unit to " + lang + ".\n" +
+        "Re-express it in IDIOMATIC " + lang + " that applies the target language's paradigm and best practices — " +
+        "NOT a literal, construct-for-construct port. For example, an imperative source should become FUNCTIONAL " +
+        lang + " (immutable values, expressions over statements, no hidden mutation), not imperative code wearing " +
+        lang + " syntax. Preserve the source's observable SEMANTICS exactly; where a construct has no faithful " +
+        lang + " form, surface it as a flagged TODO rather than guessing.\n" +
+        "Output ONLY the translated " + lang + " source code — no prose, no explanation, no markdown fences.\n\n" +
         "Unit: " + a.Unit.Value + "\n" +
-        "Target language: " + a.Target.Language + "\n" +
+        "Target language: " + lang + "\n" +
+        "\n=== TARGET CONVENTIONS / BEST PRACTICES ===\n" + notesBlock + "\n" +
         priorBlock +
         "\n=== SOURCE ===\n" + a.Source.SourceText + "\n" +
         "\n=== IMPORTED DEPENDENCIES (context only) ===\n" + depsBlock + "\n"

@@ -52,26 +52,31 @@ struct ToolchainResult(
     Output string,
 )
 
-// ToolchainRunner is the injected "run the toolchain in dir X -> result" port: a
-// struct of one function value (the GALA-idiomatic port, like Verifier / AgentRunner).
-// Run(dir, args) runs `gala <args>` with working directory `dir`. RealVerifier
-// depends on this rather than calling exec itself, so a test can substitute a
-// deterministic fake (no real process) and the real run stays at the edge.
+// ToolchainRunner is the injected "run a toolchain command in dir X -> result" port:
+// a struct of one function value (the GALA-idiomatic port, like Verifier /
+// AgentRunner). Run(dir, command, args) runs `<command> <args>` with working
+// directory `dir`. The COMMAND is a parameter (not hardcoded `gala`) so the same
+// runner drives any target language's toolchain — the per-target ToolchainProfile
+// (toolchain.gala) supplies the command + its build/test args. RealVerifier depends
+// on this rather than calling exec itself, so a test can substitute a deterministic
+// fake (no real process) and the real run stays at the edge.
 struct ToolchainRunner(
-    Run func(string, Array[string]) ToolchainResult,
+    Run func(string, string, Array[string]) ToolchainResult,
 )
 
-// GalaToolchainRunner is the DEFAULT real runner: it actually spawns `gala` in the
+// GalaToolchainRunner is the DEFAULT real runner: it spawns the given command in the
 // scratch dir and captures its combined output via os/exec. CombinedOutput buffers
 // both pipes internally (no drain-deadlock) and returns a non-nil error on a
 // non-zero exit — which we map to Ok = false, the real diagnostics still in Output.
-// Exercised only on the live-backend round; the suite always injects a fake.
+// It is command-agnostic (the profile decides whether that is `gala`, `cargo`, …);
+// the name is historical. Exercised only on the live-backend round; the suite always
+// injects a fake.
 func GalaToolchainRunner() ToolchainRunner =
-    ToolchainRunner(Run = (dir string, args Array[string]) => runGalaCmd(dir, args))
+    ToolchainRunner(Run = (dir string, command string, args Array[string]) => runToolchainCmd(dir, command, args))
 
-func runGalaCmd(dir string, args Array[string]) ToolchainResult {
+func runToolchainCmd(dir string, command string, args Array[string]) ToolchainResult {
     val gargs = args.ToGoSlice()
-    val c = exec.Command("gala", gargs...)
+    val c = exec.Command(command, gargs...)
     c.Dir = dir
     val out, err = c.CombinedOutput()
     val text = string(out)
@@ -112,11 +117,12 @@ func gateInDir(runner ToolchainRunner, req VerifyRequest, dir string) VerifyResu
     if !materializeModule(dir, req) {
         return VerifyUnsupported(Reason = "verify: could not materialize scratch module under " + dir)
     }
-    val build = runner.Run(dir, ArrayOf[string]("build", "./..."))
+    val profile = GalaProfile()
+    val build = runner.Run(dir, profile.Command, profile.BuildArgs)
     if !build.Ok {
         return VerifyFail(Failing = gatedUnits(req), Reason = "gala build failed:\n" + build.Output)
     }
-    val test = runner.Run(dir, ArrayOf[string]("test"))
+    val test = runner.Run(dir, profile.Command, profile.TestArgs)
     if !test.Ok {
         return VerifyFail(Failing = gatedUnits(req), Reason = "gala test failed:\n" + test.Output)
     }

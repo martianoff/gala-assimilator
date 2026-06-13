@@ -1,0 +1,176 @@
+package engine
+
+// PROJECT-LEVEL EVALUATION — the engine's WHOLE-PROJECT correctness gate: does the
+// migrated project actually COMPILE, and do its (replicated) tests PASS? This is the
+// gate the per-unit verifier can't be: a real project's units reference each other,
+// so a unit only type-checks IN CONTEXT. EvaluateProject materializes EVERY Done unit
+// together into one scratch module (the migrated twin), then runs the target's
+// compile command and its test command over the whole thing and reports a detailed
+// verdict. It is the answer to "the output was reported 100% done but doesn't
+// compile" — nothing is a clean success until the project compiles AND its tests pass.
+//
+// Language-neutral: WHICH commands run is the injected ToolchainProfile's job
+// (toolchain.gala); the materialize -> compile -> test -> map shape here is the same
+// for every target. The process exec is the injected ToolchainRunner, so the whole
+// mapping is exercised offline with a fake runner (projectverify_test.gala) — no real
+// `gala` spawned by the suite, no workspace-contention risk.
+//
+// Transport-neutral (CLAUDE.md / architecture.md): IO lives at this deliberate edge
+// (fs temp dir + the injected runner); NO gala_tui, NO app/ui, no acp.* crosses out.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    "martianoff/gala/fs"
+    "martianoff/gala/path"
+)
+
+// ----------------------------------------------------------------------------
+// The detailed verdict
+// ----------------------------------------------------------------------------
+
+// ProjectEvaluation is HOW THE PROJECT WAS EVALUATED, as data the report renders
+// verbatim. Materialized: the scratch module was written. Compiled / CompileOutput:
+// did the target's compile command pass, and its real diagnostics. TestsRun: whether
+// the test command was reached (a compile failure skips it). TestsPassed / TestOutput:
+// the test command's verdict and output. UnitsEmitted: how many Done translations went
+// into the build; UnitsExcluded: the units left out (Failed / Skipped / Blocked /
+// still-running) — surfaced so a "green" build over a half-translated project is never
+// mistaken for a full one. Note carries any structural reason the gate couldn't run.
+struct ProjectEvaluation(
+    Language      string,
+    Materialized  bool,
+    Compiled      bool,
+    CompileOutput string,
+    TestsRun      bool,
+    TestsPassed   bool,
+    TestOutput    string,
+    UnitsEmitted  int,
+    UnitsExcluded Array[UnitId],
+    Note          string,
+)
+
+// ProjectGreen is the single "the migration is actually good" predicate: the project
+// materialized, compiled, AND its tests ran and passed. Anything else — a failed
+// materialize, a compile error, a red test, or zero translated units — is NOT green,
+// so the run is reported INCOMPLETE and (where budget remains) fed back into the loop.
+func ProjectGreen(e ProjectEvaluation) bool =
+    e.Materialized && e.Compiled && e.TestsRun && e.TestsPassed
+
+// ----------------------------------------------------------------------------
+// The evaluation
+// ----------------------------------------------------------------------------
+
+// EvaluateProject materializes the whole migrated project into an isolated scratch
+// module and runs the target toolchain's compile then test command over it. A
+// compile error short-circuits (tests are not run — they couldn't be trusted), and
+// the build/test diagnostics are carried back verbatim so the report shows exactly
+// why, and the fix loop (ApplyProjectFeedback) can feed them to a re-translation. The
+// scratch dir is always under os.TempDir (never the project workspace) and removed
+// after the run.
+func EvaluateProject(runner ToolchainRunner, profile ToolchainProfile, state RunState, model WorkspaceModel) ProjectEvaluation {
+    val done     = doneTargets(state)
+    val emitted  = done.Size()
+    val excluded = excludedUnitIds(state)
+    if emitted == 0 {
+        return ProjectEvaluation(
+            Language = profile.Language, Materialized = true,
+            Compiled = false, CompileOutput = "", TestsRun = false, TestsPassed = false, TestOutput = "",
+            UnitsEmitted = 0, UnitsExcluded = excluded,
+            Note = "no Done translations to evaluate — nothing reached the verify gate",
+        )
+    }
+    val dirTry = fs.MkdirTemp("", "gala_projeval")
+    if dirTry.IsFailure() {
+        return ProjectEvaluation(
+            Language = profile.Language, Materialized = false,
+            Compiled = false, CompileOutput = "", TestsRun = false, TestsPassed = false, TestOutput = "",
+            UnitsEmitted = emitted, UnitsExcluded = excluded,
+            Note = "could not create scratch module: " + dirTry.Err.Error(),
+        )
+    }
+    val dir = dirTry.Get()
+    val ev  = evalInDir(runner, profile, state, model, done, emitted, excluded, dir)
+    fs.RemoveAll(dir)
+    return ev
+}
+
+// evalInDir materializes the project under dir then runs compile + test. A failed
+// materialize is surfaced (never a silent pass); a red compile carries its build
+// diagnostics with tests left unrun; a red test carries its output; all green passes.
+func evalInDir(
+    runner ToolchainRunner, profile ToolchainProfile, state RunState, model WorkspaceModel,
+    done HashMap[string, string], emitted int, excluded Array[UnitId], dir string,
+) ProjectEvaluation {
+    if !materializeProject(dir, model, done) {
+        return ProjectEvaluation(
+            Language = profile.Language, Materialized = false,
+            Compiled = false, CompileOutput = "", TestsRun = false, TestsPassed = false, TestOutput = "",
+            UnitsEmitted = emitted, UnitsExcluded = excluded,
+            Note = "could not materialize scratch module under " + dir,
+        )
+    }
+    val build = runner.Run(dir, profile.Command, profile.BuildArgs)
+    if !build.Ok {
+        return ProjectEvaluation(
+            Language = profile.Language, Materialized = true,
+            Compiled = false, CompileOutput = build.Output, TestsRun = false, TestsPassed = false, TestOutput = "",
+            UnitsEmitted = emitted, UnitsExcluded = excluded, Note = "",
+        )
+    }
+    val test = runner.Run(dir, profile.Command, profile.TestArgs)
+    return ProjectEvaluation(
+        Language = profile.Language, Materialized = true,
+        Compiled = true, CompileOutput = build.Output, TestsRun = true, TestsPassed = test.Ok, TestOutput = test.Output,
+        UnitsEmitted = emitted, UnitsExcluded = excluded, Note = "",
+    )
+}
+
+// ----------------------------------------------------------------------------
+// Whole-project materialization (ONE module, so cross-unit references resolve)
+// ----------------------------------------------------------------------------
+
+// materializeProject writes the migrated project as a SINGLE GALA module: one
+// gala.mod at the root plus every Done unit's emitted target at its package-relative
+// path (`.go` -> `.gala`). One module (not emit.gala's per-package gala.mod) is what
+// lets `gala build ./...` see the whole package graph at once, so a unit that
+// references another package type-checks in context instead of failing "undefined" in
+// isolation — the reason the per-unit gate can't validate a real project.
+func materializeProject(dir string, model WorkspaceModel, done HashMap[string, string]) bool {
+    val root = path.Clean(dir)
+    val mod  = fileWrite(Path = path.Join(root, "gala.mod"), Content = evalGalaMod(model))
+    val units = model.Packages.FlatMap((p Package) => p.Units.FlatMap((u Unit) => unitWrites(u, done, root)))
+    val plan = ArrayOf[fileWrite](mod).AppendAll(units)
+    return writeAll(plan, root) match {
+        case Integrated(_)     => true
+        case IntegrateFailed(_) => false
+    }
+}
+
+// evalGalaMod is the scratch module manifest: the migrated twin's module path (the
+// root package's mapped path) pinned to the toolchain the rest of the engine emits.
+func evalGalaMod(model WorkspaceModel) string =
+    "module " + targetModulePath(rootModulePath(model)) + "\n\ngala 0.53.0\n"
+
+// ----------------------------------------------------------------------------
+// Done / excluded classification
+// ----------------------------------------------------------------------------
+
+// isDoneUnit reports whether a unit reached Done (its translation cleared the per-unit
+// gate and is part of the integrated project). The one Done classifier the project
+// gate and its feedback share.
+func isDoneUnit(u UnitRun) bool = u.Status match {
+    case Done(_)       => true
+    case Queued()      => false
+    case Translating() => false
+    case Verifying()   => false
+    case Blocked(_)    => false
+    case Skipped()     => false
+    case Failed(_)     => false
+}
+
+// excludedUnitIds names the units NOT in the build: anything that did not reach Done.
+// Surfaced in the evaluation so a green compile over a partial project is honest about
+// what it left out.
+func excludedUnitIds(state RunState) Array[UnitId] =
+    state.Units.Filter((u UnitRun) => !isDoneUnit(u)).Map((u UnitRun) => u.Unit)

@@ -1,0 +1,56 @@
+package engine
+
+// ToolchainProfile — the per-TARGET-LANGUAGE verification toolchain: how to COMPILE
+// and how to RUN TESTS for a migrated project in that language. This is the seam the
+// architecture invariant calls for ("adding a language = a backend behind the port"):
+// the verify gate's logic (materialize -> compile -> test -> map) is language-neutral,
+// and ONLY the commands change per target. GALA migrates to `gala build ./...` +
+// `gala test`; a future TypeScript target would be `tsc` + `npm test`, Rust
+// `cargo build` + `cargo test` — each a one-value addition here, no gate change.
+//
+// The COMMANDS differ by target, the RUNNER does not: ToolchainProfile supplies the
+// command name + args, and the injected ToolchainRunner (realverify.gala) executes
+// `<command> <args>` (or a test fake substitutes for it offline). Profile is pure
+// data — no IO — so the whole selection stays unit-testable.
+//
+// Transport-neutral (CLAUDE.md / architecture.md): pure value types; NO gala_tui, NO
+// app/ui, no IO.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ToolchainProfile names a target language's verification commands: the executable
+// (Command) plus the args that COMPILE the whole project (BuildArgs) and the args
+// that RUN ITS TESTS (TestArgs). The verify gate runs Command+BuildArgs first (a
+// compile error is reported as such) then Command+TestArgs.
+struct ToolchainProfile(
+    Language  string,
+    Command   string,
+    BuildArgs Array[string],
+    TestArgs  Array[string],
+)
+
+// GalaProfile is the GALA target's toolchain: `gala build ./...` to compile the whole
+// module, then `gala test` to run its replicated tests. The single supported target
+// today (Go -> GALA); the build/test gate is exercised against exactly these commands.
+func GalaProfile() ToolchainProfile =
+    ToolchainProfile(
+        Language  = "GALA",
+        Command   = "gala",
+        BuildArgs = ArrayOf[string]("build", "./..."),
+        TestArgs  = ArrayOf[string]("test"),
+    )
+
+// SelectProfile maps a target-language name to its ToolchainProfile — the pluggable
+// selector a future multi-target run keys off. Today only GALA resolves (case-
+// insensitively, accepting the UI's "GALA" label and the engine's "gala" command
+// token); any other target returns None so the caller surfaces "no toolchain for
+// target X" rather than silently skipping verification. New languages slot in here.
+func SelectProfile(targetLanguage string) Option[ToolchainProfile] {
+    if targetLanguage == "GALA" || targetLanguage == "gala" {
+        return Some[ToolchainProfile](GalaProfile())
+    }
+    return None[ToolchainProfile]()
+}

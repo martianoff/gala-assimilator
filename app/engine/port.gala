@@ -147,6 +147,15 @@ struct EnginePort(
     SaveCheckpoint func(RunState, string) SaveResult,
     LoadCheckpoint func(string) CheckpointLoad,
     Integrate      func(RunState, WorkspaceModel, string) IntegrateResult,
+    // Whole-project verification: EvaluateProject compiles AND tests the integrated
+    // migration (the real correctness gate — a per-unit pass is not enough when units
+    // reference each other), and ApplyProjectFeedback re-queues the implicated units
+    // (with the build/test diagnostics) when it isn't green. Pure data crosses the
+    // port — RunState / WorkspaceModel / ProjectEvaluation — never the ToolchainRunner
+    // or profile the live gate captures. The offline mock engine wires an always-green
+    // stub so the suite never spawns a toolchain.
+    EvaluateProject      func(RunState, WorkspaceModel) ProjectEvaluation,
+    ApplyProjectFeedback func(RunState, ProjectEvaluation) RunState,
     // Dependency forest (assimilate a project AND its dependencies — each dep is a
     // SEPARATE run). Pure data crosses the port: WorkspaceModel / DependencyForest /
     // DependencyId / DepAction / ForestLoad — never the RepoCloner or Dependency
@@ -188,8 +197,16 @@ func MockEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clari
     MockEngineWithVerifierCap(runner, verifier, DefaultMaxAttempts())
 
 // MockEngineWithVerifierCap is MockEngineWithVerifier with a configurable per-unit
-// attempt cap, so a test can exercise the fix loop's exhaustion at a small bound.
-func MockEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort = EnginePort(
+// attempt cap, so a test can exercise the fix loop's exhaustion at a small bound. It
+// wires the OFFLINE MockProjectGate (always-green, no toolchain) for the whole-project
+// gate; MockEngineWithGate injects a real project gate when a test drives it.
+func MockEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort =
+    MockEngineWithGate(runner, verifier, maxAttempts, MockProjectGate())
+
+// MockEngineWithGate is MockEngineWithVerifierCap plus an injected ProjectGate, so a
+// test can drive the whole-project compile+test gate (with a fake toolchain runner)
+// THROUGH the port. The offline default is MockProjectGate (above).
+func MockEngineWithGate(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int, gate ProjectGate) EnginePort = EnginePort(
     Scan          = (_ ScanRequest) => ScanGoWorkspaceStub(),
     Plan          = (m WorkspaceModel) => planFor(m),
     Run           = (p MigrationPlan) => runFor(p),
@@ -202,6 +219,8 @@ func MockEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Cl
     SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
     LoadCheckpoint = (path string) => loadCheckpoint(path),
     Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
+    EvaluateProject      = (s RunState, m WorkspaceModel) => gate.Evaluate(s, m),
+    ApplyProjectFeedback = (s RunState, e ProjectEvaluation) => gate.Feedback(s, e),
     // Forest: the offline MockEngine wires the EMPTY mock cloner (no fixtures), so the
     // port is callable — a pending dep with no fixture settles DepUnsupported/DepFailed
     // rather than crashing — while the rich multi-level forest behavior is proven
