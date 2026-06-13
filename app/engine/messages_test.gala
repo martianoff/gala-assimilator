@@ -115,6 +115,7 @@ func TestPriorFailureCarrier(t T) T {
     val base = sampleAssignment()
     val retry = base.Copy(PriorFailure = Some[PriorFailure](PriorFailure(
         Summary = "previous attempt changed evaluation order",
+        Output  = "// the rejected output",
         Flags   = ArrayOf[UnsupportedFlag](sampleFlag()),
     )))
     return retry.PriorFailure match {

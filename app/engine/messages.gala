@@ -64,9 +64,14 @@ struct UnsupportedFlag(
 )
 
 // PriorFailure is the feedback attached to a RETRY: why the previous attempt was
-// rejected plus the flags it raised, so the agent can do better next time.
+// rejected (Summary — the real compile/test diagnostics), the flags it raised, and the
+// EXACT TARGET TEXT the previous attempt emitted (Output). Output is what lets the
+// underlying engine FIX its own code against the errors instead of re-translating
+// blind: the retry prompt hands back the prior output plus the diagnostics and asks for
+// a corrected version. "" when no prior output is available (e.g. an aborted attempt).
 struct PriorFailure(
     Summary string,
+    Output  string,
     Flags   Array[UnsupportedFlag],
 )
 

@@ -269,14 +269,14 @@ func TestProjectGateNonGreenFeedsBackWithinBudget(t T) T {
     }
 }
 
-// At the attempt budget a non-green evaluation SETTLES (no infinite re-translation):
-// a second round reaches the cap and the run stops feeding back.
+// The project gate gives the engine a bounded number of fix rounds: feeding back
+// `DefaultMaxProjectAttempts` non-green evaluations spends exactly that budget (no
+// infinite re-translation), and the run then settles.
 func TestProjectGateNonGreenSettlesAtBudget(t T) T {
-    val seq = runToFixpoint()
-        .Append(MProjectEvaluated(Eval = redEval()))
-        .Append(MProjectEvaluated(Eval = redEval()))
-    val (m1, _) = StepAll(prog(), seq)
-    return Eq(t, m1.ProjectAttempts, engine.DefaultMaxProjectAttempts())
+    val rounds = engine.DefaultMaxProjectAttempts()
+    val evals = ArrayTabulate[Msg](rounds, (i int) => MProjectEvaluated(Eval = redEval()))
+    val (m1, _) = StepAll(prog(), runToFixpoint().AppendAll(evals))
+    return Eq(t, m1.ProjectAttempts, rounds)
 }
 
 // ----- navigation -----------------------------------------------------------

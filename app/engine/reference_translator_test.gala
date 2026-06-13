@@ -42,7 +42,7 @@ func TestReferenceFixLoopTranslatorBrokenThenFixed(t T) T {
     }
     val asn      = referenceAssignment()
     val retryAsn = asn.Copy(PriorFailure = Some[PriorFailure](
-        PriorFailure(Summary = "gala test failed: want 5", Flags = EmptyArray[UnsupportedFlag]())))
+        PriorFailure(Summary = "gala test failed: want 5", Output = "", Flags = EmptyArray[UnsupportedFlag]())))
     val retryTx  = runner.Submit(retryAsn)
     return outcomeResult(retryTx.Final) match {
         case Some(r) => Eq(t1, r.TargetText, expectedGoldenTarget)

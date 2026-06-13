@@ -198,6 +198,7 @@ func encTargetConventions(w *json.JsonEncoderImpl, t TargetConventions) {
 func encPriorFailure(w *json.JsonEncoderImpl, pf PriorFailure) {
     w.WriteStartObject()
     w.WriteKey("summary"); w.WriteString(pf.Summary)
+    w.WriteKey("output");  w.WriteString(pf.Output)
     w.WriteKey("flags");   encArray[UnsupportedFlag](w, pf.Flags, encFlag)
     w.WriteEndObject()
 }
@@ -384,9 +385,10 @@ func decTargetConventions(d *json.JsonDecoderImpl) TargetConventions {
 func decPriorFailure(d *json.JsonDecoderImpl) PriorFailure {
     d.StartObject()
     d.ReadKey(); val summary = d.ReadString()
+    d.ReadKey(); val output  = d.ReadString()
     d.ReadKey(); val flags   = decArray[UnsupportedFlag](d, decFlag)
     d.EndObject()
-    return PriorFailure(Summary = summary, Flags = flags)
+    return PriorFailure(Summary = summary, Output = output, Flags = flags)
 }
 
 func decFlag(d *json.JsonDecoderImpl) UnsupportedFlag {

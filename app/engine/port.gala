@@ -376,7 +376,7 @@ func settleVerified(verifier Verifier, maxAttempts int, u UnitRun, attempts int,
     ))
     return verdict match {
         case VerifyPass()             => terminalStep(u, attempts, Done(Output = withCoverageFlag(r, u.SourceTests)))
-        case VerifyFail(failing, why) => retryOrFail(u, attempts, maxAttempts, verifyFailReason(failing, why))
+        case VerifyFail(failing, why) => retryOrFail(u, attempts, maxAttempts, verifyFailReason(failing, why), r.TargetText)
         case VerifyUnsupported(why)   => terminalStep(u, attempts, Failed(Reason = "needs review: untranslatable source test: " + why))
     }
 }
@@ -389,13 +389,13 @@ func settleVerified(verifier Verifier, maxAttempts int, u UnitRun, attempts int,
 // Failed, carrying the last diagnostics — a visible failure, never a silent
 // give-up. No-progress (the new diagnostics identical to the prior attempt's) is
 // surfaced in that exhaustion reason.
-func retryOrFail(u UnitRun, attempts int, maxAttempts int, reason string) StepResult {
+func retryOrFail(u UnitRun, attempts int, maxAttempts int, reason string, priorOutput string) StepResult {
     if attempts >= maxAttempts {
         return terminalStep(u, attempts, Failed(Reason = exhaustedReason(u, reason)))
     }
     val asn = u.Assignment
     val retried = asn.Copy(PriorFailure = Some[PriorFailure](
-        PriorFailure(Summary = reason, Flags = EmptyArray[UnsupportedFlag]()),
+        PriorFailure(Summary = reason, Output = priorOutput, Flags = EmptyArray[UnsupportedFlag]()),
     ))
     return StepResult(
         Unit   = u.Copy(Assignment = retried, Status = Translating(), Attempts = attempts),
@@ -478,7 +478,7 @@ func retryAssignment(u UnitRun) TaskAssignment {
     val asn = u.Assignment
     return u.Status match {
         case Failed(reason) => asn.Copy(PriorFailure = Some[PriorFailure](
-            PriorFailure(Summary = reason, Flags = EmptyArray[UnsupportedFlag]()),
+            PriorFailure(Summary = reason, Output = "", Flags = EmptyArray[UnsupportedFlag]()),
         ))
         case Queued()      => asn
         case Translating() => asn

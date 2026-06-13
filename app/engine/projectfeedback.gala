@@ -66,9 +66,22 @@ func requeueUnits(state RunState, ids Array[string], reason string) RunState {
 func requeueOne(u UnitRun, reason string) UnitRun {
     val asn = u.Assignment
     val retried = asn.Copy(PriorFailure = Some[PriorFailure](
-        PriorFailure(Summary = reason, Flags = EmptyArray[UnsupportedFlag]()),
+        PriorFailure(Summary = reason, Output = doneOutputText(u.Status), Flags = EmptyArray[UnsupportedFlag]()),
     ))
     return u.Copy(Assignment = retried, Status = Queued(), Attempts = 0)
+}
+
+// doneOutputText is the target text a Done unit emitted (the code the project gate
+// rejected), threaded back so the re-translation FIXES it rather than starting over;
+// "" for any non-Done unit (nothing to hand back).
+func doneOutputText(s UnitStatus) string = s match {
+    case Done(r)       => r.TargetText
+    case Queued()      => ""
+    case Translating() => ""
+    case Verifying()   => ""
+    case Blocked(_)    => ""
+    case Skipped()     => ""
+    case Failed(_)     => ""
 }
 
 func requeueEvents(u UnitRun, reason string) Array[EngineEvent] =
@@ -157,11 +170,12 @@ struct ProjectRunOutcome(
 
 // DefaultMaxProjectAttempts caps the project-gate loop: the whole project is
 // re-translated against fresh build/test diagnostics at most this many times before
-// the run settles with whatever evaluation it has. Two — one initial pass plus one
-// diagnostics-driven retry — is the conventional default: enough for a feedback round
-// to fix the common case, bounded so a project that won't converge surfaces quickly
-// rather than re-translating forever (each round can re-run every unit).
-func DefaultMaxProjectAttempts() int = 2
+// the run settles with whatever evaluation it has. FOUR — the initial pass plus three
+// diagnostics-driven fix rounds — gives the underlying engine a real chance to RESOLVE
+// the failures iteratively (each round it sees its own prior output + the exact errors,
+// via PriorFailure.Output), while staying bounded so a project that won't converge
+// surfaces rather than re-translating forever.
+func DefaultMaxProjectAttempts() int = 4
 
 // RunWithProjectGate runs the WHOLE migration under the project gate: drive the per-
 // unit loop to its fixpoint, evaluate the integrated project (compile + test), and —
