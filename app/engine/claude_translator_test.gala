@@ -12,6 +12,26 @@ import (
     acp "github.com/martianoff/gala-acp"
 )
 
+// extractTargetSource salvages clean GALA when the model prepends prose — the exact
+// "missing 'package'" defect seen on real output (a "Here is the translation:" preamble
+// before `package`). Everything before the first `package` line is dropped.
+func TestExtractStripsLeadingProse(t T) T =
+    Eq(t, extractTargetSource("Here is the translation:\n\npackage main\n\nfunc Add(a int) int = a\n"),
+          "package main\n\nfunc Add(a int) int = a\n")
+
+// A markdown-fenced block yields bare source (fence lines removed).
+func TestExtractStripsFences(t T) T =
+    Eq(t, extractTargetSource("```gala\npackage core\n```"), "package core")
+
+// Already-clean source (starts at `package`) passes through unchanged.
+func TestExtractKeepsCleanSource(t T) T =
+    Eq(t, extractTargetSource("package x\n\nfunc F() int = 1\n"), "package x\n\nfunc F() int = 1\n")
+
+// No `package` line: return the trimmed text so the gate surfaces the real problem,
+// rather than this step silently emitting nothing.
+func TestExtractNoPackageReturnsTrimmed(t T) T =
+    Eq(t, extractTargetSource("  some non-code text  "), "some non-code text")
+
 // The default / offline backend drives the stub workspace to completion through
 // the acp-backed run pipeline — selection + scan + plan + run + gate end to end.
 func TestSelectBackendMockRunsToDone(t T) T {

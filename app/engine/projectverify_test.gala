@@ -119,6 +119,29 @@ func TestFeedbackOnGreenIsNoOp(t T) T {
     return Eq(t, fed.Log.Length(), finished.Log.Length())
 }
 
+// Feedback threads the rejected unit's OWN prior output back onto the retry, so the
+// engine fixes that code rather than re-translating blind.
+func TestFeedbackThreadsPriorOutputToEngine(t T) T {
+    val finished = finishedRun()
+    val ev = EvaluateProject(fakeRunner(false, "compile boom", true, ""), GalaProfile(), finished, stubModel())
+    val fed = applyProjectFeedback(finished, ev)
+    return fed.Units.Get(0).Assignment.PriorFailure match {
+        case Some(pf) => IsTrue(t, strings.Contains(pf.Output, "mock translation"))
+        case None()   => Fail(t, "the re-queued unit must carry its prior output so the engine can fix it")
+    }
+}
+
+// The retry prompt hands the engine BOTH the build/test errors AND its own previous
+// output, with an explicit instruction to fix it.
+func TestRetryPromptHandsBackPriorOutput(t T) T {
+    val retry = sampleAssignment().Copy(PriorFailure = Some[PriorFailure](
+        PriorFailure(Summary = "bundled.gala:10 boom", Output = "package broken\n// prior", Flags = EmptyArray[UnsupportedFlag]())))
+    val p = buildPrompt(retry)
+    val t1 = IsTrue(t,  strings.Contains(p, "bundled.gala:10 boom"))
+    val t2 = IsTrue(t1, strings.Contains(p, "package broken"))
+    return IsTrue(t2, strings.Contains(p, "FIX the errors"))
+}
+
 // ----------------------------------------------------------------------------
 // Driver: green on the first round -> exactly one attempt, no feedback.
 // ----------------------------------------------------------------------------

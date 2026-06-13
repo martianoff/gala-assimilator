@@ -202,17 +202,53 @@ func classifyChunk(task TaskId, text string, line string) pumpState {
 func questionText(chunk ClaudeChunk) string =
     if (chunk.AskQuestionText == "") "claude requested a clarification" else chunk.AskQuestionText
 
-// finalizeOutcome turns the accumulated text into a terminus: real text becomes a
-// Result; empty output aborts (a translation we can't justify is surfaced, never
-// emitted as an empty success).
-func finalizeOutcome(task TaskId, text string) acp.RunOutcome[Result, Clarification] =
-    if (strings.TrimSpace(text) == "") abortOutcome("claude produced no translation output")
-    else resultOutcome(Result(
+// finalizeOutcome turns the accumulated text into a terminus: the agent's raw output is
+// first SALVAGED into clean GALA (extractTargetSource) — the model sometimes prepends a
+// prose preamble or wraps the code in a markdown fence despite the prompt, which would
+// otherwise make the emitted file fail to parse — then real text becomes a Result;
+// empty output aborts (a translation we can't justify is surfaced, never an empty pass).
+func finalizeOutcome(task TaskId, text string) acp.RunOutcome[Result, Clarification] {
+    val code = extractTargetSource(text)
+    if (strings.TrimSpace(code) == "") { return abortOutcome("claude produced no translation output") }
+    return resultOutcome(Result(
         Task       = task,
-        TargetText = text,
+        TargetText = code,
         Rationale  = "translated by claude",
         Flags      = EmptyArray[UnsupportedFlag](),
     ))
+}
+
+// extractTargetSource salvages compilable GALA from the agent's raw response. GALA
+// source begins at the first `package ` line, so any leading prose ("Here is the
+// translation:", "Based on the codebase…") and any markdown fence lines are stripped —
+// the exact defects that produced "missing 'package'" build errors on real output. If
+// there is no `package` line, the trimmed (de-fenced) text is returned so the gate can
+// surface the real problem rather than this step hiding it.
+func extractTargetSource(text string) string {
+    val lines = strings.Split(stripFences(text), "\n")
+    val idx = firstPackageLine(lines)
+    if (idx < 0) { return strings.TrimSpace(stripFences(text)) }
+    return lines.Drop(idx).MkString("\n")
+}
+
+// stripFences drops any markdown code-fence lines (``` / ```gala), keeping their
+// content, so a fenced block still yields bare source.
+func stripFences(text string) string =
+    strings.Split(text, "\n")
+        .Filter((l string) => !strings.HasPrefix(strings.TrimSpace(l), "```"))
+        .MkString("\n")
+
+// firstPackageLine is the index of the first line that starts the GALA source (a
+// `package ` declaration), or -1 if none is present.
+func firstPackageLine(lines Array[string]) int {
+    var i = 0
+    var found = -1
+    for i < lines.Length() && found < 0 {
+        if (strings.HasPrefix(strings.TrimSpace(lines.Get(i)), "package ")) { found = i }
+        i = i + 1
+    }
+    return found
+}
 
 // pendingOutcome is the placeholder an in-progress pump carries; the loop only
 // returns an outcome after Done is set, so this value is always overwritten.
@@ -239,8 +275,11 @@ func buildPrompt(a TaskAssignment) string {
     val depsBlock = if (deps == "") "(none)" else deps
     val notes = a.Target.Notes.Map((n string) => "- " + n).MkString("\n")
     val notesBlock = if (notes == "") "(apply idiomatic " + lang + " conventions and best practices)" else notes
+    // On a retry, hand the engine its OWN previous output plus the exact compiler/test
+    // errors and ask it to FIX that code — so it resolves the failure rather than
+    // re-translating blind (and likely reproducing the same mistakes).
     val priorBlock = a.PriorFailure match {
-        case Some(pf) => "\n=== PREVIOUS ATTEMPT REJECTED (fix exactly these and re-emit) ===\n" + pf.Summary + "\n"
+        case Some(pf) => priorFailureBlock(pf, lang)
         case None()   => ""
     }
     return "You are migrating one source unit to " + lang + ".\n" +
@@ -249,11 +288,24 @@ func buildPrompt(a TaskAssignment) string {
         lang + " (immutable values, expressions over statements, no hidden mutation), not imperative code wearing " +
         lang + " syntax. Preserve the source's observable SEMANTICS exactly; where a construct has no faithful " +
         lang + " form, surface it as a flagged TODO rather than guessing.\n" +
-        "Output ONLY the translated " + lang + " source code — no prose, no explanation, no markdown fences.\n\n" +
+        "Output ONLY the translated " + lang + " source code — no prose, no explanation, no markdown fences. " +
+        "Your response MUST begin with the `package` declaration; do NOT write any text before it.\n\n" +
         "Unit: " + a.Unit.Value + "\n" +
         "Target language: " + lang + "\n" +
         "\n=== TARGET CONVENTIONS / BEST PRACTICES ===\n" + notesBlock + "\n" +
         priorBlock +
         "\n=== SOURCE ===\n" + a.Source.SourceText + "\n" +
         "\n=== IMPORTED DEPENDENCIES (context only) ===\n" + depsBlock + "\n"
+}
+
+// priorFailureBlock renders the retry feedback: the build/test diagnostics, and — when
+// the previous attempt produced output — that output, with an explicit instruction to
+// FIX it (the engine resolving its own failure) rather than start over. Without prior
+// output (an aborted attempt) it is just the diagnostics.
+func priorFailureBlock(pf PriorFailure, lang string) string {
+    val diag = "\n=== YOUR PREVIOUS ATTEMPT WAS REJECTED — these are the build/test errors it produced ===\n" + pf.Summary + "\n"
+    if (pf.Output == "") { return diag }
+    return diag +
+        "\n=== YOUR PREVIOUS " + lang + " OUTPUT (FIX the errors above in THIS code; keep what already works, re-emit the full corrected file) ===\n" +
+        pf.Output + "\n"
 }
