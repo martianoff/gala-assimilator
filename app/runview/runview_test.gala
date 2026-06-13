@@ -11,6 +11,34 @@ import (
 // strContains is a small assertion helper for substring checks on projected lines.
 func strContains(s string, sub string) bool = str.S(s).Contains(sub)
 
+// ClassifyEvaluation projects a compile failure into PASS/FAIL labels, a not-green
+// verdict, and a diagnostics excerpt the report can show.
+func TestClassifyEvaluationCompileFailure(t T) T {
+    val e = ProjectEvaluation(
+        Language = "GALA", Materialized = true,
+        Compiled = false, CompileOutput = "bundled.gala:10:22 missing '{'",
+        TestsRun = false, TestsPassed = false, TestOutput = "",
+        UnitsEmitted = 3, UnitsExcluded = ArrayOf[UnitId](UnitId(Value = "app/x")), Note = "")
+    val vm = ClassifyEvaluation(e)
+    val t1 = IsFalse(t,  vm.Green)
+    val t2 = Eq(t1, vm.CompileLabel, "FAIL")
+    val t3 = Eq(t2, vm.TestsLabel, "not run (build failed)")
+    val t4 = IsTrue(t3, strContains(vm.Diagnostics, "missing '{'"))
+    return Eq(t4, vm.Excluded, 1)
+}
+
+// A green evaluation projects PASS/PASS with no diagnostics.
+func TestClassifyEvaluationGreen(t T) T {
+    val e = ProjectEvaluation(
+        Language = "GALA", Materialized = true,
+        Compiled = true, CompileOutput = "", TestsRun = true, TestsPassed = true, TestOutput = "",
+        UnitsEmitted = 4, UnitsExcluded = EmptyArray[UnitId](), Note = "")
+    val vm = ClassifyEvaluation(e)
+    val t1 = IsTrue(t,  vm.Green)
+    val t2 = Eq(t1, vm.CompileLabel, "PASS")
+    return Eq(t2, vm.TestsLabel, "PASS")
+}
+
 // ============================================================================
 // Direct projection tests for app/runview. These construct engine RunStates by
 // hand (public value types only) and assert the UI-facing projections, instead

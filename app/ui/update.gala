@@ -96,6 +96,7 @@ sealed type Msg {
     case MResumeLoaded(Load engine.CheckpointLoad)
     case MCheckpointSaved(Ok bool, Reason string)
     case MIntegrated(Result engine.IntegrateResult)   // migrated output written (or failed)
+    case MProjectEvaluated(Eval engine.ProjectEvaluation) // whole-project compile+test verdict (off-loop)
     case MSavePreflight(Reason string)                // pre-flight writability probe result
 
     // engine + runtime
@@ -167,6 +168,7 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MResumeLoaded(load) => resumeLoaded(m, load)
     case MCheckpointSaved(ok, reason) => (m.Copy(LastSaveOk = ok, SaveReason = reason), NoCmd[Msg]())
     case MIntegrated(res)     => (m.Copy(Integrated = Some(runview.ClassifyIntegrate(res))), NoCmd[Msg]())
+    case MProjectEvaluated(eval) => projectEvaluated(m, eval)
     case MSavePreflight(reason) => savePreflight(m, reason)
 
     case MScanPlanned(ws, plan) => scanPlanned(m, ws, plan)
@@ -654,6 +656,10 @@ func runStarted(m Model, st engine.RunState) Tuple[Model, Cmd[Msg]] {
         TreeCursor = 0,
         LogScroll  = 0,
         Screens    = m.Screens.Push(RouteS3()),
+        // a fresh run earns a fresh project-gate budget + clears any prior verdict.
+        ProjectEval       = None[engine.ProjectEvaluation](),
+        ProjectAttempts   = 0,
+        ProjectEvaluating = false,
     )
     return (m2, withAnim(m, m2, advanceCmd(m2, st)))
 }
@@ -687,9 +693,49 @@ func applyAdvance(m Model, next engine.RunState) Tuple[Model, Cmd[Msg]] {
     if (runview.AnyActionable(next)) {
         return (m2, withSave(m2, next, withAnim(m, m2, advanceCmd(m2, next))))
     }
-    // Run just reached a fixpoint — persist the checkpoint AND write the migrated
-    // project (only when we have a real source root + workspace to write from).
-    return (m2, withSave(m2, next, withIntegrate(m2, next)))
+    // The per-unit loop reached a fixpoint — but "every unit Done" is NOT yet a
+    // success. Run the WHOLE-PROJECT gate (compile + test the integrated output) and
+    // only then integrate; a failure feeds back into the loop.
+    return reachedFixpoint(m2, next)
+}
+
+// reachedFixpoint decides what happens once no unit is actionable. With a real
+// workspace and persistence on (the live app), it kicks the off-loop project gate
+// (EvaluateProject) BEFORE writing output. Without a workspace, or with persistence
+// off (the test suite), it integrates directly exactly as before this gate existed —
+// so the offline/test flow is unchanged.
+func reachedFixpoint(m Model, next engine.RunState) Tuple[Model, Cmd[Msg]] = m.Workspace match {
+    case Some(ws) =>
+        if (m.Persist && !m.ProjectEvaluating) projectGateStep(m, next, ws)
+        else (m, withSave(m, next, withIntegrate(m, next)))
+    case None() => (m, withSave(m, next, withIntegrate(m, next)))
+}
+
+// projectGateStep launches the whole-project compile+test off the loop; the verdict
+// lands as MProjectEvaluated. ProjectEvaluating keeps the spinner turning meanwhile.
+func projectGateStep(m Model, next engine.RunState, ws engine.WorkspaceModel) Tuple[Model, Cmd[Msg]] {
+    val m2 = m.Copy(ProjectEvaluating = true)
+    return (m2, withSave(m2, next, projectEvalCmd(m2.Port, next, ws)))
+}
+
+// projectEvaluated settles one project-gate round. Green (or the attempt budget spent)
+// → write the output and surface the evaluation in the report. Not green with budget
+// left → feed the compile/test diagnostics back (re-queue the implicated units) and
+// resume translating, so the loop verifies BOTH compilation and tests before it ends.
+func projectEvaluated(m Model, eval engine.ProjectEvaluation) Tuple[Model, Cmd[Msg]] = m.Run match {
+    case Some(run) => settleProjectGate(m, run, eval)
+    case None()    => (m.Copy(ProjectEvaluating = false, ProjectEval = Some(eval)), NoCmd[Msg]())
+}
+
+func settleProjectGate(m Model, run engine.RunState, eval engine.ProjectEvaluation) Tuple[Model, Cmd[Msg]] {
+    val attempts = m.ProjectAttempts + 1
+    val m2 = m.Copy(ProjectEval = Some(eval), ProjectEvaluating = false, ProjectAttempts = attempts)
+    if (engine.ProjectGreen(eval) || attempts >= engine.DefaultMaxProjectAttempts()) {
+        return (m2, withSave(m2, run, withIntegrate(m2, run)))
+    }
+    val fed = m.Port.ApplyProjectFeedback(run, eval)
+    val m3 = m2.Copy(Run = Some(fed))
+    return (m3, withSave(m3, fed, withAnim(m, m3, advanceCmd(m3, fed))))
 }
 
 // withIntegrate fires the output-write Cmd when a completed run has a scanned
@@ -723,10 +769,11 @@ func browseIsLoading(m Model) bool = m.Browse match {
 // real backend blocks for seconds with every unit still queued (AnyActionable would
 // be false then), so gating on completion is what keeps the spinner alive during
 // that first slow translation instead of sitting frozen.
-func runTicking(m Model) bool = m.Run match {
-    case Some(st) => !runview.ProjectRun(st).Complete
-    case None()   => false
-}
+func runTicking(m Model) bool =
+    m.ProjectEvaluating || (m.Run match {
+        case Some(st) => !runview.ProjectRun(st).Complete
+        case None()   => false
+    })
 
 // animCmd schedules the next animation frame (~12 fps) while something loads.
 func animCmd() Cmd[Msg] = AfterDelay[Msg](Milliseconds(int64(80)), () => MTick())

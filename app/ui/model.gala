@@ -163,6 +163,10 @@ struct Model(
     // output integration (write the migrated project once the run completes)
     Integrated   Option[runview.IntegrateSummary], // result of writing the migrated output
     Preflight    string,                            // blocking pre-flight save error ("" when clear)
+    // whole-project verification (compile + test the integrated output before writing it)
+    ProjectEval       Option[engine.ProjectEvaluation], // last project-gate evaluation (drives the S6 detail)
+    ProjectAttempts   int,                              // project-gate rounds spent so far (bounded)
+    ProjectEvaluating bool,                             // a project-gate compile+test is in flight (keeps the run spinner on)
     // recent-projects picker (S0): a selectable list of prior sessions to resume
     Recent       Array[runview.RecentRowVM],
     RecentCursor int,
@@ -222,6 +226,9 @@ func NewModel(makePort func(string) engine.EnginePort, cols int, rows int) Model
         SaveReason  = "",
         Integrated  = None[runview.IntegrateSummary](),
         Preflight   = "",
+        ProjectEval       = None[engine.ProjectEvaluation](),
+        ProjectAttempts   = 0,
+        ProjectEvaluating = false,
         Recent       = EmptyArray[runview.RecentRowVM](),
         RecentCursor = 0,
     )

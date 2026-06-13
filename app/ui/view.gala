@@ -1051,6 +1051,7 @@ func s6Board(m Model, rv runview.RunVM) Widget {
     ).AppendAll(countsRow(rv, m.Cols))
      .AppendAll(s6IssueRows(c))
      .AppendAll(s6FlagRows(rv))
+     .AppendAll(s6EvalRows(m))
      .AppendAll(s6OutputRows(m))
      .AppendAll(ArrayOf[LayoutChild](
         Fixed(1, Text("")),
@@ -1106,6 +1107,45 @@ func s6OutputRows(m Model) Array[LayoutChild] = m.Integrated match {
                 DefaultStyle().WithBold().WithFg(BrightRed()))))
     }
     case None() => EmptyArray[LayoutChild]()
+}
+
+// s6EvalRows renders the whole-project verification verdict — HOW the migration was
+// evaluated: the compile + unit-test results, unit coverage, the gate-round count, and
+// (on a failure) the real diagnostics excerpt. It is the answer to "did it actually
+// compile and pass its tests", shown in the report so a non-green migration can never
+// read as a clean success. Absent until the project gate has run (offline/test flow).
+func s6EvalRows(m Model) Array[LayoutChild] = m.ProjectEval match {
+    case Some(e) => evalRows(runview.ClassifyEvaluation(e), m.ProjectAttempts)
+    case None()  => EmptyArray[LayoutChild]()
+}
+
+func evalRows(vm runview.ProjectEvalVM, attempts int) Array[LayoutChild] {
+    val head = ArrayOf[LayoutChild](
+        Fixed(1, Text("")),
+        Fixed(1, TextStyled("  Verification — how the project was evaluated", DefaultStyle().WithBold())),
+        Fixed(1, kvRow("  Compilation", vm.CompileLabel)),
+        Fixed(1, kvRow("  Unit tests", vm.TestsLabel)),
+        Fixed(1, kvRow("  Units compiled", s"${vm.UnitsEmitted} (excluded ${vm.Excluded})")),
+        Fixed(1, kvRow("  Gate rounds", s"${attempts}")),
+        Fixed(1, evalVerdictLine(vm)),
+    )
+    return head.AppendAll(evalDiagRows(vm))
+}
+
+func evalVerdictLine(vm runview.ProjectEvalVM) Widget {
+    if (vm.Green) {
+        return TextStyled("  ✓ " + vm.Verdict, DefaultStyle().WithBold().WithFg(BrightGreen()))
+    }
+    return TextStyled("  ✗ " + vm.Verdict, DefaultStyle().WithBold().WithFg(BrightRed()))
+}
+
+// evalDiagRows shows the trimmed diagnostics excerpt under a non-green verdict, one
+// dimmed line apiece (the excerpt is already capped upstream), so the operator sees WHY
+// without the report exploding. A green verdict shows nothing.
+func evalDiagRows(vm runview.ProjectEvalVM) Array[LayoutChild] {
+    if (vm.Green || vm.Diagnostics == "") { return EmptyArray[LayoutChild]() }
+    return str.Split(vm.Diagnostics, "\n").Map((l string) =>
+        Fixed(1, TextStyled("    " + l, DefaultStyle().WithDim())))
 }
 
 // s6Actions chooses the context-appropriate primary action. With problems, route

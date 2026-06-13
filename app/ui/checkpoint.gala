@@ -86,6 +86,16 @@ func integrateCmd(port engine.EnginePort, state engine.RunState, model engine.Wo
         (res) => MIntegrated(Result = res),
     )
 
+// projectEvalCmd runs the WHOLE-PROJECT gate (compile + test the integrated migration)
+// off the Update loop — it spawns the real target toolchain, which can take seconds,
+// so it must never run inline. The verdict surfaces as MProjectEvaluated, which decides
+// whether to integrate or to feed the diagnostics back into the loop.
+func projectEvalCmd(port engine.EnginePort, state engine.RunState, model engine.WorkspaceModel) Cmd[Msg] =
+    Async[engine.ProjectEvaluation, Msg](
+        () => port.EvaluateProject(state, model),
+        (eval) => MProjectEvaluated(Eval = eval),
+    )
+
 // doSaveProbe verifies the checkpoint location is WRITABLE before a run starts:
 // it creates <root>/.assimilator and writes-then-removes a tiny probe file. It
 // returns an empty string on success, or a plain-language reason on failure — so a

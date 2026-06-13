@@ -104,3 +104,66 @@ func completeWord(state RunState) string =
 // (the emitted GALA, the transition log) reads as an indented sub-section.
 func indentLines(block string) string =
     strings.Split(block, "\n").Map((l string) => "    " + l).MkString("\n")
+
+// ----------------------------------------------------------------------------
+// Project-evaluation report — HOW THE PROJECT WAS EVALUATED
+// ----------------------------------------------------------------------------
+
+// EvaluationReport renders a ProjectEvaluation (projectverify.gala) as the report's
+// "how this migration was verified" section: the target language, how many gate
+// rounds ran, how many units went into the build (and which were excluded), the
+// COMPILATION verdict with its real diagnostics, the UNIT-TEST verdict with its
+// output, and the overall GREEN/NOT-GREEN call. This is the detail the product
+// requires — a run is never presented as a success on the strength of "units reached
+// Done"; it must compile and its tests must pass, and here is the evidence either way.
+func EvaluationReport(e ProjectEvaluation, attempts int) string {
+    val head    = "=== project evaluation (how the project was verified) ==="
+    val lang    = "target language: " + e.Language
+    val rounds  = s"gate rounds:     ${attempts}"
+    val units   = s"units compiled:  ${e.UnitsEmitted}    excluded (not Done): ${e.UnitsExcluded.Length()}"
+    val excl    = evalExcludedBlock(e)
+    val compile = "compilation:     " + compileLabel(e) + evalDiagBlock(e.CompileOutput, !e.Compiled)
+    val tests   = "unit tests:      " + testsLabel(e) + evalDiagBlock(e.TestOutput, e.TestsRun && !e.TestsPassed)
+    val note    = if (e.Note == "") "" else "\nnote:            " + e.Note
+    val verdict = "verdict:         " + evalVerdict(e)
+    return head + "\n" + lang + "\n" + rounds + "\n" + units + excl + "\n" + compile + "\n" + tests + note + "\n" + verdict
+}
+
+// compileLabel is the compilation verdict word: not-run when the project couldn't be
+// materialized, else PASS/FAIL.
+func compileLabel(e ProjectEvaluation) string {
+    if !e.Materialized { return "NOT RUN (could not materialize project)" }
+    if e.Compiled      { return "PASS" }
+    return "FAIL"
+}
+
+// testsLabel is the unit-test verdict word: not-run is split so a skip BECAUSE the
+// build failed reads differently from a clean "no tests ran".
+func testsLabel(e ProjectEvaluation) string {
+    if !e.TestsRun {
+        if e.Compiled { return "NOT RUN" }
+        return "NOT RUN (compilation failed)"
+    }
+    if e.TestsPassed { return "PASS" }
+    return "FAIL"
+}
+
+// evalVerdict is the one-line bottom call.
+func evalVerdict(e ProjectEvaluation) string {
+    if ProjectGreen(e) { return "GREEN — the migrated project compiles and its tests pass" }
+    return "NOT GREEN — the migration is not yet correct (see the diagnostics above)"
+}
+
+// evalExcludedBlock names the units left OUT of the build (anything not Done) so a
+// green compile over a partial project is honest about coverage.
+func evalExcludedBlock(e ProjectEvaluation) string {
+    if e.UnitsExcluded.IsEmpty() { return "" }
+    return "\n  excluded units: " + e.UnitsExcluded.Map((id UnitId) => id.Value).MkString(", ")
+}
+
+// evalDiagBlock indents a stage's diagnostics under its verdict line — but only when
+// the stage actually failed and produced output, so a green report stays terse.
+func evalDiagBlock(output string, show bool) string {
+    if !show || output == "" { return "" }
+    return "\n" + indentLines(output)
+}

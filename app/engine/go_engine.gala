@@ -38,8 +38,17 @@ func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarifi
     GoEngineWithVerifierCap(runner, verifier, DefaultMaxAttempts())
 
 // GoEngineWithVerifierCap is GoEngineWithVerifier with a configurable per-unit
-// attempt cap on the translate -> verify -> fix loop.
-func GoEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort = EnginePort(
+// attempt cap on the translate -> verify -> fix loop. It wires the OFFLINE
+// MockProjectGate for the whole-project gate (its default mock translator emits no
+// compilable GALA); GoEngineWithGate injects the REAL toolchain gate for the live
+// backend (ClaudeEngine).
+func GoEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort =
+    GoEngineWithGate(runner, verifier, maxAttempts, MockProjectGate())
+
+// GoEngineWithGate is GoEngineWithVerifierCap plus an injected ProjectGate — the seam
+// where the live backend wires the real `gala build`/`gala test` whole-project gate
+// (ToolchainProjectGate) while the offline frontends keep the always-green stub.
+func GoEngineWithGate(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int, gate ProjectGate) EnginePort = EnginePort(
     Scan          = (req ScanRequest) => ScanGoWorkspace(req.Root),
     Plan          = (m WorkspaceModel) => goPlanFor(m),
     Run           = (p MigrationPlan) => runFor(p),
@@ -52,6 +61,8 @@ func GoEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clar
     SaveCheckpoint = (s RunState, path string) => saveCheckpoint(s, path),
     LoadCheckpoint = (path string) => loadCheckpoint(path),
     Integrate      = (s RunState, m WorkspaceModel, outRoot string) => integrateProject(s, m, outRoot),
+    EvaluateProject      = (s RunState, m WorkspaceModel) => gate.Evaluate(s, m),
+    ApplyProjectFeedback = (s RunState, e ProjectEvaluation) => gate.Feedback(s, e),
     // Forest: GoEngine wires the REAL git cloner (RealRepoCloner over GitCliRunner) so a
     // real migration clones each dependency into its own folder. The clone is the
     // toolchain edge — exercised on the live round, never by `gala test` (the suite
@@ -76,16 +87,37 @@ func goPlanFor(model WorkspaceModel) MigrationPlan =
 // AddedTest excluded) as each unit's verify-gate input.
 func goPlanItemsForPackage(p Package) Array[PlanItem] {
     val tests = sourceTestRefs(p)
+    val target = GalaTargetConventions()
     return p.Units.Map((u Unit) => PlanItem(
         Unit        = u.Id,
         Source      = SourceContext(
             SourceText   = u.Source,
             Dependencies = unitDependencies(u),
         ),
-        Target      = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+        Target      = target,
         SourceTests = tests,
     ))
 }
+
+// GalaTargetConventions is the TARGET-language brief the live translator receives: the
+// GALA idioms that turn a transliteration into an idiomatic migration. The source is
+// Go (imperative, mutable); faithful GALA is functional and immutable — so these notes
+// steer the agent to TRANSFORM the paradigm, not transcribe it, while the project gate
+// holds the line on semantics. (The deterministic mock planner keeps the old stub
+// conventions; only the live Go frontend feeds these to a real agent.)
+func GalaTargetConventions() TargetConventions =
+    TargetConventions(
+        Language = "GALA",
+        Notes = ArrayOf[string](
+            "Produce IDIOMATIC GALA — translate the source's INTENT into GALA's paradigm, not its syntax line-for-line.",
+            "GALA is functional, Elm-architecture, immutable-by-default: prefer pure functions and values over statements and in-place mutation.",
+            "Turn imperative constructs functional: loops -> map/filter/fold over immutable collections; reassignment -> new bound vals; mutation -> Copy(...) producing a new value.",
+            "Model alternatives as sealed types with EXHAUSTIVE match instead of enums+switch or nil checks; make illegal states unrepresentable.",
+            "Keep side effects as values (Cmd / effect descriptions) at the edges; never inline IO inside pure logic.",
+            "Bind a receiver to a val before .Copy(...) (Copy re-invokes the receiver per unmodified field); don't wrap a discarded call in `val _ =`.",
+            "Preserve observable SEMANTICS exactly; if a construct has no faithful GALA form, emit a flagged TODO rather than guessing.",
+        ),
+    )
 
 // unitDependencies is the best-effort dependency context for a unit: one
 // DependencySnippet per imported path recovered from its source. Text is left

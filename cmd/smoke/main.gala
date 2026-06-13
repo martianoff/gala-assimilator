@@ -43,10 +43,21 @@ func main() {
     val root    = materializeFixture()
     val ws      = port.Scan(engine.ScanRequest(Root = root))
     val plan    = port.Plan(ws)
-    val final   = engine.RunToCompletion(port, port.Run(plan))
-    fmt.Println(engine.SmokeReport(backend, final))
+    // Drive the WHOLE migration under the project gate: translate to a fixpoint, then
+    // really `gala build`/`gala test` the integrated output and feed any failure back
+    // into the loop (bounded). The end-to-end proof that the loop verifies BOTH
+    // compilation and unit tests — not just that units reached Done.
+    val outcome = engine.RunWithProjectGate(
+        port, engine.GalaToolchainRunner(), engine.GalaProfile(),
+        ws, port.Run(plan), engine.DefaultMaxProjectAttempts(),
+    )
+    fmt.Println(engine.SmokeReport(backend, outcome.State))
+    fmt.Println("")
+    fmt.Println(engine.EvaluationReport(outcome.Evaluation, outcome.Attempts))
     fs.RemoveAll(root)
-    if !engine.SmokeSucceeded(final) {
+    // Success requires BOTH every unit Done AND the project green (compiles + tests
+    // pass) — so a run whose output doesn't compile exits non-zero, never a fake green.
+    if !engine.SmokeSucceeded(outcome.State) || !engine.ProjectGreen(outcome.Evaluation) {
         os.Exit(1)
     }
 }

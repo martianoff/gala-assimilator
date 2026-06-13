@@ -20,7 +20,9 @@ app/engine             the orchestration engine — transport-neutral, no gala_t
         ├─ acp      agent-run contract: gala-acp's generic AgentRunner[A,R,C] +
         │           RunTranscript / RunOutcome, instantiated with engine payloads
         ├─ lang     source frontend: ScanGoWorkspace reads a real Go project → WorkspaceModel
-        ├─ verify   verification harness: gates a unit on its 1:1-replicated source tests
+        ├─ verify   verification: a per-unit gate (1:1-replicated source tests) AND a
+        │           whole-project gate that COMPILES + TESTS the integrated migration via
+        │           a per-target ToolchainProfile, feeding failures back into the loop
         └─ state    run state + checkpoint (save / restore a long migration)
 ```
 
@@ -63,7 +65,14 @@ package, not separate sibling packages — see "Seam notes" for why.)
 6. **Fix / park / advance** — failures feed back for bounded retries; a unit that
    needs a human answer **parks** (a `Clarification`) while the run continues on
    other units; the answer is threaded back on a fresh assignment.
-7. **Checkpoint** — run state is pure data and is persisted (atomically) after
+7. **Project gate** — once every unit settles, the WHOLE integrated migration is
+   materialized into a scratch module and the target's toolchain (a per-language
+   `ToolchainProfile` — GALA: `gala build ./...` then `gala test`) actually
+   **compiles it and runs its tests**. Not green → the diagnostics are fed back and
+   the implicated units re-translated (bounded). "Every unit Done" is never a success
+   on its own; the migration must compile AND its tests must pass. The final report
+   spells out the evaluation (compile + test verdicts, diagnostics, coverage).
+8. **Checkpoint** — run state is pure data and is persisted (atomically) after
    transitions, so a long migration survives quit/crash and resumes without
    redoing finished units.
 

@@ -436,6 +436,62 @@ func ClassifyIntegrate(res IntegrateResult) IntegrateSummary = res match {
 }
 
 // ============================================================================
+// Project evaluation → UI summary (HOW the migration was verified)
+// ============================================================================
+
+// ProjectEvalVM is an engine ProjectEvaluation projected for S6: the compile and
+// unit-test verdicts (as plain labels the UI prints), the overall green/not-green
+// call, a trimmed diagnostics excerpt to show on a failure, and the unit coverage.
+// The UI reads these flat fields, never the engine struct's logic — the same pattern
+// as IntegrateSummary.
+struct ProjectEvalVM(
+    Green        bool,
+    CompileLabel string,
+    TestsLabel   string,
+    Verdict      string,
+    Diagnostics  string,
+    UnitsEmitted int,
+    Excluded     int,
+    Language     string,
+)
+
+func ClassifyEvaluation(e ProjectEvaluation) ProjectEvalVM =
+    ProjectEvalVM(
+        Green        = ProjectGreen(e),
+        CompileLabel = evalCompileLabel(e),
+        TestsLabel   = evalTestsLabel(e),
+        Verdict      = if (ProjectGreen(e)) "compiles & unit tests pass" else "not yet correct — see diagnostics",
+        Diagnostics  = evalExcerpt(e),
+        UnitsEmitted = e.UnitsEmitted,
+        Excluded     = e.UnitsExcluded.Length(),
+        Language     = e.Language,
+    )
+
+func evalCompileLabel(e ProjectEvaluation) string {
+    if (!e.Materialized) { return "not run" }
+    if (e.Compiled)      { return "PASS" }
+    return "FAIL"
+}
+
+func evalTestsLabel(e ProjectEvaluation) string {
+    if (!e.TestsRun) {
+        if (e.Compiled) { return "not run" }
+        return "not run (build failed)"
+    }
+    if (e.TestsPassed) { return "PASS" }
+    return "FAIL"
+}
+
+// evalExcerpt is the first few lines of the failing stage's diagnostics (compile
+// output on a build failure, else test output), so S6 shows WHY without flooding the
+// screen. Falls back to the structural Note when a stage produced no text.
+func evalExcerpt(e ProjectEvaluation) string {
+    val raw = if (!e.Compiled) e.CompileOutput else e.TestOutput
+    if (raw == "") { return e.Note }
+    return str.Split(raw, "\n").Take(8).MkString("\n")
+}
+
+// ============================================================================
 // Recent-projects index → UI rows
 // ============================================================================
 

@@ -220,6 +220,65 @@ func TestRunDrivesToCompletion(t T) T {
     }
 }
 
+// ----- project gate (compile + test the integrated output) ------------------
+
+func greenEval() engine.ProjectEvaluation =
+    engine.ProjectEvaluation(
+        Language = "GALA", Materialized = true,
+        Compiled = true, CompileOutput = "", TestsRun = true, TestsPassed = true, TestOutput = "",
+        UnitsEmitted = 4, UnitsExcluded = EmptyArray[engine.UnitId](), Note = "")
+
+func redEval() engine.ProjectEvaluation =
+    engine.ProjectEvaluation(
+        Language = "GALA", Materialized = true,
+        Compiled = false, CompileOutput = "bundled.gala:10:22 missing '{'",
+        TestsRun = false, TestsPassed = false, TestOutput = "",
+        UnitsEmitted = 4, UnitsExcluded = EmptyArray[engine.UnitId](), Note = "")
+
+func runToFixpoint() Array[Msg] {
+    val port = engine.MockEngine()
+    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
+    val plan = port.Plan(ws)
+    val st = port.Run(plan)
+    return ArrayOf[Msg](
+        MScanPlanned(Workspace = ws, Plan = plan),
+        MRunStarted(State = st),
+    ).AppendAll(ticks(40))
+}
+
+// A green project evaluation is stored and counts as one gate round, so S6 can report
+// "compiles & tests pass".
+func TestProjectGateGreenStoresEvaluation(t T) T {
+    val (m1, _) = StepAll(prog(), runToFixpoint().Append(MProjectEvaluated(Eval = greenEval())))
+    val t1 = Eq(t, m1.ProjectAttempts, 1)
+    return m1.ProjectEval match {
+        case Some(e) => IsTrue(t1, engine.ProjectGreen(e))
+        case None()  => Fail(t1, "a green evaluation must be stored for the report")
+    }
+}
+
+// A non-green evaluation with budget remaining is recorded (one round spent) and the
+// gate is no longer "evaluating" — the loop will feed the diagnostics back and resume.
+func TestProjectGateNonGreenFeedsBackWithinBudget(t T) T {
+    val (m1, _) = StepAll(prog(), runToFixpoint().Append(MProjectEvaluated(Eval = redEval())))
+    val t1 = Eq(t, m1.ProjectAttempts, 1)
+    val t2 = IsFalse(t1, m1.ProjectEvaluating)
+    return m1.ProjectEval match {
+        case Some(e) => IsFalse(t2, engine.ProjectGreen(e))
+        case None()  => Fail(t2, "the evaluation must be stored")
+    }
+}
+
+// At the attempt budget a non-green evaluation SETTLES (no infinite re-translation):
+// a second round reaches the cap and the run stops feeding back.
+func TestProjectGateNonGreenSettlesAtBudget(t T) T {
+    val seq = runToFixpoint()
+        .Append(MProjectEvaluated(Eval = redEval()))
+        .Append(MProjectEvaluated(Eval = redEval()))
+    val (m1, _) = StepAll(prog(), seq)
+    return Eq(t, m1.ProjectAttempts, engine.DefaultMaxProjectAttempts())
+}
+
 // ----- navigation -----------------------------------------------------------
 
 func TestBackFromS2ReturnsToS1(t T) T {

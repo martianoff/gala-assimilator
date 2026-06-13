@@ -23,7 +23,7 @@ import (
 // with (buildOk, buildOut) and the `test` invocation with (testOk, testOut),
 // keying off the first arg — so a test pins each stage's outcome without exec.
 func fakeRunner(buildOk bool, buildOut string, testOk bool, testOut string) ToolchainRunner =
-    ToolchainRunner(Run = (dir string, args Array[string]) => isBuildArgs(args) match {
+    ToolchainRunner(Run = (dir string, command string, args Array[string]) => isBuildArgs(args) match {
         case true  => ToolchainResult(Ok = buildOk, Output = buildOut)
         case false => ToolchainResult(Ok = testOk, Output = testOut)
     })
