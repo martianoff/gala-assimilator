@@ -20,14 +20,13 @@ func s1Harness() harness.Harness[Model, Msg] {
     return harness.NewHarnessFull[Model, Msg](program, (e) => inputToMsg(e), 110, 20)
 }
 
-// Keyboard: Tab through the source-origin controls to the target-language cycler
-// (browse → origin → url → ref → target), then ArrowRight cycles it forward.
+// Keyboard: Tab through the (local-origin) source controls to the target-language
+// cycler (browse → origin → target — the URL/ref stops only exist in the GitHub ring),
+// then ArrowRight cycles it forward.
 func TestKeyboardCyclesTargetLanguage(t T) T {
     val s = s1Harness().Start()
         .Press(PlainKey(Tab()))         // browse → origin
-        .Press(PlainKey(Tab()))         // origin → url
-        .Press(PlainKey(Tab()))         // url → ref
-        .Press(PlainKey(Tab()))         // ref → target
+        .Press(PlainKey(Tab()))         // origin → target
         .Press(PlainKey(ArrowRight()))  // cycle target forward
     val t1 = Eq(t, s.Model.TargetLang(), "TypeScript")
     // View reflects the new selection.
@@ -57,6 +56,45 @@ func TestMouseSelectsSkipPolicy(t T) T {
             }
         }
         case None() => IsTrue(pre, false)
+    }
+}
+
+// Mouse parity for the GitHub origin: clicking the "GitHub URL" radio then clicking
+// INSIDE the URL box focuses the box, and typing a URL that contains 'q' edits the
+// field — proving the click is no longer a no-op and 'q' types instead of quitting
+// the app (the reported "impossible to input a repo" trap).
+func TestMouseClickUrlBoxFocusesAndTypes(t T) T {
+    val s0 = s1Harness().Start()
+    return s0.FindRow("GitHub URL") match {
+        case Some(y) => {
+            val rowText = str.S(s0.Text()).Lines().Get(y)
+            return rowText.IndexOf("GitHub URL") match {
+                case Some(x) => {
+                    val s1 = s0.Click(x + 1, y)
+                    val t1 = IsTrue(t, s1.Model.OriginGit)
+                    // Click inside the URL input box (its placeholder), then type.
+                    return s1.FindRow("owner/repo") match {
+                        case Some(by) => {
+                            val boxText = str.S(s1.Text()).Lines().Get(by)
+                            return boxText.IndexOf("owner/repo") match {
+                                case Some(bx) => {
+                                    val s2 = s1.Click(bx + 1, by)
+                                    val t2 = Eq(t1, s2.Model.Focus.Current(), PaneUrl())
+                                    val s3 = s2.Press(PlainKey(Char('q')))
+                                                .Press(PlainKey(Char('/')))
+                                                .Press(PlainKey(Char('x')))
+                                    return Eq(t2, s3.Model.RepoUrl, "q/x")
+                                }
+                                case None() => IsTrue(t1, false)
+                            }
+                        }
+                        case None() => IsTrue(t1, false)
+                    }
+                }
+                case None() => IsTrue(t, false)
+            }
+        }
+        case None() => IsTrue(t, false)
     }
 }
 

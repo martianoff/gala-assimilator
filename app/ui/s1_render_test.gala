@@ -45,7 +45,8 @@ func TestS1FocusCaretRendersAndMoves(t T) T {
     val m0 = NewModel(mockFactory(), 110, 20)
     val out0 = str.S(Snapshot(view(m0), 110, 20))
     val t1 = IsTrue(t, out0.Contains("▸ Project"))     // initial focus (browse pane)
-    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MFocusNext(), MFocusNext(), MFocusNext(), MFocusNext()))
+    // Local-origin ring is browse → origin → target, so two Tabs reach Language.
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MFocusNext(), MFocusNext()))
     val out1 = str.S(Snapshot(view(m1), 110, 20))
     val t2 = IsTrue(t1, out1.Contains("▸ Language"))   // caret moved to Language
     return IsFalse(t2, out1.Contains("▸ Project"))     // no longer on Project
