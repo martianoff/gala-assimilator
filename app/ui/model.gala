@@ -47,18 +47,36 @@ func PaneBack() string  = "back"   // S2 back button
 func PaneTree() string  = "tree"   // S3 unit tree
 func PaneLog() string   = "log"    // S3 activity log
 
-func s1Panes() Array[string] =
-    ArrayOf[string](
-        PaneBrowse(),
-        PaneOrigin(),
-        PaneUrl(),
-        PaneRef(),
-        PaneTarget(),
-        PaneUnsupported(),
-        PaneRetry(),
-        PaneAmbiguity(),
-        PaneScan(),
-    )
+// s1Panes is the Tab ring for the CURRENT source origin. It is kept in lockstep
+// with the fields s1View actually renders for that origin: the local path exposes
+// the browse picker (no URL/ref), the GitHub path exposes the URL + ref fields (no
+// browse). Keeping the ring mode-aware means Tab only ever lands on a control that
+// is on screen — no phantom stops on an unrendered field, and the ▸ focus caret is
+// always visible. The ring is rebuilt whenever the origin toggles (see toggleOrigin).
+func s1Panes() Array[string] = s1PanesFor(false)
+
+func s1PanesFor(originGit bool) Array[string] =
+    if (originGit)
+        ArrayOf[string](
+            PaneOrigin(),
+            PaneUrl(),
+            PaneRef(),
+            PaneTarget(),
+            PaneUnsupported(),
+            PaneRetry(),
+            PaneAmbiguity(),
+            PaneScan(),
+        )
+    else
+        ArrayOf[string](
+            PaneBrowse(),
+            PaneOrigin(),
+            PaneTarget(),
+            PaneUnsupported(),
+            PaneRetry(),
+            PaneAmbiguity(),
+            PaneScan(),
+        )
 
 // Minimum viewport the full layout needs; below this a resize notice shows.
 func MinCols() int = 60

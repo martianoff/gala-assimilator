@@ -126,6 +126,12 @@ func s0Corrupt(offer runview.LoadSummary) Widget =
 func maxI(a int, b int) int = if (a > b) a else b
 func minI(a int, b int) int = if (a < b) a else b
 
+// dispPath normalizes a filesystem path for DISPLAY only (back-slashes → forward), so
+// a path.Join result on Windows doesn't render mixed separators beside the
+// forward-slash source path (e.g. "\root\.assimilator\out"). The real IO paths the
+// engine writes to are untouched — this is purely what the user reads on screen.
+func dispPath(p string) string = str.S(p).ReplaceAll("\\", "/").ToString()
+
 // spin returns a braille spinner glyph for the given animation frame, so any
 // in-progress / loading state visibly rotates instead of looking frozen. Pair it
 // with the loading text: s"${spin(m.Frame)} loading…".
@@ -195,12 +201,16 @@ func originRow(m Model) Widget {
 
 // urlRow / refRow are the git-origin text fields. The label is clickable (focus by
 // mouse); Tab reaches them too, and a printable key types into the focused field.
+// The whole field — the label AND the input box — carries the focus click. A user
+// naturally clicks inside the box to type; without a click contract there, the click
+// was a no-op and the keystrokes fell through to the still-focused origin radio (where
+// a typed 'q' even quit the app). Making the box itself focusable closes that trap.
 func urlRow(m Model) Widget {
     val focused = m.Focus.IsFocused(PaneUrl())
     return Row(ArrayOf[LayoutChild](
         focusCaretCell(m, PaneUrl()),
         Fixed(subLabelW(), TextStyled("Repo URL", DefaultStyle().WithDim()).OnClick(MFocusUrl())),
-        Flex(1, Input(m.RepoUrl, RuneCount(m.RepoUrl), "https://github.com/owner/repo", focused)),
+        Flex(1, Input(m.RepoUrl, RuneCount(m.RepoUrl), "https://github.com/owner/repo", focused).OnClick(MFocusUrl())),
     ))
 }
 
@@ -209,7 +219,7 @@ func refRow(m Model) Widget {
     return Row(ArrayOf[LayoutChild](
         focusCaretCell(m, PaneRef()),
         Fixed(subLabelW(), TextStyled("Ref (opt)", DefaultStyle().WithDim()).OnClick(MFocusRef())),
-        Flex(1, Input(m.RepoRef, RuneCount(m.RepoRef), "default branch", focused)),
+        Flex(1, Input(m.RepoRef, RuneCount(m.RepoRef), "default branch", focused).OnClick(MFocusRef())),
     ))
 }
 
@@ -282,7 +292,7 @@ func sourceRow(m Model) Widget {
     return Row(ArrayOf[LayoutChild](
         focusCaretCell(m, PaneBrowse()),
         Fixed(subLabelW(), TextStyled("Project", DefaultStyle().WithDim())),
-        Flex(1, TextStyled(m.SourceDir, DefaultStyle())),
+        Flex(1, TextStyled(dispPath(m.SourceDir), DefaultStyle())),
         Fixed(12, btnWidget("browse…", focused, MBrowse())),
     ))
 }
@@ -404,8 +414,8 @@ func s2Board(m Model, pv runview.PlanVM) Widget {
     val head = ArrayOf[LayoutChild](
         Fixed(1, headerRow("Migration plan")),
         Fixed(1, Text("")),
-        Fixed(1, kvRow("Source", m.SourceDir)),
-        Fixed(1, kvRow("Output", OutputDir(m.SourceDir))),
+        Fixed(1, kvRow("Source", dispPath(m.SourceDir))),
+        Fixed(1, kvRow("Output", dispPath(OutputDir(m.SourceDir)))),
         Fixed(1, kvRow("Packages", s"${pv.Packages}     Units ${pv.Units}")),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  Units to migrate:", DefaultStyle().WithDim())),
@@ -426,7 +436,7 @@ func preflightRows(m Model) Array[LayoutChild] {
     return ArrayOf[LayoutChild](
         Fixed(1, Text("")),
         Fixed(1, errLine("✗ Can't save progress here", DefaultStyle().WithBold().WithFg(BrightRed()))),
-        Fixed(1, errLine("  " + CheckpointDir(m.SourceDir) + " — " + m.Preflight, DefaultStyle().WithFg(BrightYellow()))),
+        Fixed(1, errLine("  " + dispPath(CheckpointDir(m.SourceDir)) + " — " + m.Preflight, DefaultStyle().WithFg(BrightYellow()))),
         Fixed(1, errLine("  Choose a writable project location, then start again.", DefaultStyle().WithDim())),
     )
 }
@@ -439,7 +449,7 @@ func s2EmptyPlan(m Model, pv runview.PlanVM) Widget =
     Border(Column(ArrayOf[LayoutChild](
         Fixed(1, headerRow("Migration plan — nothing to migrate")),
         Fixed(1, Text("")),
-        Fixed(1, kvRow("Source", m.SourceDir)),
+        Fixed(1, kvRow("Source", dispPath(m.SourceDir))),
         Fixed(1, kvRow("Scanned", s"${pv.Packages} packages · 0 migratable units")),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  ⚠ No migratable units were found in this project.",
@@ -510,7 +520,7 @@ func s3Board(m Model, rv runview.RunVM) Widget {
      .AppendAll(saveErrorRows(m))
     val children = head.AppendAll(ArrayOf[LayoutChild](
         Flex(1, board),
-        Fixed(1, s3Footer()),
+        Fixed(1, s3Footer(m.Cols)),
     ))
     return Border(Column(children))
 }
@@ -692,9 +702,15 @@ func stackedBoard(m Model, rv runview.RunVM) Widget =
         Flex(1, logPane(m, rv)),
     ))
 
-func s3Footer() Widget =
-    TextStyled("  Tab switch pane · ↑/↓ move · ⏎ open unit · p report · d deps · Esc back · q quit",
-        DefaultStyle().WithDim())
+// s3Footer shortens below WideCols so the hint never runs off the right border (the
+// full line clipped its trailing "Esc back · q quit" at narrow widths).
+func s3Footer(cols int) Widget {
+    val text = if (cols >= WideCols())
+        "  Tab switch pane · ↑/↓ move · ⏎ open unit · p report · d deps · Esc back · q quit"
+    else
+        "  ⏎ open · p report · d deps · Tab pane · Esc · q"
+    return TextStyled(text, DefaultStyle().WithDim())
+}
 
 // ----- left: unit tree by package -------------------------------------------
 
@@ -826,7 +842,7 @@ func s4Board(m Model, vm runview.UnitDetailVM) Widget {
         Fixed(1, headerRow("Review — " + vm.Id)),
         Fixed(1, diffLegend()),
         Flex(1, diffArea(m, vm)),
-        Fixed(1, diffCaveat()),
+        Fixed(1, diffCaveat(m.Cols)),
         Fixed(1, kvRow("Rationale", rationale)),
         Fixed(1, kvRow("Flags", flags)),
         Fixed(1, kvRow("Verify", vm.Status)),
@@ -848,9 +864,13 @@ func diffLegend() Widget =
 // diffCaveat is the honest disclaimer for the cheap by-index comparison: after any
 // insertion/deletion the lines no longer align, so "changed" tints can be spurious.
 // Surfacing this is the no-silent-drift discipline applied to the UI itself.
-func diffCaveat() Widget =
-    TextStyled("  ⓘ by-index compare: after an inserted/removed line, later lines may show as changed though they're not.",
-        DefaultStyle().WithDim().WithFg(BrightYellow()))
+func diffCaveat(cols int) Widget {
+    val text = if (cols >= WideCols())
+        "  ⓘ by-index compare: after an inserted/removed line, later lines may show as changed though they're not."
+    else
+        "  ⓘ diff is by-index — lines after an edit may look changed."
+    return TextStyled(text, DefaultStyle().WithDim().WithFg(BrightYellow()))
+}
 
 // diffArea shows source vs emitted target side-by-side (wide) or stacked (narrow),
 // each pane line-numbered and scrolled by S4Scroll (↑/↓). Lines that differ at the
@@ -1026,7 +1046,7 @@ func s6Board(m Model, rv runview.RunVM) Widget {
     val children = ArrayOf[LayoutChild](
         Fixed(1, headerRow(title)),
         Fixed(1, Text("")),
-        Fixed(1, kvRow("Source", m.SourceDir)),
+        Fixed(1, kvRow("Source", dispPath(m.SourceDir))),
         Fixed(1, kvRow("Progress", s"${rv.Done}/${rv.Total} units (${rv.Pct}%)")),
     ).AppendAll(countsRow(rv, m.Cols))
      .AppendAll(s6IssueRows(c))
@@ -1034,7 +1054,7 @@ func s6Board(m Model, rv runview.RunVM) Widget {
      .AppendAll(s6OutputRows(m))
      .AppendAll(ArrayOf[LayoutChild](
         Fixed(1, Text("")),
-        Fixed(1, TextStyled(s"  Checkpoint: ${CheckpointPath(m.SourceDir)}", DefaultStyle().WithDim())),
+        Fixed(1, TextStyled(s"  Checkpoint: ${dispPath(CheckpointPath(m.SourceDir))}", DefaultStyle().WithDim())),
         Fixed(1, Text("")),
         Fixed(1, s6Actions(m, rv, problems)),
         Flex(1, Text("")),
@@ -1077,7 +1097,7 @@ func s6OutputRows(m Model) Array[LayoutChild] = m.Integrated match {
         if (sum.Ok) {
             return ArrayOf[LayoutChild](
                 Fixed(1, Text("")),
-                Fixed(1, TextStyled(s"  ✓ Results written to ${OutputDir(m.SourceDir)}  (${sum.Files} files)",
+                Fixed(1, TextStyled(s"  ✓ Results written to ${dispPath(OutputDir(m.SourceDir))}  (${sum.Files} files)",
                     DefaultStyle().WithBold().WithFg(BrightGreen()))))
         }
         return ArrayOf[LayoutChild](
@@ -1346,7 +1366,24 @@ func depReasonSuffix(r runview.DepRowVM) string {
 func trimDepReason(reason string) string {
     val oneLine = str.S(reason).ReplaceAll("\n", " ").Trim()
     if (oneLine.Length() <= 44) { return oneLine.ToString() }
-    return oneLine.Take(44).ToString() + "…"
+    // Cut on a word boundary so the truncation never lands mid-word ("expand t…").
+    // Accumulate whole words up to the cap, then ellipsize; a single over-long first
+    // word still falls back to a hard cut so something always shows.
+    val words = oneLine.Split(" ")
+    var out = ""
+    var stop = false
+    var i = 0
+    val n = words.Length()
+    for i < n {
+        if (!stop) {
+            val w = words.Get(i).ToString()
+            val next = if (out == "") w else out + " " + w
+            if (RuneCount(next) > 44) { stop = true } else { out = next }
+        }
+        i = i + 1
+    }
+    if (out == "") { return oneLine.Take(44).ToString() + "…" }
+    return out + "…"
 }
 
 // depRowStyle keeps the off-ramps VISUALLY DISTINCT: failed in red, unsupported in

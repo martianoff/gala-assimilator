@@ -126,10 +126,7 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MKeyBackspace() => (keyBackspace(m), NoCmd[Msg]())
 
     case MBrowse()          => openBrowse(m)
-    case MSetOrigin(g)      => {
-        val mf = focusOn(m, PaneOrigin())
-        return (mf.Copy(OriginGit = g), NoCmd[Msg]())
-    }
+    case MSetOrigin(g)      => (setOrigin(m, g), NoCmd[Msg]())
     case MFocusUrl()        => (focusOn(m, PaneUrl()), NoCmd[Msg]())
     case MFocusRef()        => (focusOn(m, PaneRef()), NoCmd[Msg]())
     case MCycleTarget()     => (cycleTarget(focusOn(m, PaneTarget()), 1), NoCmd[Msg]())
@@ -519,7 +516,15 @@ func focusOn(m Model, pane string) Model = m.Copy(Focus = m.Focus.FocusOn(pane))
 // ----- S1 pure control edits ------------------------------------------------
 
 // toggleOrigin flips the source origin between the local directory and a GitHub URL.
-func toggleOrigin(m Model) Model = m.Copy(OriginGit = !m.OriginGit)
+func toggleOrigin(m Model) Model = setOrigin(m, !m.OriginGit)
+
+// setOrigin switches the source origin and rebuilds the S1 Tab ring to match the
+// fields that origin renders (mode-aware s1PanesFor), landing focus on the origin
+// selector. This keeps Tab in lockstep with the view — the URL/ref fields become
+// reachable the instant the GitHub origin is chosen, and the browse picker drops out
+// of the ring — so no keystroke is ever swallowed by an unrendered, still-focused pane.
+func setOrigin(m Model, g bool) Model =
+    m.Copy(OriginGit = g, Focus = NewFocusRing(s1PanesFor(g)).FocusOn(PaneOrigin()))
 
 func cycleTarget(m Model, dir int) Model =
     m.Copy(TargetIdx = clampIdx(m.TargetIdx + dir, TargetLangOptions().Length()))
