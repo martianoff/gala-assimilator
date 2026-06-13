@@ -68,6 +68,17 @@ struct ForestVM(
     Pct         int,
     Unsupported int,
     Failed      int,
+    // Skipped is the count of parked nodes — children pushed beyond the depth bound
+    // (or operator-skipped). On a DEEP chain this is the work the run did NOT reach,
+    // so it must be counted in the roll-up, not just left as the unexplained gap
+    // between Done and Total. Discovering is true while the transitive frontier is
+    // still expanding (a node not yet resolved), so the Total/Pct shown are still
+    // provisional; MaxDepth is the live depth bound (ExpandDep raises it) and Deepest
+    // the deepest node materialized so far.
+    Skipped     int,
+    Discovering bool,
+    MaxDepth    int,
+    Deepest     int,
     Complete    bool,
 )
 
@@ -78,6 +89,12 @@ func ProjectForest(f DependencyForest) ForestVM {
     val total = f.Deps.Length()
     val done = CountDepsDone(f)
     val pct = if (total == 0) 0 else (done * 100) / total
+    // Discovery is still expanding the frontier while any node hasn't yet resolved its
+    // own go.mod (pending / cloning / resolved) — those nodes will still ADD children,
+    // so Total is a moving target until none remain.
+    val discovering = rows.Exists((r DepRowVM) =>
+        r.Status == "pending" || r.Status == "cloning" || r.Status == "resolved")
+    val deepest = rows.FoldLeft[int](0, (acc int, r DepRowVM) => if (r.Depth > acc) r.Depth else acc)
     return ForestVM(
         Rows        = rows,
         Total       = total,
@@ -85,6 +102,10 @@ func ProjectForest(f DependencyForest) ForestVM {
         Pct         = pct,
         Unsupported = rows.Count((r DepRowVM) => r.IsUnsupported),
         Failed      = rows.Count((r DepRowVM) => r.IsFailed),
+        Skipped     = rows.Count((r DepRowVM) => r.IsSkipped),
+        Discovering = discovering,
+        MaxDepth    = f.MaxDepth,
+        Deepest     = deepest,
         Complete    = ForestComplete(f),
     )
 }
@@ -136,7 +157,7 @@ func ProjectDep(d DependencyRun) DepRowVM {
         case DepAssimilating(run) => depAssimRow(base, run)
         case DepDone()            => base.Copy(Glyph = "✓", Status = "done",         IsDone = true, CanRetry = true)
         case DepSkipped()         => base.Copy(Glyph = "⊘", Status = "skipped",
-            Reason = "skipped (depth bound or operator) — expand to grow",
+            Reason = "expand to convert — parked at depth bound",
             IsSkipped = true, CanResolve = true, CanExpand = true)
         case DepUnsupported(why)  => base.Copy(Glyph = "⚠", Status = "unsupported",
             Reason = why, IsUnsupported = true, CanSkip = true, CanRetry = true)

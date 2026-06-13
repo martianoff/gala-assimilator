@@ -83,7 +83,8 @@ func TestProjectDepSkipped(t T) T {
     val t3 = IsTrue(t2, r.IsSkipped)
     val t4 = IsTrue(t3, r.CanResolve)
     val t5 = IsTrue(t4, r.CanExpand)
-    return IsTrue(t5, strContains(r.Reason, "skipped"))
+    // The reason leads with the actionable call-to-action so truncation never eats it.
+    return IsTrue(t5, strContains(r.Reason, "expand to convert"))
 }
 
 // An unsupported dependency must be surfaced with its reason and a distinguishing
