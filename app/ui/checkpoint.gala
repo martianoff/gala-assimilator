@@ -119,11 +119,37 @@ func saveProbeCmd(root string) Cmd[Msg] =
         (reason) => MSavePreflight(Reason = reason),
     )
 
-// doSaveForest ensures the state dir exists, then persists the forest via the port.
+// doSaveForest ensures the state dir exists, persists the forest via the port, AND
+// writes a human-readable dependency diagnostics log (deps.log) beside it — the FULL
+// per-dependency reasons (the exact failing git command + stderr, the no-mapping
+// note), which the dependency screen can only show truncated. Best-effort: the log
+// write never changes the checkpoint's own success.
 func doSaveForest(port engine.EnginePort, forest engine.DependencyForest, root string) bool {
     fs.MkdirAll(CheckpointDir(root), 493)   // 0755; ignore result — SaveForest reports failure
+    fs.WriteFileString(DepsLogPath(root), engine.ForestReport(forest), 420)
     return port.SaveForest(forest, ForestCheckpointPath(root))
 }
+
+// DepsLogPath / SessionLogPath are the human-readable diagnostics logs beside the
+// checkpoint: deps.log captures the dependency resolution (full reasons), session.log
+// captures the run + the whole-project compile/test evaluation.
+func DepsLogPath(root string) string = path.Join(CheckpointDir(root), "deps.log")
+func SessionLogPath(root string) string = path.Join(CheckpointDir(root), "session.log")
+
+// writeSessionLog records the finished run + its project-gate evaluation to
+// session.log (best-effort, off the loop). It is how a completed migration leaves a
+// readable record of HOW it was verified — compile/test verdicts and diagnostics.
+func writeSessionLog(backend string, state engine.RunState, eval engine.ProjectEvaluation, attempts int, root string) bool {
+    fs.MkdirAll(CheckpointDir(root), 493)
+    val body = engine.SmokeReport(backend, state) + "\n\n" + engine.EvaluationReport(eval, attempts)
+    return !fs.WriteFileString(SessionLogPath(root), body, 420).IsFailure()
+}
+
+func sessionLogCmd(backend string, state engine.RunState, eval engine.ProjectEvaluation, attempts int, root string) Cmd[Msg] =
+    Async[bool, Msg](
+        () => writeSessionLog(backend, state, eval, attempts, root),
+        (_) => MNoOp(),
+    )
 
 // saveForestCmd persists the dependency forest off the Update loop; the result
 // surfaces as MForestSaved so the UI can show a save indicator.

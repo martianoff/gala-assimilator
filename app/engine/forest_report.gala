@@ -1,0 +1,78 @@
+package engine
+
+// FOREST REPORT — a pure DependencyForest -> human-readable text projection, the
+// diagnostics log behind the dependency screen. The UI truncates each dep's reason to
+// one line; this renders the FULL reason (the exact failing git command + its stderr
+// for a DepFailed, the no-mapping note for a DepUnsupported), so "why did 24 deps
+// fail / 8 unsupported" is answerable from a file instead of a truncated row.
+//
+// Pure data -> string: no IO, no gala_tui, no app/ui. The UI writes the returned text
+// to <root>/.assimilator/deps.log at the same point it checkpoints the forest.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+)
+
+// ForestReport renders the whole forest: a header, a one-line summary (done /
+// unsupported / failed counts), then one block per dependency with its coordinate,
+// resolved repo URL, depth, and — for the off-ramp states — the FULL reason.
+func ForestReport(forest DependencyForest) string {
+    val header  = s"=== dependency resolution — how each dependency was handled ===\ndeps: ${forest.Deps.Length()}    max depth: ${forest.MaxDepth}"
+    val summary = forestSummaryLine(forest)
+    val rows    = forest.Deps.Map((d DependencyRun) => depReport(d)).MkString("\n\n")
+    return header + "\n" + summary + "\n\n" + rows
+}
+
+// forestSummaryLine counts the terminal off-ramps the operator cares about.
+func forestSummaryLine(forest DependencyForest) string {
+    val done        = forest.Deps.Count((d DependencyRun) => isDepDone(d.Status))
+    val unsupported = forest.Deps.Count((d DependencyRun) => isDepUnsupported(d.Status))
+    val failed      = forest.Deps.Count((d DependencyRun) => isDepFailed(d.Status))
+    return s"done ${done} · unsupported ${unsupported} · failed ${failed}"
+}
+
+// depReport is one dependency's block: coordinate + status, the repo URL it mapped to
+// (or "no VCS mapping"), and the full reason for an unsupported / failed node.
+func depReport(d DependencyRun) string {
+    val node = d.Node
+    val head = s"  ${node.Coord.Module}@${node.Coord.Version}  [${depStatusWord(d.Status)}]  depth=${d.Depth}"
+    val repo = if (node.RepoUrl == "") "    repo: (no VCS mapping)" else "    repo: " + node.RepoUrl
+    return head + "\n" + repo + depStatusDetail(d.Status)
+}
+
+func depStatusWord(s DepResolution) string = s match {
+    case DepPending()       => "pending"
+    case DepCloning()       => "cloning"
+    case DepResolved(_)     => "resolved"
+    case DepAssimilating(_) => "assimilating"
+    case DepDone()          => "done"
+    case DepSkipped()       => "skipped"
+    case DepUnsupported(_)  => "unsupported"
+    case DepFailed(_)       => "failed"
+}
+
+// depStatusDetail appends the FULL reason (indented) for the states that carry one;
+// everything else adds nothing. This is the line the UI truncates and the log keeps.
+func depStatusDetail(s DepResolution) string = s match {
+    case DepUnsupported(reason) => "\n" + indentLines(reason)
+    case DepFailed(reason)      => "\n" + indentLines(reason)
+    case DepPending()           => ""
+    case DepCloning()           => ""
+    case DepResolved(_)         => ""
+    case DepAssimilating(_)     => ""
+    case DepDone()              => ""
+    case DepSkipped()           => ""
+}
+
+// isDepDone lives in forest.gala (reused here). The two off-ramp classifiers below
+// are report-local.
+func isDepUnsupported(s DepResolution) bool = s match {
+    case DepUnsupported(_) => true
+    case _                 => false
+}
+
+func isDepFailed(s DepResolution) bool = s match {
+    case DepFailed(_) => true
+    case _            => false
+}

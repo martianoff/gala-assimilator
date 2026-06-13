@@ -21,7 +21,7 @@ val sampleGoMod =
     "require (\n" +
     "\tgithub.com/acme/widget v1.2.3\n" +
     "\tgithub.com/acme/gadget v0.4.0 // indirect\n" +
-    "\tgolang.org/x/tools v0.1.0\n" +
+    "\trsc.io/quote v1.5.2\n" +
     ")\n"
 
 func writeGoMod(content string) string {
@@ -61,7 +61,7 @@ func TestGoResolverMarksIndirect(t T) T {
 // never silently dropped — it is still a node, just not resolvable.
 func TestGoResolverFlagsUnsupportedHost(t T) T {
     val g = GoDependencyResolver().Resolve(ResolveRequest(RepoPath = writeGoMod(sampleGoMod)))
-    return findNode(g, "golang.org/x/tools") match {
+    return findNode(g, "rsc.io/quote") match {
         case Some(n) => {
             val a = Eq(t, n.RepoUrl, "")
             return Eq(a, IsResolvable(n), false)
@@ -92,8 +92,20 @@ func TestModuleToRepoUrlMapping(t T) T {
     val t2 = Eq(t1, moduleToRepoUrl("github.com/x/y/v2"), "https://github.com/x/y")
     val t3 = Eq(t2, moduleToRepoUrl("gitlab.com/a/b"), "https://gitlab.com/a/b")
     val t4 = Eq(t3, moduleToRepoUrl("bitbucket.org/a/b/sub"), "https://bitbucket.org/a/b")
-    val t5 = Eq(t4, moduleToRepoUrl("golang.org/x/tools"), "")
-    return Eq(t5, moduleToRepoUrl("example.com/single"), "")
+    // an unknown vanity host is still unsupported; a too-short github path too.
+    val t5 = Eq(t4, moduleToRepoUrl("example.com/single"), "")
+    return Eq(t5, moduleToRepoUrl("github.com/only-owner"), "")
+}
+
+// Known vanity hosts now resolve to their backing GitHub repos (previously all "" =
+// unsupported) — golang.org/x, gopkg.in, fyne.io: the modules the deps screen flagged.
+func TestVanityHostMapping(t T) T {
+    val t1 = Eq(t,  moduleToRepoUrl("golang.org/x/sys"),    "https://github.com/golang/sys")
+    val t2 = Eq(t1, moduleToRepoUrl("golang.org/x/image"),  "https://github.com/golang/image")
+    val t3 = Eq(t2, moduleToRepoUrl("gopkg.in/yaml.v3"),    "https://github.com/go-yaml/yaml")
+    val t4 = Eq(t3, moduleToRepoUrl("gopkg.in/user/pkg.v2"),"https://github.com/user/pkg")
+    val t5 = Eq(t4, moduleToRepoUrl("fyne.io/fyne/v2"),     "https://github.com/fyne-io/fyne")
+    return Eq(t5, moduleToRepoUrl("fyne.io/systray"),       "https://github.com/fyne-io/systray")
 }
 
 // SelectResolver is the pluggable-by-ecosystem seam: "go" yields the Go resolver.
