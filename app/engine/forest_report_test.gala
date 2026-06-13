@@ -1,0 +1,45 @@
+package engine
+
+// Tests for the forest diagnostics report (forest_report.gala): it must surface the
+// FULL per-dependency reason (the truncated-in-UI clone stderr / no-mapping note) and
+// an accurate done/unsupported/failed summary.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    strings "martianoff/gala/strings"
+)
+
+// sampleForest is a two-node forest: one failed clone (carrying git's stderr) and one
+// unsupported node (no VCS mapping) — the two off-ramps the report must spell out.
+func sampleForest() DependencyForest {
+    val failed = DependencyRun(
+        Node = DependencyNode(
+            Id      = DependencyId(Value = "github.com/x/y"),
+            Coord   = ModuleCoord(Module = "github.com/x/y", Version = "v1.4.0"),
+            RepoUrl = "https://github.com/x/y", Direct = true),
+        Dest = "/d/x_y", Depth = 1, Children = EmptyArray[DependencyId](),
+        Status = DepFailed(Reason = "git clone --depth 1 --branch v1.4.0 … exited non-zero:\nfatal: could not read Username"))
+    val unsup = DependencyRun(
+        Node = DependencyNode(
+            Id      = DependencyId(Value = "rsc.io/quote"),
+            Coord   = ModuleCoord(Module = "rsc.io/quote", Version = "v1.5.2"),
+            RepoUrl = "", Direct = true),
+        Dest = "/d/rsc", Depth = 1, Children = EmptyArray[DependencyId](),
+        Status = DepUnsupported(Reason = "no VCS host mapping for module rsc.io/quote — cannot clone"))
+    return DependencyForest(
+        Deps = ArrayOf[DependencyRun](failed, unsup),
+        DepMap = EmptyHashMap[string, DependencyRun](),
+        Visited = EmptyArray[string](), MaxDepth = 5, DepsBase = "/d")
+}
+
+func TestForestReportSurfacesFullReasons(t T) T {
+    val r = ForestReport(sampleForest())
+    val t1 = IsTrue(t,  strings.Contains(r, "done 0 · unsupported 1 · failed 1"))  // summary
+    val t2 = IsTrue(t1, strings.Contains(r, "[failed]"))
+    val t3 = IsTrue(t2, strings.Contains(r, "fatal: could not read Username"))     // FULL clone stderr
+    val t4 = IsTrue(t3, strings.Contains(r, "[unsupported]"))
+    val t5 = IsTrue(t4, strings.Contains(r, "no VCS host mapping for module rsc.io/quote"))
+    return IsTrue(t5, strings.Contains(r, "https://github.com/x/y"))               // resolved repo url shown
+}

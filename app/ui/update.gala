@@ -731,12 +731,20 @@ func settleProjectGate(m Model, run engine.RunState, eval engine.ProjectEvaluati
     val attempts = m.ProjectAttempts + 1
     val m2 = m.Copy(ProjectEval = Some(eval), ProjectEvaluating = false, ProjectAttempts = attempts)
     if (engine.ProjectGreen(eval) || attempts >= engine.DefaultMaxProjectAttempts()) {
-        return (m2, withSave(m2, run, withIntegrate(m2, run)))
+        // Settled: write the migrated output AND a readable session log (run + the
+        // compile/test evaluation), then integrate.
+        val tail = withSave(m2, run, withIntegrate(m2, run))
+        return (m2, withSessionLog(m2, run, eval, attempts, tail))
     }
     val fed = m.Port.ApplyProjectFeedback(run, eval)
     val m3 = m2.Copy(Run = Some(fed))
     return (m3, withSave(m3, fed, withAnim(m, m3, advanceCmd(m3, fed))))
 }
+
+// withSessionLog batches the session-log write (run + evaluation) ahead of `base` when
+// persistence is on; off (tests) it returns `base` unchanged so no IO is issued.
+func withSessionLog(m Model, run engine.RunState, eval engine.ProjectEvaluation, attempts int, base Cmd[Msg]) Cmd[Msg] =
+    if (m.Persist) Batch[Msg](sessionLogCmd(BackendName(m.Backend), run, eval, attempts, m.SourceDir), base) else base
 
 // withIntegrate fires the output-write Cmd when a completed run has a scanned
 // workspace to emit from (and we're persisting to a real root). Off (tests, or no

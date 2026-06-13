@@ -22,6 +22,7 @@ package engine
 
 import (
     . "martianoff/gala/collection_immutable"
+    strings "martianoff/gala/strings"
     "os/exec"
 )
 
@@ -54,19 +55,77 @@ func runGitCmd(args Array[string]) ToolchainResult {
 func RealRepoCloner(runner GitRunner) RepoCloner =
     RepoCloner(Clone = (req CloneRequest) => realClone(runner, req))
 
-// realClone runs a shallow `git clone` of req.Url into req.Dest, pinning the branch/
-// tag when a Ref is given. Shallow (`--depth 1`) because the migration reads a
-// snapshot, not history. A red exit is surfaced with git's stderr.
-func realClone(runner GitRunner, req CloneRequest) CloneResult {
-    val res = runner.Run(cloneArgs(req))
-    if res.Ok { return Cloned(Path = req.Dest) }
-    return CloneFailed(Reason = "git clone exited non-zero:\n" + res.Output)
+// realClone clones req.Url into req.Dest at the requested ref, running the git steps
+// cloneStepsFor decides and stopping at the first non-zero exit (surfaced with git's
+// stderr). It handles the three Ref shapes a Go module version takes — see
+// cloneStepsFor.
+func realClone(runner GitRunner, req CloneRequest) CloneResult =
+    runClone(runner, cloneStepsFor(req), req.Dest)
+
+// cloneStepsFor is the heart of the fix for "clone failed" on most dependencies: a Go
+// module version is NOT always a git ref. It comes in three shapes, each needing a
+// different incantation:
+//   - empty Ref            -> shallow clone of the default branch.
+//   - a semver TAG (v1.2.3)-> shallow clone with `--branch <tag>` (fast; one round).
+//   - a PSEUDO-VERSION (v0.0.0-<utc>-<12hex commit>) -> there is no branch/tag with
+//     that name, so `--branch` fails ("Remote branch … not found"). The real ref is
+//     the embedded COMMIT; a short SHA can't be shallow-fetched (GitHub rejects it),
+//     so we full-clone then `git checkout <commit>`. Heavier, but it's the only
+//     reliable way to land on an exact historical commit without a module proxy.
+func cloneStepsFor(req CloneRequest) Array[Array[string]] {
+    if req.Ref == "" {
+        return ArrayOf[Array[string]](shallowClone(req.Url, req.Dest))
+    }
+    if isPseudoVersion(req.Ref) {
+        return ArrayOf[Array[string]](
+            fullClone(req.Url, req.Dest),
+            checkoutCmd(req.Dest, pseudoCommit(req.Ref)),
+        )
+    }
+    return ArrayOf[Array[string]](shallowBranchClone(req.Url, req.Ref, req.Dest))
 }
 
-// cloneArgs assembles the `git clone` argv: a shallow clone, with `--branch <ref>`
-// only when a Ref is pinned (an empty Ref takes the repo's default branch).
-func cloneArgs(req CloneRequest) Array[string] {
-    val base = ArrayOf[string]("clone", "--depth", "1")
-    val withRef = if (req.Ref == "") base else base.AppendAll(ArrayOf[string]("--branch", req.Ref))
-    return withRef.AppendAll(ArrayOf[string](req.Url, req.Dest))
+func shallowClone(url string, dest string) Array[string] =
+    ArrayOf[string]("clone", "--depth", "1", url, dest)
+
+func shallowBranchClone(url string, ref string, dest string) Array[string] =
+    ArrayOf[string]("clone", "--depth", "1", "--branch", ref, url, dest)
+
+func fullClone(url string, dest string) Array[string] =
+    ArrayOf[string]("clone", url, dest)
+
+func checkoutCmd(dest string, commit string) Array[string] =
+    ArrayOf[string]("-C", dest, "checkout", "-q", commit)
+
+// runClone runs the clone steps in order, halting at the first failure and surfacing
+// which git command failed plus its stderr (so the forest's DepFailed reason — and the
+// session log — name the exact failing step, not just "clone failed").
+func runClone(runner GitRunner, steps Array[Array[string]], dest string) CloneResult {
+    var i = 0
+    var failure = ""
+    for i < steps.Length() && failure == "" {
+        val step = steps.Get(i)
+        val res = runner.Run(step)
+        if !res.Ok { failure = "git " + step.MkString(" ") + " exited non-zero:\n" + res.Output }
+        i = i + 1
+    }
+    if failure != "" { return CloneFailed(Reason = failure) }
+    return Cloned(Path = dest)
+}
+
+// isPseudoVersion reports whether a module version is a Go PSEUDO-VERSION — its last
+// `-`-separated segment is a 12-char lowercase-hex commit prefix (e.g.
+// v0.0.0-20220119005834-d2da28d9ccfe). A real tag (v1.2.3) or a named prerelease
+// (v1.2.3-rc.1, last segment not 12-hex) is not a pseudo-version.
+func isPseudoVersion(v string) bool {
+    val parts = strings.Split(v, "-")
+    if parts.Length() < 2 { return false }
+    val last = parts.Get(parts.Length() - 1)
+    return strings.S(last).Length() == 12 && strings.Trim(last, "0123456789abcdef") == ""
+}
+
+// pseudoCommit extracts the commit prefix from a pseudo-version (its last segment).
+func pseudoCommit(v string) string {
+    val parts = strings.Split(v, "-")
+    return parts.Get(parts.Length() - 1)
 }

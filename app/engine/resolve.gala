@@ -194,20 +194,70 @@ func commentStripped(line string) string =
 // Module path -> VCS repo URL
 // ----------------------------------------------------------------------------
 
-// moduleToRepoUrl maps a module path to the https VCS repo it lives in, for the
-// hosts whose layout is "host/owner/repo[/subpath…]" (the repo is the first three
-// segments). An unknown host yields "" — the explicit unsupported signal, NOT a
-// guessed URL. Examples:
-//   github.com/x/y        -> https://github.com/x/y
-//   github.com/x/y/v2     -> https://github.com/x/y      (the major-version subpath
-//                                                          is inside the same repo)
-//   golang.org/x/tools    -> ""                           (vanity host — unsupported)
+// moduleToRepoUrl maps a module path to the https VCS repo it can be cloned from.
+// Two classes are handled:
+//   - DIRECT VCS hosts (github.com / gitlab.com / bitbucket.org): the repo is the
+//     first three path segments; a /vN major-version subpath stays inside that repo.
+//       github.com/x/y      -> https://github.com/x/y
+//       github.com/x/y/v2   -> https://github.com/x/y
+//   - KNOWN VANITY hosts (golang.org/x, gopkg.in, fyne.io): the import path is an
+//     alias for a GitHub repo, resolved by the host's well-known convention so these
+//     modules are no longer dropped as "unsupported".
+//       golang.org/x/sys    -> https://github.com/golang/sys
+//       gopkg.in/yaml.v3    -> https://github.com/go-yaml/yaml
+//       fyne.io/fyne/v2     -> https://github.com/fyne-io/fyne
+// An unrecognized host yields "" — the explicit unsupported signal, never a guessed
+// URL (other vanity hosts need go-get meta resolution, a future extension here).
 func moduleToRepoUrl(module string) string {
     val segs = strings.Split(module, "/")
-    if segs.Length() < 3 { return "" }
-    if !knownVcsHost(segs.Get(0)) { return "" }
-    return "https://" + segs.Get(0) + "/" + segs.Get(1) + "/" + segs.Get(2)
+    if segs.IsEmpty() { return "" }
+    val host = segs.Get(0)
+    if knownVcsHost(host) {
+        if segs.Length() < 3 { return "" }
+        return "https://" + host + "/" + segs.Get(1) + "/" + segs.Get(2)
+    }
+    return vanityRepoUrl(host, segs)
 }
 
 func knownVcsHost(host string) bool =
     host == "github.com" || host == "gitlab.com" || host == "bitbucket.org"
+
+// vanityRepoUrl resolves a known vanity import host to its backing GitHub repo by that
+// host's documented convention. An unknown vanity host returns "" (still unsupported).
+func vanityRepoUrl(host string, segs Array[string]) string {
+    if host == "golang.org" { return golangOrgRepo(segs) }
+    if host == "gopkg.in"   { return gopkgRepo(segs) }
+    if host == "fyne.io"    { return fyneRepo(segs) }
+    return ""
+}
+
+// golangOrgRepo: golang.org/x/<repo>[/…] is mirrored at github.com/golang/<repo>.
+func golangOrgRepo(segs Array[string]) string {
+    if segs.Length() < 3 || segs.Get(1) != "x" { return "" }
+    return "https://github.com/golang/" + segs.Get(2)
+}
+
+// gopkgRepo applies the gopkg.in convention:
+//   gopkg.in/pkg.vN       -> github.com/go-pkg/pkg
+//   gopkg.in/user/pkg.vN  -> github.com/user/pkg
+// (the `.vN` major-version suffix is stripped from the package name).
+func gopkgRepo(segs Array[string]) string {
+    if segs.Length() == 2 {
+        val pkg = stripGopkgVersion(segs.Get(1))
+        return "https://github.com/go-" + pkg + "/" + pkg
+    }
+    if segs.Length() >= 3 {
+        return "https://github.com/" + segs.Get(1) + "/" + stripGopkgVersion(segs.Get(2))
+    }
+    return ""
+}
+
+// stripGopkgVersion drops a trailing `.vN` from a gopkg.in package name ("yaml.v3" ->
+// "yaml"). The name before the version-suffix is the first ".v"-split segment.
+func stripGopkgVersion(name string) string = strings.Split(name, ".v").Get(0)
+
+// fyneRepo: fyne.io/<repo>[/vN][/…] is published from github.com/fyne-io/<repo>.
+func fyneRepo(segs Array[string]) string {
+    if segs.Length() < 2 { return "" }
+    return "https://github.com/fyne-io/" + segs.Get(1)
+}

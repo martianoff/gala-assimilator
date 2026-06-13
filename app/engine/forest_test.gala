@@ -134,7 +134,7 @@ func TestForestDepthBoundSurfacesSkip(t T) T {
 // An unresolvable dependency (vanity host, no VCS mapping) is parked DepUnsupported —
 // surfaced with a reason, never silently dropped, never a clone attempt.
 func TestForestUnsupportedDependency(t T) T {
-    val root  = materializeForestRoot("require golang.org/x/tools v0.1.0\n")
+    val root  = materializeForestRoot("require rsc.io/quote v1.5.2\n")
     val seed  = resolveForest(GoDependencyResolver(), ScanGoWorkspace(root), freshDepsBase(), DefaultMaxDepth())
     val final = driveForest(seed)
     val t1 = Eq(t, final.Deps.Length(), 1)

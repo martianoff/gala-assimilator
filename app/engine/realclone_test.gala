@@ -1,0 +1,99 @@
+package engine
+
+// Tests for the REAL cloner's step planning (realclone.gala), driven through an
+// INJECTED FAKE GitRunner — NO real `git`, no network. The fix under test: a Go module
+// version is not always a git ref, so the clone steps differ by version SHAPE (empty /
+// semver tag / pseudo-version). The pure step-builder (cloneStepsFor) is asserted
+// directly, and realClone's success/failure mapping is exercised with a fake runner.
+
+import (
+    . "martianoff/gala/collection_immutable"
+    . "martianoff/gala/std"
+    . "martianoff/gala/test"
+    strings "martianoff/gala/strings"
+)
+
+// okGit is a fake GitRunner where every step succeeds — used to assert step planning
+// and the success mapping without a real `git`.
+func okGit() GitRunner =
+    GitRunner(Run = (_ Array[string]) => ToolchainResult(Ok = true, Output = ""))
+
+// failOnGit fails any step whose argv contains `marker`, mimicking e.g. a fetch/clone
+// that exits non-zero, so realClone's failure surfacing is exercised.
+func failOnGit(marker string) GitRunner =
+    GitRunner(Run = (args Array[string]) => args.Exists((a string) => a == marker) match {
+        case true  => ToolchainResult(Ok = false, Output = "boom: " + marker)
+        case false => ToolchainResult(Ok = true, Output = "")
+    })
+
+func reqOf(ref string) CloneRequest =
+    CloneRequest(Url = "https://github.com/o/r", Ref = ref, Dest = "/d/o_r")
+
+// ----------------------------------------------------------------------------
+// Pseudo-version detection.
+// ----------------------------------------------------------------------------
+
+func TestIsPseudoVersion(t T) T {
+    val t1 = IsTrue(t,  isPseudoVersion("v0.0.0-20220119005834-d2da28d9ccfe"))
+    val t2 = IsTrue(t1, isPseudoVersion("v1.2.3-0.20210101000000-abcdef012345"))
+    val t3 = IsFalse(t2, isPseudoVersion("v1.4.0"))      // plain tag
+    val t4 = IsFalse(t3, isPseudoVersion("v1.2.3-rc.1")) // named prerelease, last seg not 12-hex
+    return IsFalse(t4, isPseudoVersion(""))
+}
+
+func TestPseudoCommitExtraction(t T) T =
+    Eq(t, pseudoCommit("v0.0.0-20220119005834-d2da28d9ccfe"), "d2da28d9ccfe")
+
+// ----------------------------------------------------------------------------
+// Step planning by version shape.
+// ----------------------------------------------------------------------------
+
+// A semver tag -> a single shallow clone pinned with `--branch <tag>`.
+func TestCloneStepsTagIsShallowBranch(t T) T {
+    val steps = cloneStepsFor(reqOf("v1.4.0"))
+    val t1 = Eq(t, steps.Length(), 1)
+    val argv = steps.Get(0)
+    val t2 = IsTrue(t1, argv.Exists((a string) => a == "--branch"))
+    val t3 = IsTrue(t2, argv.Exists((a string) => a == "v1.4.0"))
+    return IsTrue(t3, argv.Exists((a string) => a == "--depth"))   // still shallow
+}
+
+// A pseudo-version -> a FULL clone (no --depth/--branch) then a checkout of the commit.
+func TestCloneStepsPseudoIsFullCloneThenCheckout(t T) T {
+    val steps = cloneStepsFor(reqOf("v0.0.0-20220119005834-d2da28d9ccfe"))
+    val t1 = Eq(t, steps.Length(), 2)
+    val clone = steps.Get(0)
+    val checkout = steps.Get(1)
+    val t2 = IsFalse(t1, clone.Exists((a string) => a == "--branch"))  // can't branch a pseudo-version
+    val t3 = IsFalse(t2, clone.Exists((a string) => a == "--depth"))   // full clone so the commit is present
+    val t4 = IsTrue(t3, checkout.Exists((a string) => a == "checkout"))
+    return IsTrue(t4, checkout.Exists((a string) => a == "d2da28d9ccfe"))
+}
+
+// An empty ref -> a single shallow clone of the default branch (no --branch).
+func TestCloneStepsEmptyRefIsDefaultBranch(t T) T {
+    val steps = cloneStepsFor(reqOf(""))
+    val t1 = Eq(t, steps.Length(), 1)
+    return IsFalse(t1, steps.Get(0).Exists((a string) => a == "--branch"))
+}
+
+// ----------------------------------------------------------------------------
+// realClone success / failure mapping through the fake runner.
+// ----------------------------------------------------------------------------
+
+func TestRealCloneSucceeds(t T) T {
+    val cloner = RealRepoCloner(okGit())
+    return cloner.Clone(reqOf("v0.0.0-20220119005834-d2da28d9ccfe")) match {
+        case Cloned(p)      => Eq(t, p, "/d/o_r")
+        case CloneFailed(r) => Fail(t, "expected Cloned, got: " + r)
+    }
+}
+
+// A failing checkout (pseudo-version path) surfaces as CloneFailed naming the step.
+func TestRealCloneSurfacesCheckoutFailure(t T) T {
+    val cloner = RealRepoCloner(failOnGit("checkout"))
+    return cloner.Clone(reqOf("v0.0.0-20220119005834-d2da28d9ccfe")) match {
+        case CloneFailed(r) => IsTrue(t, strings.Contains(r, "checkout"))
+        case Cloned(_)      => Fail(t, "a failing checkout must surface as CloneFailed")
+    }
+}
