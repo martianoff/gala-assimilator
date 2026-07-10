@@ -18,6 +18,7 @@ package engine
 // acp.* crosses the new port methods.
 
 import (
+    "martianoff/gala/go_builtins"
     "os"
     . "martianoff/gala/std"
     . "martianoff/gala/collection_immutable"
@@ -126,7 +127,7 @@ func decodeRecent(s string) RecentIndex {
     val d = json.NewJsonDecoder(s)
     d.StartObject()
     d.ReadKey(); val v = d.ReadInt()
-    if v != 1 { panic("unsupported recent-index version") }
+    if v != 1 { go_builtins.Panic("unsupported recent-index version") }
     d.ReadKey(); val entries = decArray[RecentEntry](d, decRecentEntry)
     d.EndObject()
     return RecentIndex(Entries = entries)

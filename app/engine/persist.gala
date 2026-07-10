@@ -28,6 +28,7 @@ package engine
 // or other internal type crosses the new EnginePort methods.
 
 import (
+    "martianoff/gala/go_builtins"
     "os"
     "strconv"
     . "martianoff/gala/std"
@@ -118,7 +119,7 @@ func loadCheckpoint(path string) CheckpointLoad {
 // single filesystem; the Try captures any failure (e.g. cross-device, permissions).
 func atomicRename(from string, to string) Try[bool] = Try[bool](() => {
     val err = os.Rename(from, to)
-    if err != nil { panic(err) }
+    if err != nil { go_builtins.Panic(err.Error()) }
     return true
 })
 
@@ -305,7 +306,7 @@ func decodeCheckpoint(s string) Checkpoint {
     val d = json.NewJsonDecoder(s)
     d.StartObject()
     d.ReadKey(); val v = d.ReadInt()
-    if v != 1 { panic("unsupported checkpoint version") }
+    if v != 1 { go_builtins.Panic("unsupported checkpoint version") }
     d.ReadKey(); val units = decArray[UnitRun](d, decUnitRun)
     d.ReadKey(); val log   = decArray[EngineEvent](d, decEngineEvent)
     d.EndObject()
@@ -450,7 +451,7 @@ func decUnitStatusByTag(d *json.JsonDecoderImpl, tag string) UnitStatus {
     if tag == "done"        { d.ReadKey(); return Done(Output = decResult(d)) }
     if tag == "blocked"     { d.ReadKey(); return Blocked(Question = decClarification(d)) }
     if tag == "failed"      { d.ReadKey(); val r = d.ReadString(); return Failed(Reason = r) }
-    panic("unknown UnitStatus tag: " + tag)
+    go_builtins.Panic("unknown UnitStatus tag: " + tag)
 }
 
 func decProgressUpdate(d *json.JsonDecoderImpl) ProgressUpdate {
@@ -487,5 +488,5 @@ func decEngineEventByTag(d *json.JsonDecoderImpl, tag string) EngineEvent {
         d.ReadKey(); val reason = d.ReadString()
         return EvRetry(Unit = unit, Attempt = attempt, Reason = reason)
     }
-    panic("unknown EngineEvent tag: " + tag)
+    go_builtins.Panic("unknown EngineEvent tag: " + tag)
 }
