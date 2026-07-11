@@ -1,6 +1,6 @@
 module github.com/martianoff/gala-assimilator
 
-gala dev
+gala 0.70.0
 
 require (
 	github.com/martianoff/gala-acp v0.2.0
