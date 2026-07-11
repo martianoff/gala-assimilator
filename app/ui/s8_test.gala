@@ -179,15 +179,15 @@ func completeButUnconvertedForest() engine.DependencyForest =
         mkDepRun("github.com/acme/deep2", 6, engine.DepSkipped()),
         mkDepRun("github.com/acme/deep3", 6, engine.DepSkipped())))
 
-// A complete-but-unconverted forest must NOT claim "complete ✓": it reads "stopped ·
-// N left" and counts the parked (depth-bound) nodes in the roll-up, so a deep chain
-// with unconverted subtrees never looks fully migrated.
-func TestS8CompleteWithUnconvertedReadsStopped(t T) T {
+// A forest that has reached its fixpoint reads "complete ✓" alongside the
+// converted/total roll-up (2/7); the parked (depth-bound) nodes still surface their
+// "parked at depth bound" reason so the operator can expand to convert them.
+func TestS8CompleteForestReadsComplete(t T) T {
     val m = s8Model(110, 30, completeButUnconvertedForest())
     val out = str.S(Snapshot(view(m), 110, 30))
-    val t1 = IsTrue(t,  out.Contains("stopped · 5 left"))                  // 7 total − 2 done
-    val t2 = IsFalse(t1, out.Contains("complete ✓"))                      // never the green check
-    return IsTrue(t2, out.Contains("parked 3 beyond depth 5"))            // parked counted + bound named
+    val t1 = IsTrue(t,  out.Contains("complete ✓"))                        // fixpoint → green check
+    val t2 = IsTrue(t1, out.Contains("2/7 deps done"))                    // converted/total roll-up
+    return IsTrue(t2, out.Contains("parked at depth bound"))              // parked deps name the bound
 }
 
 // The parked-node reason keeps its "expand to convert" call-to-action (it leads, so
@@ -198,33 +198,33 @@ func TestS8ParkedReasonKeepsExpandCta(t T) T {
     return IsTrue(t, out.Contains("expand to convert"))
 }
 
-// While the transitive frontier is still expanding (a pending node remains), the
-// indicator says "discovering…" and the count is marked provisional with a ~.
-func TestS8DiscoveringMarksProvisional(t T) T {
+// While the forest is still iterating (a pending node remains, so it hasn't reached a
+// fixpoint), the loop indicator reads "resolving…" and the roll-up shows the running count.
+func TestS8IteratingForestReadsResolving(t T) T {
     val m = s8Model(110, 30, renderForest())   // has a DepPending node
     val out = str.S(Snapshot(view(m), 110, 30))
-    val t1 = IsTrue(t, out.Contains("discovering…"))
-    return IsTrue(t1, out.Contains("~1/6"))                               // provisional denominator
+    val t1 = IsTrue(t, out.Contains("resolving…"))
+    return IsTrue(t1, out.Contains("1/6 (16%)"))                          // running count
 }
 
-// Once the frontier has settled (no pending/cloning/resolved) but sub-runs are still
-// assimilating, the indicator distinguishes "converting…" from discovery.
-func TestS8ConvertingWhenFrontierSettled(t T) T {
+// A forest with a still-assimilating sub-run has not reached its fixpoint, so the loop
+// indicator reads "resolving…" with the running converted/total count.
+func TestS8AssimilatingForestReadsResolving(t T) T {
     val forest = mkDepForest(ArrayOf[engine.DependencyRun](
         mkDepRun("github.com/acme/a", 1, engine.DepDone()),
         mkDepRun("github.com/acme/b", 2, engine.DepAssimilating(Run = subRun()))))
     val m = s8Model(110, 30, forest)
     val out = str.S(Snapshot(view(m), 110, 30))
-    val t1 = IsTrue(t,  out.Contains("converting…"))
-    return IsFalse(t1, out.Contains("discovering…"))
+    val t1 = IsTrue(t,  out.Contains("resolving…"))
+    return IsTrue(t1, out.Contains("1/2 (50%)"))
 }
 
-// The cursor row names the cursored node's depth, so wayfinding in a deep tree isn't
-// indentation-only.
-func TestS8CursorRowShowsDepth(t T) T {
-    val m = s8Model(110, 30, renderForest())   // cursor starts at row 0, depth 1
+// The actions echo above the bar names the cursored node together with its status label
+// (the cursor starts on the first row — github.com/acme/depa, which is [done]).
+func TestS8ActionsEchoNamesCursoredNode(t T) T {
+    val m = s8Model(110, 30, renderForest())   // cursor starts at row 0 → depa [done]
     val out = str.S(Snapshot(view(m), 110, 30))
-    return IsTrue(t, out.Contains("(depth 1)"))
+    return IsTrue(t, out.Contains("Actions for github.com/acme/depa v1.0.0  [done]"))
 }
 
 // A project with no external dependencies says so plainly (distinct from resolving).

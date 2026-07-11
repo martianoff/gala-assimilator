@@ -19,6 +19,7 @@ package engine
 // at this edge; NO gala_tui, NO app/ui, no acp.* crosses the new port methods.
 
 import (
+    "martianoff/gala/go_builtins"
     . "martianoff/gala/std"
     . "martianoff/gala/collection_immutable"
     "martianoff/gala/fs"
@@ -181,7 +182,7 @@ func decodeForest(s string) DependencyForest {
     val d = json.NewJsonDecoder(s)
     d.StartObject()
     d.ReadKey(); val v = d.ReadInt()
-    if v != 1 { panic("unsupported forest version") }
+    if v != 1 { go_builtins.Panic("unsupported forest version") }
     d.ReadKey(); val maxDepth = d.ReadInt()
     d.ReadKey(); val depsBase = d.ReadString()
     d.ReadKey(); val visited  = decArray[string](d, decStr)
@@ -236,7 +237,7 @@ func decDepResolutionByTag(d *json.JsonDecoderImpl, tag string) DepResolution {
     if tag == "skipped"      { return DepSkipped() }
     if tag == "unsupported"  { d.ReadKey(); val r = d.ReadString(); return DepUnsupported(Reason = r) }
     if tag == "failed"       { d.ReadKey(); val r = d.ReadString(); return DepFailed(Reason = r) }
-    panic("unknown DepResolution tag: " + tag)
+    go_builtins.Panic("unknown DepResolution tag: " + tag)
 }
 
 func decRunState(d *json.JsonDecoderImpl) RunState {
