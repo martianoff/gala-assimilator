@@ -24,6 +24,7 @@ package engine
 import (
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    "martianoff/gala/concurrent"
     "martianoff/gala/fs"
     "martianoff/gala/path"
 )
@@ -153,6 +154,15 @@ sealed type OriginScan {
 // A GitRepo is cloned into `dest` first; a failed clone is OriginUnsupported, never
 // a silent empty scan. This is the single bridge GitRepo -> cloned path ->
 // ScanGoWorkspace, reused by both a one-shot start and the dependency forest.
+// ScanOriginAsync is ScanOrigin off the caller's thread: the clone shells out to
+// `git` and the scan walks the cloned tree, so neither may run on a UI update loop.
+// The boundary lives here, at the engine edge, because a closure crossing it may
+// only capture shareable state — a RepoCloner is a record of function values, so
+// the caller vouches for it with Sendable and the check lands where the cloner is
+// actually built.
+func ScanOriginAsync(cloner Sendable[RepoCloner], origin SourceOrigin, dest string) concurrent.Future[OriginScan] =
+    concurrent.Future(ScanOrigin(cloner, origin, dest))
+
 func ScanOrigin(cloner RepoCloner, origin SourceOrigin, dest string) OriginScan = origin match {
     case LocalPath(root) => OriginScanned(Path = root, Workspace = ScanGoWorkspace(root))
     case GitRepo(url, ref) => cloner.Clone(CloneRequest(Url = url, Ref = ref, Dest = dest)) match {

@@ -19,11 +19,12 @@ package engine
 // at this edge; NO gala_tui, NO app/ui, no acp.* crosses the new port methods.
 
 import (
-    "martianoff/gala/go_builtins"
     . "martianoff/gala/std"
     . "martianoff/gala/collection_immutable"
     "martianoff/gala/fs"
+    "martianoff/gala/go_builtins"
     json "martianoff/gala/json"
+    gpath "martianoff/gala/path"
 )
 
 // ForestLoad is the sealed result of reading a forest checkpoint: the restored forest,
@@ -42,6 +43,9 @@ sealed type ForestLoad {
 // ----------------------------------------------------------------------------
 
 func saveForest(forest DependencyForest, path string) bool {
+    // Ensure the forest checkpoint's directory exists — same reason as
+    // saveCheckpoint: the save runs off the caller's thread, so the write owns it.
+    fs.MkdirAll(gpath.Dir(path), 493)   // 0755
     val body = encodeForest(forest)
     val tmp  = path + ".tmp"
     if fs.WriteFileString(tmp, body, 420).IsFailure() { return false }

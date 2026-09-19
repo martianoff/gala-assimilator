@@ -39,6 +39,17 @@ package, not separate sibling packages — see "Seam notes" for why.)
   surface: `Scan`, `Plan`, `Run`, `Advance`, `Events`, `ActOnUnit`,
   `AnswerBlocker`, `Checkpoint`/`Resume` (+ disk save/load). No direct calls into
   engine internals.
+- **The engine owns the concurrency boundary, not the UI.** The operations the UI
+  must run off its Update loop also exist as `*Async` fields returning an
+  already-running `concurrent.Future[T]`; the UI just maps the result to a `Msg`
+  and wraps it in `FutureCmd`. This is forced by GALA's compile-time data-race
+  safety (`GALA-E0037`): a closure crossing a `Sendable` boundary may capture only
+  deeply-immutable state, and a port is a record of function values, which is never
+  shareable — so the closure literal has to live where the engine's own injected
+  collaborators are in scope. Those collaborators (the runner, verifier, project
+  gate, repo cloner) are declared `Sendable[...]` on the engine constructors, which
+  pushes the "captures only immutable state" vouch to the composition root. What
+  crosses the port is still pure data: `Future[T]` is std, never an engine internal.
 - **The agent-run contract (`acp.*`) never crosses the port.** The engine adapts
   gala-acp's generic types to its own domain values at the boundary, so swapping
   the agent backend (mock ↔ live Claude) touches nothing in the UI.

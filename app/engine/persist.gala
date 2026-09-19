@@ -28,13 +28,14 @@ package engine
 // or other internal type crosses the new EnginePort methods.
 
 import (
-    "martianoff/gala/go_builtins"
     "os"
     "strconv"
     . "martianoff/gala/std"
     . "martianoff/gala/collection_immutable"
     "martianoff/gala/fs"
+    "martianoff/gala/go_builtins"
     json "martianoff/gala/json"
+    gpath "martianoff/gala/path"
     tu "martianoff/gala/time_utils"
 )
 
@@ -69,6 +70,11 @@ struct SaveResult(
 // backoff. The temp name is per-process-unique (pid + nanos) so two concurrent
 // saves never collide on the same sibling file.
 func saveCheckpoint(state RunState, path string) SaveResult {
+    // Ensure the checkpoint's own directory exists. The write owns this: the save
+    // runs off the caller's thread now, so a caller can no longer create the folder
+    // just before calling in. Ignore the result — the write below reports the real
+    // failure with a reason the UI can show.
+    fs.MkdirAll(gpath.Dir(path), 493)   // 0755
     val cp   = Checkpoint(Units = state.Units, Log = state.Log)
     val body = encodeCheckpoint(cp)
     val tmp  = path + uniqueSuffix()
@@ -119,7 +125,10 @@ func loadCheckpoint(path string) CheckpointLoad {
 // single filesystem; the Try captures any failure (e.g. cross-device, permissions).
 func atomicRename(from string, to string) Try[bool] = Try[bool](() => {
     val err = os.Rename(from, to)
-    if err != nil { go_builtins.Panic(err.Error()) }
+    // Panic with the error VALUE, not its text: Try captures it as-is, so the
+    // rename failure keeps its identity for anything that later wants more than
+    // the message (which is all saveCheckpoint reads today).
+    if err != nil { go_builtins.Panic(err) }
     return true
 })
 

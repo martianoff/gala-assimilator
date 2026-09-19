@@ -5,6 +5,7 @@ import (
     "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    "martianoff/gala/concurrent"
 )
 
 // ============================================================================
@@ -119,7 +120,10 @@ struct Model(
     // (engine.ScanOrigin over a RepoCloner). The local-path origin never touches
     // it: it scans through Port.Scan exactly as before. The app wires the real git
     // cloner here; tests inject a deterministic stub.
-    ScanGit  func(engine.SourceOrigin, string) engine.OriginScan,
+    // It hands back an already-running Future because the clone must not block the
+    // Update loop and the UI cannot spawn that goroutine itself: the closure would
+    // capture this very function value, which is never shareable (GALA-E0037).
+    ScanGit  func(engine.SourceOrigin, string) concurrent.Future[engine.OriginScan],
     Cols     int,
     Rows     int,
     Frame    int,   // animation frame counter — advanced by ticks while loading/running

@@ -196,7 +196,7 @@ struct ReferenceGateReport(
 // builds/tests in its OWN os.TempDir scratch module, so this never touches the
 // project workspace. It is invoked only from cmd/verifygate, never the offline suite
 // (which would risk the nested-`gala` workspace-contention bug).
-func RunReferenceVerifyGate(runner ToolchainRunner) ReferenceGateReport {
+func RunReferenceVerifyGate(runner Sendable[ToolchainRunner]) ReferenceGateReport {
     val verifier = RealVerifier(runner)
     val passRes  = verifier.Verify(referenceVerifyRequest(referenceGalaTarget()))
     val failRes  = verifier.Verify(referenceVerifyRequest(referenceWrongTarget()))
@@ -230,7 +230,7 @@ func checkMark(ok bool) string = ok match {
 // fix loop against the REAL gate: attempt 1 emits the wrong target (red test),
 // retryOrFail re-translates with the real diagnostics, attempt 2 emits the golden
 // target (green) and the unit settles Done. Returns whether the unit reached Done.
-func referenceFixLoopReachesDone(runner ToolchainRunner) bool {
+func referenceFixLoopReachesDone(runner Sendable[ToolchainRunner]) bool {
     val port  = MockEngineWithVerifier(referenceFixLoopTranslator(), RealVerifier(runner))
     val final = RunToCompletion(port, port.Run(referenceFixLoopPlan()))
     return final.Units.Exists((u UnitRun) => doneTarget(u).IsDefined())
