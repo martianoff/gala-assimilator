@@ -29,6 +29,7 @@ package engine
 import (
     . "martianoff/gala/std"
     . "martianoff/gala/collection_immutable"
+    "martianoff/gala/concurrent"
     strings "martianoff/gala/strings"
     acp "github.com/martianoff/gala-acp"
     . "github.com/martianoff/gala-acp/agent"
@@ -63,11 +64,9 @@ func ClaudeEngineRealVerify() EnginePort =
 //   - "go"            — the real Go frontend on the deterministic mock translator.
 //   - anything else   — the fully offline stub engine (the safe default: no IO, no
 //                       credentials).
-// It lives in the engine (not cmd) on purpose: under the 0.49.2 toolchain a
-// non-entry package's self-import is not rewritten, so `cmd` importing the engine
-// would break the whole-workspace `gala test`. The UI entrypoint calls this once
-// it is the build's entry (where self-imports DO resolve), keeping selection in
-// one tested place meanwhile.
+// It lives in the engine (not cmd) on purpose: backend selection is engine policy,
+// and keeping it here means it is covered by the engine's own tests rather than
+// only by an entrypoint the suite never builds. Each cmd just calls it.
 func SelectBackend(name string) EnginePort {
     if name == "claude"        { return ClaudeEngine() }
     if name == "claude-verify" { return ClaudeEngineRealVerify() }
@@ -120,15 +119,31 @@ func claudeSubmit(
 // event stream to a terminus, and closes the session. Steps are a faithful
 // reading -> emitting prefix; the boundary maps them to the public ProgressPhase.
 func runClaudeTurn(session AgentSession, a TaskAssignment) acp.RunTranscript[Result, Clarification] {
-    session.Send(PromptInput(Text = buildPrompt(a)))
-    session.EndTurn()
-    val outcome = pumpClaude(session, a.Task, "")
+    val outcome = startClaudeTurn(session, a) match {
+        case Failure(e) => abortOutcome("failed to start claude turn: " + e.Error())
+        case Success(_) => pumpClaude(session, a.Task, "")
+    }
     session.Close()
     return acp.RunTranscript[Result, Clarification](
         Steps = claudeSteps(a.Task),
         Final = outcome,
     )
 }
+
+// startClaudeTurn delivers the prompt, then signals end-of-turn. Both writes are
+// async on the agent port, so each is awaited before the next: the child's stdin
+// must see the prompt before it sees EOF. A delivery failure is returned rather
+// than dropped — silently losing a write would leave the pump waiting on a turn
+// the agent was never asked to run.
+func startClaudeTurn(session AgentSession, a TaskAssignment) Try[Void] =
+    awaitWrite(session.SendAsync(PromptInput(Text = buildPrompt(a))))
+        .FlatMap((_) => awaitWrite(session.EndTurnAsync()))
+
+// awaitWrite collapses an async write's two failure layers into one: the outer Try
+// is the Future itself failing, the inner Try is the write being rejected. Either
+// way the prompt did not reach the agent, so they fold into a single Try.
+func awaitWrite(f concurrent.Future[Try[Void]]) Try[Void] =
+    f.Await().FlatMap((inner) => inner)
 
 func claudeSteps(task TaskId) Array[acp.RunStep] =
     ArrayOf[acp.RunStep](

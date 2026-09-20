@@ -6,6 +6,7 @@ import (
     "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    "martianoff/gala/concurrent"
     str "martianoff/gala/strings"
     . "martianoff/gala/time_utils"
 )
@@ -61,6 +62,7 @@ sealed type Msg {
     case MForestSaved(Ok bool)
     case MForestLoaded(Load engine.ForestLoad)
     case MScanFailed(Reason string)            // a git-origin clone/scan failure
+    case MOriginScanned(Scan engine.OriginScan) // a git-origin acquisition landed, not yet planned
 
     // S7 directory picker
     case MBrowseLoaded(State BrowseState)      // async listing landed
@@ -177,6 +179,7 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MRunAdvanced(next)     => applyAdvance(m, next)
     case MTick()                => animTick(m)
     case MScanFailed(reason)    => (m.Copy(Scanning = false, ScanError = reason), NoCmd[Msg]())
+    case MOriginScanned(os)     => originScanned(m, os)
 
     case MOpenDeps()         => openDeps(m)
     case MDepSelect(i)       => (depSelect(m, i), NoCmd[Msg]())
@@ -554,10 +557,11 @@ func startScan(m Model) Tuple[Model, Cmd[Msg]] {
     val port = m.MakePort(BackendName(m.Backend))
     if (m.OriginGit) { return startGitScan(m, port) }
     val root = m.SourceDir
-    val cmd = Async[engine.WorkspaceModel, Msg](
-        () => port.Scan(engine.ScanRequest(Root = root)),
-        (ws) => MScanPlanned(Workspace = ws, Plan = port.Plan(ws)),
-    )
+    // Scan AND plan in one off-loop round trip: the port cannot be reached from a
+    // Future's continuation (see checkpoint.gala's header), so the plan is produced
+    // alongside the workspace rather than by a mapper calling back into Plan.
+    val cmd = FutureCmd[Msg](Fut = port.ScanPlanAsync(engine.ScanRequest(Root = root))
+        .Map((sp) => MScanPlanned(Workspace = sp.Workspace, Plan = sp.Plan)))
     val m2 = m.Copy(Port = port, Scanning = true, ScanError = "")
     return (m2, withAnim(m, m2, cmd))
 }
@@ -571,20 +575,25 @@ func startGitScan(m Model, port engine.EnginePort) Tuple[Model, Cmd[Msg]] {
     val origin = engine.GitOrigin(m.RepoUrl, m.RepoRef)
     val dest = gitCloneDest(m.RepoUrl)
     val scan = m.ScanGit
-    val cmd = Async[engine.OriginScan, Msg](
-        () => scan(origin, dest),
-        (os) => originScanToMsg(port, os),
-    )
+    // ScanGit hands back an already-running Future, so the clone stays off the loop
+    // without the UI spawning the goroutine. The acquired origin comes back as its
+    // own message: classifying it needs the port, which cannot be reached from a
+    // Future's continuation (see checkpoint.gala's header), so the plan is built by
+    // a second off-loop command once we are back on the update thread.
+    val cmd = FutureCmd[Msg](Fut = scan(origin, dest).Map((os) => MOriginScanned(Scan = os)))
     val m2 = m.Copy(Port = port, Scanning = true, ScanError = "")
     return (m2, withAnim(m, m2, cmd))
 }
 
-// originScanToMsg classifies the acquired origin (the sealed-type match lives in
-// runview) and routes a successful scan into MScanPlanned, a failure into MScanFailed.
-func originScanToMsg(port engine.EnginePort, os engine.OriginScan) Msg {
+// originScanned classifies the acquired origin (the sealed-type match lives in
+// runview): a successful scan plans off the loop and lands as MScanPlanned, a
+// failure surfaces on S1 as MScanFailed.
+func originScanned(m Model, os engine.OriginScan) Tuple[Model, Cmd[Msg]] {
     val sum = runview.ClassifyOrigin(os)
-    if (sum.Ok) { return MScanPlanned(Workspace = sum.Workspace, Plan = port.Plan(sum.Workspace)) }
-    return MScanFailed(Reason = sum.Reason)
+    if (!sum.Ok) { return update(m, MScanFailed(Reason = sum.Reason)) }
+    val ws = sum.Workspace
+    return (m, FutureCmd[Msg](Fut = m.Port.PlanAsync(ws)
+        .Map((plan) => MScanPlanned(Workspace = ws, Plan = plan))))
 }
 
 // scanPlanned routes to the S2 plan summary and kicks off dependency resolution off
@@ -608,10 +617,7 @@ func scanPlanned(m Model, ws engine.WorkspaceModel, plan engine.MigrationPlan) T
 // resolveDepsCmd resolves the scanned workspace's dependencies into a forest off the
 // Update loop. A rootless / dependency-free project yields an empty forest (no-op).
 func resolveDepsCmd(port engine.EnginePort, ws engine.WorkspaceModel) Cmd[Msg] =
-    Async[engine.DependencyForest, Msg](
-        () => port.ResolveDeps(ws),
-        (f) => MDepsResolved(Forest = f),
-    )
+    FutureCmd[Msg](Fut = port.ResolveDepsAsync(ws).Map((f) => MDepsResolved(Forest = f)))
 
 // startRun is the "start assimilation" path. When persisting (the live app) it
 // first runs an off-loop PRE-FLIGHT writability probe of the checkpoint location:
@@ -631,11 +637,7 @@ func startRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
 // launchRun materializes the run off the loop and routes (via MRunStarted) to S3.
 func launchRun(m Model) Tuple[Model, Cmd[Msg]] = m.Plan match {
     case Some(plan) => {
-        val port = m.Port
-        val cmd = Async[engine.RunState, Msg](
-            () => port.Run(plan),
-            (st) => MRunStarted(State = st),
-        )
+        val cmd = FutureCmd[Msg](Fut = m.Port.RunAsync(plan).Map((st) => MRunStarted(State = st)))
         return (m, cmd)
     }
     case None() => noCmd(m)
@@ -681,7 +683,7 @@ func runTick(m Model) Tuple[Model, Cmd[Msg]] = m.Run match {
 // switches and dead clicks. The result lands as MRunAdvanced; the spinner keeps
 // turning meanwhile on the independent anim timer.
 func advanceCmd(m Model, st engine.RunState) Cmd[Msg] =
-    Async[engine.RunState, Msg](() => m.Port.Advance(st), (next) => MRunAdvanced(State = next))
+    FutureCmd[Msg](Fut = m.Port.AdvanceAsync(st).Map((next) => MRunAdvanced(State = next)))
 
 // applyAdvance installs a freshly-advanced run state, auto-saves it (when
 // persisting), and chains the next advance off the loop while work remains. Shared

@@ -91,7 +91,10 @@ func runToolchainCmd(dir string, command string, args Array[string]) ToolchainRe
 // RealVerifier builds the verify gate over an injected toolchain runner. The pure
 // mapping (materialize -> build -> test -> VerifyResult) is the same regardless of
 // whether the runner is the real `gala` or a test fake.
-func RealVerifier(runner ToolchainRunner) Verifier =
+// The runner is Sendable because the Verifier this builds is itself handed to the
+// engine's async seam, which captures it into a goroutine body: the vouch that the
+// injected toolchain runner closes over only immutable state rides up to here.
+func RealVerifier(runner Sendable[ToolchainRunner]) Verifier =
     Verifier(Verify = (req VerifyRequest) => realVerify(runner, req))
 
 // realVerify materializes the unit into an isolated scratch module, runs the gate

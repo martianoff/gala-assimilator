@@ -18,11 +18,11 @@ package engine
 // acp.* crosses the new port methods.
 
 import (
-    "martianoff/gala/go_builtins"
     "os"
     . "martianoff/gala/std"
     . "martianoff/gala/collection_immutable"
     "martianoff/gala/fs"
+    "martianoff/gala/go_builtins"
     "martianoff/gala/path"
     json "martianoff/gala/json"
     tu "martianoff/gala/time_utils"
@@ -91,7 +91,7 @@ func LoadRecentFrom(p string) RecentIndex {
 // failure is reported as false, never thrown.
 func SaveRecentTo(p string, idx RecentIndex) bool {
     fs.MkdirAll(path.Dir(p), 493)
-    return fs.WriteFileString(p, encodeRecent(idx), 420).GetOrElse(false)
+    return !fs.WriteFileString(p, encodeRecent(idx), 420).IsFailure()
 }
 
 // RecordRecentTo upserts an entry into the index at `p` and writes it back.

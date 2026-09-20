@@ -16,6 +16,7 @@ package engine
 import (
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    "martianoff/gala/concurrent"
     acp "github.com/martianoff/gala-acp"
 )
 
@@ -27,14 +28,14 @@ func GoEngine() EnginePort = GoEngineWith(MockTranslator())
 // GoEngineWith builds the real-frontend engine over a caller-supplied translator
 // (with the default MockVerifier), so a future real backend (or a ScriptedRunner
 // in tests) drops in unchanged.
-func GoEngineWith(runner acp.AgentRunner[TaskAssignment, Result, Clarification]) EnginePort = GoEngineWithVerifier(runner, MockVerifier())
+func GoEngineWith(runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]]) EnginePort = GoEngineWithVerifier(runner, MockVerifier())
 
 // GoEngineWithVerifier builds the real-frontend engine over a caller-supplied
 // runner AND verifier — the seam where a real `gala test` verifier replaces the
 // mock once translation emits real GALA, with no change to the scan -> plan -> run
 // -> gate pipeline. Uses the default per-unit fix-loop cap; GoEngineWithVerifierCap
 // sets a custom one.
-func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier) EnginePort =
+func GoEngineWithVerifier(runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]], verifier Sendable[Verifier]) EnginePort =
     GoEngineWithVerifierCap(runner, verifier, DefaultMaxAttempts())
 
 // GoEngineWithVerifierCap is GoEngineWithVerifier with a configurable per-unit
@@ -42,13 +43,21 @@ func GoEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarifi
 // MockProjectGate for the whole-project gate (its default mock translator emits no
 // compilable GALA); GoEngineWithGate injects the REAL toolchain gate for the live
 // backend (ClaudeEngine).
-func GoEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort =
+func GoEngineWithVerifierCap(runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]], verifier Sendable[Verifier], maxAttempts int) EnginePort =
     GoEngineWithGate(runner, verifier, maxAttempts, MockProjectGate())
 
 // GoEngineWithGate is GoEngineWithVerifierCap plus an injected ProjectGate — the seam
 // where the live backend wires the real `gala build`/`gala test` whole-project gate
 // (ToolchainProjectGate) while the offline frontends keep the always-green stub.
-func GoEngineWithGate(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int, gate ProjectGate) EnginePort = EnginePort(
+// The injected collaborators are Sendable for the same reason as MockEngineWithGate's
+// (port.gala): the async fields capture them into goroutine bodies, so the caller
+// vouches that they close over only immutable state.
+func GoEngineWithGate(
+    runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]],
+    verifier Sendable[Verifier],
+    maxAttempts int,
+    gate Sendable[ProjectGate],
+) EnginePort = EnginePort(
     Scan          = (req ScanRequest) => ScanGoWorkspace(req.Root),
     Plan          = (m WorkspaceModel) => goPlanFor(m),
     Run           = (p MigrationPlan) => runFor(p),
@@ -72,7 +81,27 @@ func GoEngineWithGate(runner acp.AgentRunner[TaskAssignment, Result, Clarificati
     ActOnDependency = (f DependencyForest, id DependencyId, a DepAction) => actOnDependency(f, id, a),
     SaveForest      = (f DependencyForest, path string) => saveForest(f, path),
     LoadForest      = (path string) => loadForest(path),
+    // Off-thread faces — same operations, same collaborators, wrapped at the seam.
+    ScanPlanAsync        = (req ScanRequest) => concurrent.Future(goScanPlan(req.Root)),
+    PlanAsync            = (m WorkspaceModel) => concurrent.Future(goPlanFor(m)),
+    RunAsync             = (p MigrationPlan) => concurrent.Future(runFor(p)),
+    AdvanceAsync         = (s RunState) => concurrent.Future(advance(runner, verifier, maxAttempts, s)),
+    SaveCheckpointAsync  = (s RunState, path string) => concurrent.Future(saveCheckpoint(s, path)),
+    LoadCheckpointAsync  = (path string) => concurrent.Future(loadCheckpoint(path)),
+    IntegrateAsync       = (s RunState, m WorkspaceModel, outRoot string) => concurrent.Future(integrateProject(s, m, outRoot)),
+    EvaluateProjectAsync = (s RunState, m WorkspaceModel) => concurrent.Future(gate.Evaluate(s, m)),
+    ResolveDepsAsync     = (m WorkspaceModel) => concurrent.Future(resolveForest(SelectResolver("go"), m, depsBaseFor(m), DefaultMaxDepth())),
+    SaveForestAsync      = (f DependencyForest, path string) => concurrent.Future(saveForest(f, path)),
+    LoadForestAsync      = (path string) => concurrent.Future(loadForest(path)),
 )
+
+// goScanPlan is the real frontend's scan-then-plan round trip: read the project from
+// disk, then build the plan from it. Folded into one value so the UI's off-thread
+// scan never has to call back into the port from a Future continuation.
+func goScanPlan(root string) ScanPlan {
+    val ws = ScanGoWorkspace(root)
+    return ScanPlan(Workspace = ws, Plan = goPlanFor(ws))
+}
 
 // goPlanFor builds the plan from a scanned workspace, threading each unit's REAL
 // source text (and a best-effort dependency list parsed from its imports) into the

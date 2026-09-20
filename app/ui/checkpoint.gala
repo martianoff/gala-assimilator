@@ -3,6 +3,7 @@ package ui
 import (
     . "github.com/martianoff/gala-tui"
     "github.com/martianoff/gala-assimilator/app/engine"
+    "martianoff/gala/concurrent"
     "martianoff/gala/fs"
     "martianoff/gala/path"
 )
@@ -11,9 +12,9 @@ import (
 // Checkpoint paths + the save effect.
 //
 // The checkpoint lives at a stable per-project location: <source-root>/
-// .assimilator/state.json. The UI never blocks on IO — saving is wrapped in an
-// Async Cmd (saveCmd) the runtime drains; doSave is the pure-ish effect it runs
-// (ensure the dir, then SaveCheckpoint through the engine port).
+// .assimilator/state.json. The UI never blocks on IO — saveCmd wraps the engine's
+// off-thread save in a Cmd the runtime drains; doSave is the same operation awaited,
+// for tests that want the result inline.
 // ============================================================================
 
 // CheckpointDir is the per-project state directory.
@@ -33,68 +34,81 @@ func OutputDir(root string) string = path.Join(CheckpointDir(root), "out")
 // so the forest persists alongside the run state.
 func ForestCheckpointPath(root string) string = path.Join(CheckpointDir(root), "forest.json")
 
-// doSave ensures the state dir exists, then persists the run via the port.
-// Returns the port's SaveResult (Ok=false carrying the reason on any IO failure —
-// never throws), so the UI can surface exactly WHY a save failed.
-func doSave(port engine.EnginePort, state engine.RunState, root string) engine.SaveResult {
-    fs.MkdirAll(CheckpointDir(root), 493)   // 0755; ignore result — SaveCheckpoint reports failure
-    return port.SaveCheckpoint(state, CheckpointPath(root))
-}
+// ============================================================================
+// Why these commands are built from engine-supplied Futures rather than Async.
+//
+// gala_tui's Async takes a Sendable closure: whatever it captures must be deeply
+// immutable, because it runs on another goroutine. An EnginePort is a record of
+// function values, which is never shareable, so a closure that reaches into the
+// port cannot cross that boundary (GALA-E0037). The engine therefore owns the
+// boundary — its *Async fields hand back an already-running Future — and the UI
+// only maps the result to a Msg and wraps it in FutureCmd. The work still happens
+// off the Update loop exactly as before; only the side that spawns it moved.
+// ============================================================================
+
+// doSave persists the run through the port and waits for it — the synchronous face
+// of what saveCmd does off the loop, driving the SAME engine operation so a test
+// exercises the real save path rather than a parallel one. Returns the port's
+// SaveResult (Ok=false carrying the reason on any IO failure — never throws), so
+// the UI can surface exactly WHY a save failed.
+func doSave(port engine.EnginePort, state engine.RunState, root string) engine.SaveResult =
+    port.SaveCheckpointAsync(state, CheckpointPath(root)).Await().Get()
+
+// doIntegrate writes the completed migration to <root>/.assimilator/out and waits
+// for it — the synchronous face of integrateCmd, over the same engine operation.
+func doIntegrate(
+    port engine.EnginePort,
+    state engine.RunState,
+    model engine.WorkspaceModel,
+    root string,
+) engine.IntegrateResult =
+    port.IntegrateAsync(state, model, OutputDir(root)).Await().Get()
 
 // saveCmd persists the run off the Update loop; the result surfaces as
 // MCheckpointSaved so the UI can show a save indicator (and the failure reason). On
 // a successful save it ALSO records the project in the user-level recent-projects
 // index (best-effort), so a later launch can offer to resume THIS project — not just
-// one hardcoded default path.
+// one hardcoded default path. The state directory is created by the engine's write.
 func saveCmd(port engine.EnginePort, state engine.RunState, root string) Cmd[Msg] =
-    Async[engine.SaveResult, Msg](
-        () => saveAndRecord(port, state, root),
-        (res) => MCheckpointSaved(Ok = res.Ok, Reason = res.Reason),
-    )
+    FutureCmd[Msg](Fut = port.SaveCheckpointAsync(state, CheckpointPath(root))
+        .Map((res) => recordSaved(res, state, root)))
 
-// saveAndRecord persists the checkpoint and, on success, upserts the recent-projects
-// index entry for this root with the latest progress. The recent write is best-effort
-// — it never changes the save's own success/failure.
-func saveAndRecord(port engine.EnginePort, state engine.RunState, root string) engine.SaveResult {
-    val res = doSave(port, state, root)
+// recordSaved upserts the recent-projects index entry for this root with the latest
+// progress on a successful save, then turns the result into its Msg. The recent
+// write is best-effort — it never changes the save's own success/failure.
+func recordSaved(res engine.SaveResult, state engine.RunState, root string) Msg {
     if (res.Ok) {
         engine.RecordRecent(root, engine.CountByDone(state), state.Units.Length(), engine.NowMillis())
     }
-    return res
+    return MCheckpointSaved(Ok = res.Ok, Reason = res.Reason)
 }
 
 // loadCmd reads the checkpoint off the loop; the result surfaces as
 // MResumeLoaded (used by the S6 resume affordance).
 func loadCmd(port engine.EnginePort, root string) Cmd[Msg] =
-    Async[engine.CheckpointLoad, Msg](
-        () => port.LoadCheckpoint(CheckpointPath(root)),
-        (load) => MResumeLoaded(Load = load),
-    )
+    FutureCmd[Msg](Fut = port.LoadCheckpointAsync(CheckpointPath(root))
+        .Map((load) => MResumeLoaded(Load = load)))
 
-// doIntegrate writes the completed migration to <root>/.assimilator/out via the
-// engine port, returning the IntegrateResult (file list or failure reason). The
-// output root is created as part of the engine's emit (writeOne mkdir's parents).
-func doIntegrate(port engine.EnginePort, state engine.RunState, model engine.WorkspaceModel, root string) engine.IntegrateResult =
-    port.Integrate(state, model, OutputDir(root))
-
-// integrateCmd writes the migrated project off the Update loop once a run is
-// complete; the result surfaces as MIntegrated so the UI can show WHERE the output
-// landed (or the failure reason).
-func integrateCmd(port engine.EnginePort, state engine.RunState, model engine.WorkspaceModel, root string) Cmd[Msg] =
-    Async[engine.IntegrateResult, Msg](
-        () => doIntegrate(port, state, model, root),
-        (res) => MIntegrated(Result = res),
-    )
+// integrateCmd writes the migrated project to <root>/.assimilator/out off the Update
+// loop once a run is complete; the result surfaces as MIntegrated so the UI can show
+// WHERE the output landed (or the failure reason). The output root is created as part
+// of the engine's emit (writeOne mkdir's parents).
+func integrateCmd(
+    port engine.EnginePort,
+    state engine.RunState,
+    model engine.WorkspaceModel,
+    root string,
+) Cmd[Msg] =
+    FutureCmd[Msg](Fut = port.IntegrateAsync(state, model, OutputDir(root))
+        .Map((res) => MIntegrated(Result = res)))
 
 // projectEvalCmd runs the WHOLE-PROJECT gate (compile + test the integrated migration)
 // off the Update loop — it spawns the real target toolchain, which can take seconds,
 // so it must never run inline. The verdict surfaces as MProjectEvaluated, which decides
 // whether to integrate or to feed the diagnostics back into the loop.
 func projectEvalCmd(port engine.EnginePort, state engine.RunState, model engine.WorkspaceModel) Cmd[Msg] =
-    Async[engine.ProjectEvaluation, Msg](
-        () => port.EvaluateProject(state, model),
-        (eval) => MProjectEvaluated(Eval = eval),
-    )
+    FutureCmd[Msg](Fut = port.EvaluateProjectAsync(state, model)
+        .Map((eval) => MProjectEvaluated(Eval = eval)))
 
 // doSaveProbe verifies the checkpoint location is WRITABLE before a run starts:
 // it creates <root>/.assimilator and writes-then-removes a tiny probe file. It
@@ -119,15 +133,16 @@ func saveProbeCmd(root string) Cmd[Msg] =
         (reason) => MSavePreflight(Reason = reason),
     )
 
-// doSaveForest ensures the state dir exists, persists the forest via the port, AND
-// writes a human-readable dependency diagnostics log (deps.log) beside it — the FULL
-// per-dependency reasons (the exact failing git command + stderr, the no-mapping
-// note), which the dependency screen can only show truncated. Best-effort: the log
-// write never changes the checkpoint's own success.
-func doSaveForest(port engine.EnginePort, forest engine.DependencyForest, root string) bool {
-    fs.MkdirAll(CheckpointDir(root), 493)   // 0755; ignore result — SaveForest reports failure
+// forestSaved writes the human-readable dependency diagnostics log (deps.log)
+// beside the forest checkpoint — the FULL per-dependency reasons (the exact failing
+// git command + stderr, the no-mapping note), which the dependency screen can only
+// show truncated — then reports the save's result. The log is best-effort: it never
+// changes the checkpoint's own success. It runs in the save's continuation, so it is
+// still off the Update loop and still lands before MForestSaved is dispatched.
+func forestSaved(ok bool, forest engine.DependencyForest, root string) Msg {
+    fs.MkdirAll(CheckpointDir(root), 493)   // 0755; best-effort, the log is diagnostics only
     fs.WriteFileString(DepsLogPath(root), engine.ForestReport(forest), 420)
-    return port.SaveForest(forest, ForestCheckpointPath(root))
+    return MForestSaved(Ok = ok)
 }
 
 // DepsLogPath / SessionLogPath are the human-readable diagnostics logs beside the
@@ -151,18 +166,15 @@ func sessionLogCmd(backend string, state engine.RunState, eval engine.ProjectEva
         (_) => MNoOp(),
     )
 
-// saveForestCmd persists the dependency forest off the Update loop; the result
-// surfaces as MForestSaved so the UI can show a save indicator.
+// saveForestCmd persists the dependency forest off the Update loop, then writes the
+// deps.log diagnostics beside it; the result surfaces as MForestSaved so the UI can
+// show a save indicator. The state directory is created by the engine's write.
 func saveForestCmd(port engine.EnginePort, forest engine.DependencyForest, root string) Cmd[Msg] =
-    Async[bool, Msg](
-        () => doSaveForest(port, forest, root),
-        (ok) => MForestSaved(Ok = ok),
-    )
+    FutureCmd[Msg](Fut = port.SaveForestAsync(forest, ForestCheckpointPath(root))
+        .Map((ok) => forestSaved(ok, forest, root)))
 
 // loadForestCmd reads the forest checkpoint off the loop; the result surfaces as
 // MForestLoaded (resumed alongside the run checkpoint).
 func loadForestCmd(port engine.EnginePort, root string) Cmd[Msg] =
-    Async[engine.ForestLoad, Msg](
-        () => port.LoadForest(ForestCheckpointPath(root)),
-        (load) => MForestLoaded(Load = load),
-    )
+    FutureCmd[Msg](Fut = port.LoadForestAsync(ForestCheckpointPath(root))
+        .Map((load) => MForestLoaded(Load = load)))

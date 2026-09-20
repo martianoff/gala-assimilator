@@ -21,6 +21,7 @@ package engine
 import (
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
+    "martianoff/gala/concurrent"
     acp "github.com/martianoff/gala-acp"
 )
 
@@ -165,7 +166,35 @@ struct EnginePort(
     ActOnDependency func(DependencyForest, DependencyId, DepAction) DependencyForest,
     SaveForest      func(DependencyForest, string) bool,
     LoadForest      func(string) ForestLoad,
+    // ---- Off-thread faces of the operations the UI must not run on its Update
+    // loop. Each returns an ALREADY-BUILT Future, because the goroutine boundary
+    // has to live here rather than in the caller: a closure crossing it may only
+    // capture deeply-immutable state, and a port is a record of function values,
+    // which is never shareable. Building the Future inside the engine puts the
+    // closure literal where the engine's own (caller-vouched) collaborators are
+    // in scope, and hands the UI a plain value it can drop into a FutureCmd.
+    //
+    // The synchronous fields above are unchanged and remain the surface tests and
+    // the engine's own internals use; these are purely the concurrent entry points.
+    // What crosses is still pure data — Future[T] is std, never an engine internal.
+    ScanPlanAsync        func(ScanRequest) concurrent.Future[ScanPlan],
+    PlanAsync            func(WorkspaceModel) concurrent.Future[MigrationPlan],
+    RunAsync             func(MigrationPlan) concurrent.Future[RunState],
+    AdvanceAsync         func(RunState) concurrent.Future[RunState],
+    SaveCheckpointAsync  func(RunState, string) concurrent.Future[SaveResult],
+    LoadCheckpointAsync  func(string) concurrent.Future[CheckpointLoad],
+    IntegrateAsync       func(RunState, WorkspaceModel, string) concurrent.Future[IntegrateResult],
+    EvaluateProjectAsync func(RunState, WorkspaceModel) concurrent.Future[ProjectEvaluation],
+    ResolveDepsAsync     func(WorkspaceModel) concurrent.Future[DependencyForest],
+    SaveForestAsync      func(DependencyForest, string) concurrent.Future[bool],
+    LoadForestAsync      func(string) concurrent.Future[ForestLoad],
 )
+
+// ScanPlan pairs a scanned workspace with the plan derived from it. Scan and plan
+// are one round trip for the UI, and folding them into a single off-thread result
+// keeps the port out of the Future's continuation: a mapper that called back into
+// Plan would have to capture the port, which cannot cross a goroutine boundary.
+struct ScanPlan(Workspace WorkspaceModel, Plan MigrationPlan)
 
 // ----------------------------------------------------------------------------
 // MockEngine — the deterministic offline implementation
@@ -179,7 +208,7 @@ func MockEngine() EnginePort = MockEngineWith(MockTranslator())
 // the default MockVerifier), so tests can inject a ScriptedRunner that yields a
 // Clarification or an Abort and drive a unit to Blocked / Failed — every terminus
 // exercised THROUGH the real run machinery, not hand-built.
-func MockEngineWith(runner acp.AgentRunner[TaskAssignment, Result, Clarification]) EnginePort = MockEngineWithVerifier(runner, MockVerifier())
+func MockEngineWith(runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]]) EnginePort = MockEngineWithVerifier(runner, MockVerifier())
 
 // DefaultMaxAttempts caps the per-unit fix loop: a unit that keeps failing the
 // verify gate is re-translated (diagnostics fed back) at most this many times
@@ -193,20 +222,31 @@ func DefaultMaxAttempts() int = 3
 // verifier, so tests can inject a ScriptedVerifier (pass / fail / unsupported) and
 // drive the verify gate's every terminus THROUGH the run machinery. Uses the
 // default per-unit attempt cap; MockEngineWithVerifierCap sets a custom one.
-func MockEngineWithVerifier(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier) EnginePort =
+func MockEngineWithVerifier(runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]], verifier Sendable[Verifier]) EnginePort =
     MockEngineWithVerifierCap(runner, verifier, DefaultMaxAttempts())
 
 // MockEngineWithVerifierCap is MockEngineWithVerifier with a configurable per-unit
 // attempt cap, so a test can exercise the fix loop's exhaustion at a small bound. It
 // wires the OFFLINE MockProjectGate (always-green, no toolchain) for the whole-project
 // gate; MockEngineWithGate injects a real project gate when a test drives it.
-func MockEngineWithVerifierCap(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int) EnginePort =
+func MockEngineWithVerifierCap(runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]], verifier Sendable[Verifier], maxAttempts int) EnginePort =
     MockEngineWithGate(runner, verifier, maxAttempts, MockProjectGate())
 
 // MockEngineWithGate is MockEngineWithVerifierCap plus an injected ProjectGate, so a
 // test can drive the whole-project compile+test gate (with a fake toolchain runner)
 // THROUGH the port. The offline default is MockProjectGate (above).
-func MockEngineWithGate(runner acp.AgentRunner[TaskAssignment, Result, Clarification], verifier Verifier, maxAttempts int, gate ProjectGate) EnginePort = EnginePort(
+// The injected collaborators are declared Sendable: each is a record of function
+// values, so nothing about its type proves it is safe to share, and the async
+// fields below capture them into goroutine bodies. The Sendable bound makes the
+// CALLER vouch that the runner / verifier / gate it supplies closes over only
+// immutable state — the standard Send-style contract, checked where the closure
+// is actually written.
+func MockEngineWithGate(
+    runner Sendable[acp.AgentRunner[TaskAssignment, Result, Clarification]],
+    verifier Sendable[Verifier],
+    maxAttempts int,
+    gate Sendable[ProjectGate],
+) EnginePort = EnginePort(
     Scan          = (_ ScanRequest) => ScanGoWorkspaceStub(),
     Plan          = (m WorkspaceModel) => planFor(m),
     Run           = (p MigrationPlan) => runFor(p),
@@ -230,7 +270,26 @@ func MockEngineWithGate(runner acp.AgentRunner[TaskAssignment, Result, Clarifica
     ActOnDependency = (f DependencyForest, id DependencyId, a DepAction) => actOnDependency(f, id, a),
     SaveForest      = (f DependencyForest, path string) => saveForest(f, path),
     LoadForest      = (path string) => loadForest(path),
+    // Off-thread faces — same operations, same collaborators, wrapped at the seam.
+    ScanPlanAsync        = (_ ScanRequest) => concurrent.Future(stubScanPlan()),
+    PlanAsync            = (m WorkspaceModel) => concurrent.Future(planFor(m)),
+    RunAsync             = (p MigrationPlan) => concurrent.Future(runFor(p)),
+    AdvanceAsync         = (s RunState) => concurrent.Future(advance(runner, verifier, maxAttempts, s)),
+    SaveCheckpointAsync  = (s RunState, path string) => concurrent.Future(saveCheckpoint(s, path)),
+    LoadCheckpointAsync  = (path string) => concurrent.Future(loadCheckpoint(path)),
+    IntegrateAsync       = (s RunState, m WorkspaceModel, outRoot string) => concurrent.Future(integrateProject(s, m, outRoot)),
+    EvaluateProjectAsync = (s RunState, m WorkspaceModel) => concurrent.Future(gate.Evaluate(s, m)),
+    ResolveDepsAsync     = (m WorkspaceModel) => concurrent.Future(resolveForest(SelectResolver("go"), m, depsBaseFor(m), DefaultMaxDepth())),
+    SaveForestAsync      = (f DependencyForest, path string) => concurrent.Future(saveForest(f, path)),
+    LoadForestAsync      = (path string) => concurrent.Future(loadForest(path)),
 )
+
+// stubScanPlan is the mock frontend's scan-then-plan round trip over the built-in
+// stub workspace — the synchronous Scan/Plan pair, folded into one value.
+func stubScanPlan() ScanPlan {
+    val ws = ScanGoWorkspaceStub()
+    return ScanPlan(Workspace = ws, Plan = planFor(ws))
+}
 
 // ----------------------------------------------------------------------------
 // scan / plan / run

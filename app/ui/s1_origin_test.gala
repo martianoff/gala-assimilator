@@ -86,18 +86,21 @@ func TestGitScanValidUrlScans(t T) T {
 // A successfully acquired origin routes into MScanPlanned (the same path the local
 // scan uses); a failed acquisition routes into MScanFailed (surfaced on S1).
 func TestOriginScanToMsgRoutes(t T) T {
-    val port = engine.MockEngine()
-    val ws = port.Scan(engine.ScanRequest(Root = "/x"))
-    val ok = originScanToMsg(port, engine.OriginScanned(Path = "/clone", Workspace = ws))
-    val bad = originScanToMsg(port, engine.OriginUnsupported(Reason = "clone failed"))
-    val t1 = ok match {
-        case MScanPlanned(_, _) => IsTrue(t, true)
-        case _                  => IsTrue(t, false)
+    val m = NewModel(mockFactory(), 100, 30)
+    val ws = m.Port.Scan(engine.ScanRequest(Root = "/x"))
+    // A good acquisition plans off the loop: the command it returns resolves to
+    // MScanPlanned, the same message the local-path scan produces.
+    val (_, okCmd) = originScanned(m, engine.OriginScanned(Path = "/clone", Workspace = ws))
+    val t1 = okCmd match {
+        case FutureCmd(f) => f.Await().Get() match {
+            case MScanPlanned(_, _) => IsTrue(t, true)
+            case _                  => IsTrue(t, false)
+        }
+        case _ => IsTrue(t, false)
     }
-    return bad match {
-        case MScanFailed(reason) => IsTrue(t1, str.S(reason).Contains("clone failed"))
-        case _                   => IsTrue(t1, false)
-    }
+    // A failed acquisition never plans — the reason is surfaced on S1 directly.
+    val (bad, _) = originScanned(m, engine.OriginUnsupported(Reason = "clone failed"))
+    return IsTrue(t1, str.S(bad.ScanError).Contains("clone failed"))
 }
 
 // MScanFailed clears the scanning state and surfaces the reason on S1.
