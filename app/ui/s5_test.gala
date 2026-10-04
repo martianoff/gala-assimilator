@@ -106,7 +106,7 @@ func TestS5SkipAbandonsUnit(t T) T {
 }
 
 // A bracketed paste reaches the S5 answer as one input event, flattened to a
-// single line.
+// single line (terminals end pasted lines with CR).
 func TestPasteIntoAnswer(t T) T {
     val port = blockingEngine()
     val ws = port.Scan(engine.ScanRequest(Root = "/x"))
@@ -114,7 +114,7 @@ func TestPasteIntoAnswer(t T) T {
     val s = NewHarnessOnRun(port, ws, st)
         .SendMsg(MRunTick()).SendMsg(MRunTick()).SendMsg(MRunTick())
         .SendMsg(MOpenBlocker())
-        .SendInput(PasteInput(Content = "never\nnull\n"))
+        .SendInput(PasteInput(Content = "never\rnull\r"))
     val t1 = Eq(t, s.Model.Screens.Current(), RouteS5())
     return Eq(t1, s.Model.AnswerText, "never null")
 }

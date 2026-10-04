@@ -61,6 +61,18 @@ func TestPasteIntoUrlField(t T) T {
     return Eq(t, m1.RepoUrl, "https://github.com/acme/quux")
 }
 
+// singleLine keeps a paste's leading space (it joins onto typed text), turns
+// inner line breaks and tabs into spaces, and drops other control characters.
+func TestSingleLine(t T) T = RunCases[string, string](t,
+    (sub T, input string, expected string) => Eq(sub, singleLine(input), expected),
+    Case[string, string](Name = "trailing newline", Input = "https://github.com/acme/x\n", Expected = "https://github.com/acme/x"),
+    Case[string, string](Name = "leading space kept", Input = " Option[T]", Expected = " Option[T]"),
+    Case[string, string](Name = "CR lines", Input = "a\rb\r", Expected = "a b"),
+    Case[string, string](Name = "CRLF lines", Input = "a\r\nb", Expected = "a b"),
+    Case[string, string](Name = "tab", Input = "url\tmain", Expected = "url main"),
+    Case[string, string](Name = "control char", Input = "a\x1bb", Expected = "ab"),
+)
+
 // Outside a text field a paste is dropped: its 'q' must not quit the app.
 func TestPasteOutsideFieldIsDropped(t T) T {
     val (m1, cmds) = StepAll(prog(), ArrayOf[Msg](MPaste(Text = "q")))

@@ -9,6 +9,7 @@ import (
     "martianoff/gala/concurrent"
     str "martianoff/gala/strings"
     . "martianoff/gala/time_utils"
+    "unicode"
 )
 
 // ============================================================================
@@ -372,12 +373,17 @@ func reviewedUnitId(m Model) Option[engine.UnitId] = m.Run match {
     case None() => None[engine.UnitId]()
 }
 
-// keyChar interprets a printable key per screen: type into the S5 answer, run
-// an S4 action (a/r/s/e), or quit on 'q' elsewhere.
-func keyChar(m Model, c rune) Tuple[Model, Cmd[Msg]] {
+// keyChar interprets a printable key per screen: type into the S5 answer or a
+// focused S1 field, otherwise run that screen's shortcut.
+func keyChar(m Model, c rune) Tuple[Model, Cmd[Msg]] = typeText(m, string(c)) match {
+    case Some(typed) => noCmd(typed)
+    case None()      => shortcutKey(m, c)
+}
+
+// shortcutKey runs a single-key shortcut: an S4 action (a/r/s/e), an S8 forest
+// action, or quit on 'q'.
+func shortcutKey(m Model, c rune) Tuple[Model, Cmd[Msg]] {
     val r = m.Screens.Current()
-    if (r == RouteS5()) { return (typeAnswer(m, string(c)), NoCmd[Msg]()) }
-    if (r == RouteS1() && typingPane(m)) { return (typeOriginField(m, string(c)), NoCmd[Msg]()) }
     if (c == 'q') { return (m, QuitCmd[Msg]()) }
     if (r == RouteS7() && c == 's') { return browseSelect(m) }
     if (r == RouteS8()) { return depKey(m, c) }
@@ -424,18 +430,29 @@ func typeOriginField(m Model, s string) Model {
 
 func typeAnswer(m Model, s string) Model = m.Copy(AnswerText = m.AnswerText + s)
 
-// pasteText inserts a bracketed paste into the field a printable key would type
-// into (the S5 answer, or the focused S1 git-origin field) in one step. Every
-// such field is single-line, so line breaks flatten to spaces and the paste is
-// trimmed (a copied URL usually carries a trailing newline). Anywhere else the
-// paste is dropped: pasted text must never fire the single-key shortcuts.
-func pasteText(m Model, s string) Model {
-    val text = str.S(s).ReplaceAll("\r", "").ReplaceAll("\n", " ").Trim().ToString()
+// typeText types s into the field that owns the keyboard — the S5 answer, or the
+// focused S1 git-origin field — or is None when no field does.
+func typeText(m Model, s string) Option[Model] {
     val r = m.Screens.Current()
-    if (r == RouteS5()) { return typeAnswer(m, text) }
-    if (r == RouteS1() && typingPane(m)) { return typeOriginField(m, text) }
-    return m
+    if (r == RouteS5()) { return Some(typeAnswer(m, s)) }
+    if (r == RouteS1() && typingPane(m)) { return Some(typeOriginField(m, s)) }
+    return None[Model]()
 }
+
+// pasteText inserts a bracketed paste into the field a printable key would type
+// into, in one step. Anywhere else the paste is dropped: pasted text must never
+// fire the single-key shortcuts.
+func pasteText(m Model, s string) Model = typeText(m, singleLine(s)).GetOrElse(m)
+
+// singleLine fits pasted text to a single-line field. The trailing line break a
+// copied line carries is dropped, inner line breaks (CR, LF or CRLF — terminals
+// send CR in bracketed paste) and tabs become spaces, and other control
+// characters, which would sit invisibly in the field, are removed.
+func singleLine(s string) string =
+    str.S(s).TrimRight().ReplaceAll("\r\n", "\n")
+        .Map((c) => if (c == '\r' || c == '\n' || c == '\t') ' ' else c)
+        .FilterNot((c) => unicode.IsControl(c))
+        .ToString()
 
 func keyBackspace(m Model) Model {
     val r = m.Screens.Current()
