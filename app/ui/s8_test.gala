@@ -71,6 +71,8 @@ func mkQueuedUnit(id string) engine.UnitRun =
             Answers      = EmptyArray[engine.Answer](),
         ),
         Status = engine.Queued(),
+        SourceTests = EmptyArray[engine.SourceTestRef](),
+        Attempts = 0,
     )
 
 func subRun() engine.RunState =

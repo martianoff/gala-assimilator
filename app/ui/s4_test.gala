@@ -69,6 +69,14 @@ func TestS4DiffLegendNumbersCaveatDisabledEdit(t T) T {
     return IsTrue(t4, out.Contains("1 //"))                  // line-numbered gutter
 }
 
+// A paste on S4 is dropped: a pasted 'a' must not accept the unit the way the
+// 'a' key does.
+func TestS4PasteDoesNotAct(t T) T {
+    val m0 = onS4Done(100, 20)
+    val (m1, _) = StepAll2(m0, ArrayOf[Msg](MPaste(Text = "a")))
+    return Eq(t, m1.Screens.Current(), RouteS4())
+}
+
 // Accept (key 'a') runs through ActOnUnit and returns to S3; the unit stays Done.
 func TestS4AcceptReturnsToS3(t T) T {
     val m0 = onS4Done(100, 20)
