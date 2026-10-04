@@ -59,6 +59,8 @@ func mkUnit(id string, src string, status UnitStatus) UnitRun =
             Answers      = EmptyArray[Answer](),
         ),
         Status = status,
+        SourceTests = EmptyArray[SourceTestRef](),
+        Attempts = 0,
     )
 
 func doneStatus(text string, rationale string, flags Array[UnsupportedFlag]) UnitStatus =
@@ -393,4 +395,5 @@ func planItem(id string) PlanItem =
         Unit   = UnitId(Value = id),
         Source = SourceContext(SourceText = "", Dependencies = EmptyArray[DependencySnippet]()),
         Target = TargetConventions(Language = "go", Notes = EmptyArray[string]()),
+        SourceTests = EmptyArray[SourceTestRef](),
     )

@@ -320,7 +320,7 @@ struct UnitDetailVM(
     Question    string,          // the clarification question (when Blocked)
 )
 
-func lines(s string) Array[string] = str.S(s).Lines().Map((ln Str) => ln.ToString())
+func lines(s string) Array[string] = str.S(s).Lines().Map((ln) => ln.ToString())
 
 // projectUnit turns one UnitRun into its review/blocker detail.
 func projectUnit(u UnitRun) UnitDetailVM {

@@ -35,6 +35,7 @@ sealed type Msg {
     case MScrollDown()  // wheel down
     case MKeyChar(C rune)   // a printable key — interpreted per screen
     case MKeyBackspace()    // backspace — S5 answer editing
+    case MPaste(Text string) // a bracketed paste — inserted whole, never replayed as keys
     case MBack()        // Esc — pop a screen, or quit at root
     case MQuit()
     case MNoOp()
@@ -127,6 +128,7 @@ func update(m Model, msg Msg) Tuple[Model, Cmd[Msg]] = msg match {
     case MScrollDown() => (scrollLog(m, -1), NoCmd[Msg]())
     case MKeyChar(c)   => keyChar(m, c)
     case MKeyBackspace() => (keyBackspace(m), NoCmd[Msg]())
+    case MPaste(s)       => (pasteText(m, s), NoCmd[Msg]())
 
     case MBrowse()          => openBrowse(m)
     case MSetOrigin(g)      => (setOrigin(m, g), NoCmd[Msg]())
@@ -374,8 +376,8 @@ func reviewedUnitId(m Model) Option[engine.UnitId] = m.Run match {
 // an S4 action (a/r/s/e), or quit on 'q' elsewhere.
 func keyChar(m Model, c rune) Tuple[Model, Cmd[Msg]] {
     val r = m.Screens.Current()
-    if (r == RouteS5()) { return (typeAnswer(m, c), NoCmd[Msg]()) }
-    if (r == RouteS1() && typingPane(m)) { return (typeOriginField(m, c), NoCmd[Msg]()) }
+    if (r == RouteS5()) { return (typeAnswer(m, string(c)), NoCmd[Msg]()) }
+    if (r == RouteS1() && typingPane(m)) { return (typeOriginField(m, string(c)), NoCmd[Msg]()) }
     if (c == 'q') { return (m, QuitCmd[Msg]()) }
     if (r == RouteS7() && c == 's') { return browseSelect(m) }
     if (r == RouteS8()) { return depKey(m, c) }
@@ -413,14 +415,27 @@ func typingPane(m Model) bool {
     return p == PaneUrl() || p == PaneRef()
 }
 
-// typeOriginField appends a typed char to the focused git-origin field.
-func typeOriginField(m Model, c rune) Model {
-    if (m.Focus.Current() == PaneUrl()) { return m.Copy(RepoUrl = m.RepoUrl + string(c)) }
-    if (m.Focus.Current() == PaneRef()) { return m.Copy(RepoRef = m.RepoRef + string(c)) }
+// typeOriginField appends typed text to the focused git-origin field.
+func typeOriginField(m Model, s string) Model {
+    if (m.Focus.Current() == PaneUrl()) { return m.Copy(RepoUrl = m.RepoUrl + s) }
+    if (m.Focus.Current() == PaneRef()) { return m.Copy(RepoRef = m.RepoRef + s) }
     return m
 }
 
-func typeAnswer(m Model, c rune) Model = m.Copy(AnswerText = m.AnswerText + string(c))
+func typeAnswer(m Model, s string) Model = m.Copy(AnswerText = m.AnswerText + s)
+
+// pasteText inserts a bracketed paste into the field a printable key would type
+// into (the S5 answer, or the focused S1 git-origin field) in one step. Every
+// such field is single-line, so line breaks flatten to spaces and the paste is
+// trimmed (a copied URL usually carries a trailing newline). Anywhere else the
+// paste is dropped: pasted text must never fire the single-key shortcuts.
+func pasteText(m Model, s string) Model {
+    val text = str.S(s).ReplaceAll("\r", "").ReplaceAll("\n", " ").Trim().ToString()
+    val r = m.Screens.Current()
+    if (r == RouteS5()) { return typeAnswer(m, text) }
+    if (r == RouteS1() && typingPane(m)) { return typeOriginField(m, text) }
+    return m
+}
 
 func keyBackspace(m Model) Model {
     val r = m.Screens.Current()
@@ -971,6 +986,8 @@ func keyToMsg(ev KeyEvent) Msg {
 func inputToMsg(ev InputEvent) Msg = ev match {
     case KeyInput(k)       => keyToMsg(k)
     case MouseInput(me)    => mouseToMsg(me)
+    case PasteInput(s)     => MPaste(Text = s)
+    case FocusInput(_)     => MNoOp()
     case ResizeInput(w, h) => MResized(W = w, H = h)
     case UnknownInput()    => MNoOp()
 }

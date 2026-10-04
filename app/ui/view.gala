@@ -77,7 +77,7 @@ func s0Recent(m Model) Widget {
 func recentRow(e runview.RecentRowVM, selected bool, idx int) Widget {
     val caret = if (selected) "▸ " else "  "
     val text = "  " + caret + "resume " + e.Root + s" — ${e.Done}/${e.Total} done"
-    val style = if (selected) DefaultStyle().WithReverse().WithBold() else DefaultStyle().WithFg(BrightGreen())
+    val style = if (selected) DefaultStyle().WithReverse().WithBold() else DefaultStyle().WithFg(BrightGreen)
     return TextStyled(text, style)
         .OnClick(MRecentSelect(Idx = idx))
         .OnDoubleClick(MRecentResume())
@@ -85,7 +85,7 @@ func recentRow(e runview.RecentRowVM, selected bool, idx int) Widget {
 
 func recentStartNewRow(selected bool, idx int) Widget {
     val caret = if (selected) "▸ " else "  "
-    val style = if (selected) DefaultStyle().WithReverse().WithBold() else DefaultStyle().WithBold().WithFg(BrightCyan())
+    val style = if (selected) DefaultStyle().WithReverse().WithBold() else DefaultStyle().WithBold().WithFg(BrightCyan)
     return TextStyled("  " + caret + "[ start new project ]", style)
         .OnClick(MRecentSelect(Idx = idx))
         .OnDoubleClick(MRecentStartNew())
@@ -96,7 +96,7 @@ func s0Resume(offer runview.LoadSummary) Widget =
         Fixed(1, headerRow("Saved migration found")),
         Fixed(1, Text("")),
         Fixed(1, TextStyled(s"  A checkpoint exists: ${offer.Done}/${offer.Total} units done.",
-            DefaultStyle().WithFg(BrightGreen()))),
+            DefaultStyle().WithFg(BrightGreen))),
         Fixed(1, Text("")),
         Fixed(1, Row(ArrayOf[LayoutChild](
             Fixed(2, Text("")),
@@ -113,7 +113,7 @@ func s0Corrupt(offer runview.LoadSummary) Widget =
         Fixed(1, headerRow("Saved migration unreadable")),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  The checkpoint could not be read:",
-            DefaultStyle().WithFg(BrightYellow()))),
+            DefaultStyle().WithFg(BrightYellow))),
         Fixed(1, TextStyled("    " + offer.Reason, DefaultStyle().WithDim())),
         Fixed(1, Text("")),
         Fixed(1, Row(ArrayOf[LayoutChild](
@@ -228,8 +228,8 @@ func refRow(m Model) Widget {
 // try next — instead of a single cryptic warning line.
 func scanErrorRows(m Model) Array[LayoutChild] =
     ArrayOf[LayoutChild](
-        Fixed(1, errLine("✗ Couldn't start the migration", DefaultStyle().WithBold().WithFg(BrightRed()))),
-        Fixed(1, errLine("  " + m.ScanError, DefaultStyle().WithFg(BrightYellow()))),
+        Fixed(1, errLine("✗ Couldn't start the migration", DefaultStyle().WithBold().WithFg(BrightRed))),
+        Fixed(1, errLine("  " + m.ScanError, DefaultStyle().WithFg(BrightYellow))),
         Fixed(1, errLine(scanErrorHint(m), DefaultStyle().WithDim())),
     )
 
@@ -244,7 +244,7 @@ func scanErrorHint(m Model) string =
 func headerRow(title string) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Flex(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan()))),
+        Flex(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan))),
         Fixed(8, TextStyled("q quit ", DefaultStyle().WithDim())),
     ))
 
@@ -256,7 +256,7 @@ func s1Footer() Widget =
 func sectionRow(title string) Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Flex(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan()))),
+        Flex(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan))),
     ))
 
 func subLabelW() int = 14
@@ -274,7 +274,7 @@ func subFieldRow(label string, control Widget) Widget =
 // own highlight is subtle.
 func focusCaretCell(m Model, pane string) LayoutChild {
     if (m.Focus.IsFocused(pane)) {
-        return Fixed(4, TextStyled("  ▸ ", DefaultStyle().WithBold().WithFg(BrightCyan())))
+        return Fixed(4, TextStyled("  ▸ ", DefaultStyle().WithBold().WithFg(BrightCyan)))
     }
     return Fixed(4, Text(""))
 }
@@ -307,9 +307,9 @@ func detectedRow(m Model) Widget {
         "—  (" + info.Marker + ")"
     val mark = if (info.Detected) "✓ " else "✗ "
     val markStyle = if (info.Detected)
-        DefaultStyle().WithFg(BrightGreen())
+        DefaultStyle().WithFg(BrightGreen)
     else
-        DefaultStyle().WithFg(BrightYellow())
+        DefaultStyle().WithFg(BrightYellow)
     // The detection mark sits NEXT TO the detection text (not flush-right), so the
     // ✓/✗ reads as part of the readout it describes.
     return Row(ArrayOf[LayoutChild](
@@ -372,7 +372,7 @@ func scanRow(m Model) Widget {
         focusCaretCell(m, PaneScan()),
         Fixed(20, disabledBtn("scan project", focused)),
         Fixed(2, Text("")),
-        Flex(1, TextStyled("↑ enter a repo URL above first", DefaultStyle().WithFg(BrightYellow()))),
+        Flex(1, TextStyled("↑ enter a repo URL above first", DefaultStyle().WithFg(BrightYellow))),
     ))
 }
 
@@ -435,8 +435,8 @@ func preflightRows(m Model) Array[LayoutChild] {
     if (m.Preflight == "") { return EmptyArray[LayoutChild]() }
     return ArrayOf[LayoutChild](
         Fixed(1, Text("")),
-        Fixed(1, errLine("✗ Can't save progress here", DefaultStyle().WithBold().WithFg(BrightRed()))),
-        Fixed(1, errLine("  " + dispPath(CheckpointDir(m.SourceDir)) + " — " + m.Preflight, DefaultStyle().WithFg(BrightYellow()))),
+        Fixed(1, errLine("✗ Can't save progress here", DefaultStyle().WithBold().WithFg(BrightRed))),
+        Fixed(1, errLine("  " + dispPath(CheckpointDir(m.SourceDir)) + " — " + m.Preflight, DefaultStyle().WithFg(BrightYellow))),
         Fixed(1, errLine("  Choose a writable project location, then start again.", DefaultStyle().WithDim())),
     )
 }
@@ -453,7 +453,7 @@ func s2EmptyPlan(m Model, pv runview.PlanVM) Widget =
         Fixed(1, kvRow("Scanned", s"${pv.Packages} packages · 0 migratable units")),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  ⚠ No migratable units were found in this project.",
-            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+            DefaultStyle().WithBold().WithFg(BrightYellow))),
         Fixed(1, TextStyled("    This folder doesn't look like a Go source project",
             DefaultStyle().WithDim())),
         Fixed(1, TextStyled("    — no .go files were detected under it.",
@@ -533,7 +533,7 @@ func saveErrorRows(m Model) Array[LayoutChild] {
     val why = if (m.SaveReason == "") "" else " — " + m.SaveReason
     return ArrayOf[LayoutChild](
         Fixed(1, errLine("⚠ couldn't save checkpoint" + why + " (progress may be lost)",
-            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+            DefaultStyle().WithBold().WithFg(BrightYellow))),
     )
 }
 
@@ -545,7 +545,7 @@ func s3Empty() Widget =
         Fixed(1, headerRow("Assimilation — nothing to do")),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  This run has no units — nothing was migrated.",
-            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+            DefaultStyle().WithBold().WithFg(BrightYellow))),
         Fixed(1, TextStyled("  Go back and scan a project that has source to translate.",
             DefaultStyle().WithDim())),
         Flex(1, Text("")),
@@ -606,14 +606,14 @@ func breadcrumbRow(rv runview.RunVM, frame int) Widget {
 // (RunVM.Complete, projected from the engine's IsComplete).
 func iteratingIndicator(rv runview.RunVM, frame int) Widget {
     if (rv.Complete) {
-        return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen()))
+        return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen))
     }
-    return TextStyled(s" ${spin(frame)} iterating…", DefaultStyle().WithFg(BrightYellow()))
+    return TextStyled(s" ${spin(frame)} iterating…", DefaultStyle().WithFg(BrightYellow))
 }
 
 func stageStyle(i int, curIdx int) Style {
-    if (i == curIdx) { return DefaultStyle().WithBold().WithFg(BrightCyan()) }
-    if (i < curIdx)  { return DefaultStyle().WithDim().WithFg(BrightGreen()) }
+    if (i == curIdx) { return DefaultStyle().WithBold().WithFg(BrightCyan) }
+    if (i < curIdx)  { return DefaultStyle().WithDim().WithFg(BrightGreen) }
     return DefaultStyle().WithDim()
 }
 
@@ -623,7 +623,7 @@ func stageStyle(i int, curIdx int) Style {
 func s3Actions(m Model, rv runview.RunVM) Widget {
     val badge = if (rv.Counts.Blocked > 0)
         TextStyled(s"[ ! ${rv.Counts.Blocked} blocked → ]",
-            DefaultStyle().WithReverse().WithFg(BrightYellow())).OnClick(MOpenBlocker())
+            DefaultStyle().WithReverse().WithFg(BrightYellow)).OnClick(MOpenBlocker())
     else
         Text("")
     return Row(ArrayOf[LayoutChild](
@@ -642,10 +642,10 @@ func s3Actions(m Model, rv runview.RunVM) Widget {
 func savedIndicator(m Model) Widget {
     if (!m.Persist) { return Text("") }
     if (m.LastSaveOk) {
-        return TextStyled("  checkpoint saved ✓", DefaultStyle().WithDim().WithFg(BrightGreen()))
+        return TextStyled("  checkpoint saved ✓", DefaultStyle().WithDim().WithFg(BrightGreen))
     }
     // The full reason renders on its own row (saveErrorRows); keep this compact.
-    return TextStyled("  ⚠ save failed", DefaultStyle().WithBold().WithFg(BrightYellow()))
+    return TextStyled("  ⚠ save failed", DefaultStyle().WithBold().WithFg(BrightYellow))
 }
 
 func progressBar(rv runview.RunVM) Widget =
@@ -655,7 +655,7 @@ func progressBar(rv runview.RunVM) Widget =
         // Width 20 fits the widest label "  NN/NN units (100%)" without overrunning
         // the right border (18 clipped the trailing ")" at 100%).
         Fixed(20, TextStyled(s"  ${rv.Done}/${rv.Total} units (${rv.Pct}%)",
-            DefaultStyle().WithBold().WithFg(BrightGreen()))),
+            DefaultStyle().WithBold().WithFg(BrightGreen))),
     ))
 
 // countsRow stacks the status tally and the tests counter on the SAME row only when
@@ -684,9 +684,9 @@ func countsRow(rv runview.RunVM, cols int) Array[LayoutChild] {
 func testsCounter(rv runview.RunVM) Widget {
     val allPass = rv.TestsTotal > 0 && rv.TestsPassing >= rv.TestsTotal
     val style = if (allPass)
-        DefaultStyle().WithBold().WithFg(BrightGreen())
+        DefaultStyle().WithBold().WithFg(BrightGreen)
     else
-        DefaultStyle().WithFg(BrightCyan())
+        DefaultStyle().WithFg(BrightCyan)
     return TextStyled(s"tests ${rv.TestsPassing}/${rv.TestsTotal} passing ", style)
 }
 
@@ -768,17 +768,17 @@ func rowBadges(r runview.UnitRowVM, selected bool, idx int) Array[LayoutChild] {
             TextStyled(badgeText, attemptBadgeStyle(selected)).OnClick(MSelectUnit(Idx = idx))))
     }
     if (r.Flagged) {
-        badges = badges.Append(Fixed(2, markerBadge("⚑ ", BrightRed(), selected, idx)))
+        badges = badges.Append(Fixed(2, markerBadge("⚑ ", BrightRed, selected, idx)))
     }
     if (r.Unverified) {
-        badges = badges.Append(Fixed(2, markerBadge("⚠ ", BrightYellow(), selected, idx)))
+        badges = badges.Append(Fixed(2, markerBadge("⚠ ", BrightYellow, selected, idx)))
     }
     return badges
 }
 
 func attemptBadgeStyle(selected bool) Style {
     if (selected) { return DefaultStyle().WithReverse().WithBold() }
-    return DefaultStyle().WithFg(BrightYellow())
+    return DefaultStyle().WithFg(BrightYellow)
 }
 
 // markerBadge is a one-glyph per-row badge (the ⚑ flag / ⚠ unverified markers): the
@@ -817,7 +817,7 @@ func logColumn(m Model, lines Array[string]) Widget {
 func paneTitle(label string, focused bool, pane string) Widget {
     val mark = if (focused) "▸ " else "  "
     val style = if (focused)
-        DefaultStyle().WithBold().WithFg(BrightCyan())
+        DefaultStyle().WithBold().WithFg(BrightCyan)
     else
         DefaultStyle().WithBold()
     return TextStyled(mark + label, style).OnClick(MFocusPane(Pane = pane))
@@ -856,8 +856,8 @@ func s4Board(m Model, vm runview.UnitDetailVM) Widget {
 func diffLegend() Widget =
     Row(ArrayOf[LayoutChild](
         Fixed(2, Text("")),
-        Fixed(20, TextStyled("red = source", DefaultStyle().WithFg(BrightRed()))),
-        Fixed(20, TextStyled("green = target", DefaultStyle().WithFg(BrightGreen()))),
+        Fixed(20, TextStyled("red = source", DefaultStyle().WithFg(BrightRed))),
+        Fixed(20, TextStyled("green = target", DefaultStyle().WithFg(BrightGreen))),
         Flex(1, TextStyled("dim = unchanged", DefaultStyle().WithDim())),
     ))
 
@@ -869,7 +869,7 @@ func diffCaveat(cols int) Widget {
         "  ⓘ by-index compare: after an inserted/removed line, later lines may show as changed though they're not."
     else
         "  ⓘ diff is by-index — lines after an edit may look changed."
-    return TextStyled(text, DefaultStyle().WithDim().WithFg(BrightYellow()))
+    return TextStyled(text, DefaultStyle().WithDim().WithFg(BrightYellow))
 }
 
 // diffArea shows source vs emitted target side-by-side (wide) or stacked (narrow),
@@ -905,7 +905,7 @@ func diffPane(m Model, title string, lines Array[string], other Array[string], i
     val more = if (end < total) s"  … ${total - end} more lines (↓)" else ""
     val moreRow = if (more == "") Text("") else TextStyled(more, DefaultStyle().WithDim())
     return Border(Column(ArrayOf[LayoutChild](
-        Fixed(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan()))),
+        Fixed(1, TextStyled(title, DefaultStyle().WithBold().WithFg(BrightCyan))),
         Flex(1, Column(rows)),
         Fixed(1, moreRow),
     )))
@@ -929,8 +929,8 @@ func spaces(n int) string {
 
 func diffStyle(isSource bool, same bool) Style {
     if (same) { return DefaultStyle().WithDim() }
-    if (isSource) { return DefaultStyle().WithFg(BrightRed()) }
-    return DefaultStyle().WithFg(BrightGreen())
+    if (isSource) { return DefaultStyle().WithFg(BrightRed) }
+    return DefaultStyle().WithFg(BrightGreen)
 }
 
 // s4ActionBar exposes the three real review actions plus a clearly DISABLED "edit"
@@ -967,7 +967,7 @@ func s5Board(m Model, vm runview.UnitDetailVM) Widget {
         Fixed(1, headerRow("Blocker — " + vm.Id)),
         Fixed(1, Text("")),
         Fixed(1, TextStyled("  The agent needs a clarification:", DefaultStyle().WithDim())),
-        Fixed(1, TextStyled("    " + question, DefaultStyle().WithBold().WithFg(BrightYellow()))),
+        Fixed(1, TextStyled("    " + question, DefaultStyle().WithBold().WithFg(BrightYellow))),
         Fixed(1, Text("")),
     )
     val snippet = s5SnippetRows(vm)
@@ -1086,7 +1086,7 @@ func s6IssueRows(c runview.StatusCounts) Array[LayoutChild] {
         Fixed(1, Text("")),
         Fixed(1, TextStyled(
             s"  ⚠ ${c.Failed} failed · ${c.Blocked} blocked — review them on the dashboard (Esc).",
-            DefaultStyle().WithBold().WithFg(BrightYellow()))),
+            DefaultStyle().WithBold().WithFg(BrightYellow))),
     )
 }
 
@@ -1101,7 +1101,7 @@ func s6FlagRows(rv runview.RunVM) Array[LayoutChild] {
     return ArrayOf[LayoutChild](
         Fixed(1, TextStyled(
             s"  ⚑ ${flagged} flagged · ⚠ ${unverified} unverified — open them on the dashboard (Esc) to check.",
-            DefaultStyle().WithFg(BrightYellow()))),
+            DefaultStyle().WithFg(BrightYellow))),
     )
 }
 
@@ -1113,7 +1113,7 @@ func s6OutputRows(m Model) Array[LayoutChild] = m.Integrated match {
         return ArrayOf[LayoutChild](
             Fixed(1, Text("")),
             Fixed(1, TextStyled(s"  ✗ Couldn't write output: ${sum.Reason}",
-                DefaultStyle().WithBold().WithFg(BrightRed()))))
+                DefaultStyle().WithBold().WithFg(BrightRed))))
     }
     case None() => EmptyArray[LayoutChild]()
 }
@@ -1127,12 +1127,12 @@ func outputWrittenRows(m Model, sum runview.IntegrateSummary) Array[LayoutChild]
         return ArrayOf[LayoutChild](
             Fixed(1, Text("")),
             Fixed(1, TextStyled(s"  ✓ Results written to ${dispPath(OutputDir(m.SourceDir))}  (${sum.Files} files)",
-                DefaultStyle().WithBold().WithFg(BrightGreen()))))
+                DefaultStyle().WithBold().WithFg(BrightGreen))))
     }
     return ArrayOf[LayoutChild](
         Fixed(1, Text("")),
         Fixed(1, TextStyled(s"  ⚠ Output written to ${dispPath(OutputDir(m.SourceDir))} (${sum.Files} files) — does NOT compile yet (see Verification)",
-            DefaultStyle().WithFg(BrightYellow()))))
+            DefaultStyle().WithFg(BrightYellow))))
 }
 
 // s6EvalRows renders the whole-project verification verdict — HOW the migration was
@@ -1160,9 +1160,9 @@ func evalRows(vm runview.ProjectEvalVM, attempts int) Array[LayoutChild] {
 
 func evalVerdictLine(vm runview.ProjectEvalVM) Widget {
     if (vm.Green) {
-        return TextStyled("  ✓ " + vm.Verdict, DefaultStyle().WithBold().WithFg(BrightGreen()))
+        return TextStyled("  ✓ " + vm.Verdict, DefaultStyle().WithBold().WithFg(BrightGreen))
     }
-    return TextStyled("  ✗ " + vm.Verdict, DefaultStyle().WithBold().WithFg(BrightRed()))
+    return TextStyled("  ✗ " + vm.Verdict, DefaultStyle().WithBold().WithFg(BrightRed))
 }
 
 // evalDiagRows shows the trimmed diagnostics excerpt under a non-green verdict, one
@@ -1282,7 +1282,7 @@ func browseRow(b BrowseState, idx int) Widget {
 
 func browseRowStyle(selected bool, isProject bool) Style {
     if (selected) { return DefaultStyle().WithReverse().WithBold() }
-    if (isProject) { return DefaultStyle().WithFg(BrightGreen()) }
+    if (isProject) { return DefaultStyle().WithFg(BrightGreen) }
     return DefaultStyle()
 }
 
@@ -1346,7 +1346,7 @@ func s8CursorRow(m Model, fv runview.ForestVM) Widget {
     val idx = clampInt(m.DepCursor, 0, maxI(0, fv.Rows.Length() - 1))
     val r = fv.Rows.Get(idx)
     return TextStyled(s"  Actions for ${r.Module} ${r.Version}  [${r.Status}]:",
-        DefaultStyle().WithBold().WithFg(BrightCyan()))
+        DefaultStyle().WithBold().WithFg(BrightCyan))
 }
 
 // s8NoDeps is the honest "scanned, no external dependencies" state — distinct from
@@ -1374,9 +1374,9 @@ func depsSummaryRow(fv runview.ForestVM, frame int) Widget =
 // flipping to "complete ✓" once the forest reaches its fixpoint.
 func iteratingDeps(fv runview.ForestVM, frame int) Widget {
     if (fv.Complete) {
-        return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen()))
+        return TextStyled(" complete ✓", DefaultStyle().WithBold().WithFg(BrightGreen))
     }
-    return TextStyled(s" ${spin(frame)} resolving…", DefaultStyle().WithFg(BrightYellow()))
+    return TextStyled(s" ${spin(frame)} resolving…", DefaultStyle().WithFg(BrightYellow))
 }
 
 func depsProgressRow(fv runview.ForestVM) Widget =
@@ -1384,7 +1384,7 @@ func depsProgressRow(fv runview.ForestVM) Widget =
         Fixed(2, Text("")),
         Flex(1, Progress(fv.Pct)),
         Fixed(16, TextStyled(s"  ${fv.Done}/${fv.Total} (${fv.Pct}%)",
-            DefaultStyle().WithBold().WithFg(BrightGreen()))),
+            DefaultStyle().WithBold().WithFg(BrightGreen))),
     ))
 
 // depsTree renders a window of forest rows around the cursor (so a deep forest still
@@ -1459,11 +1459,11 @@ func trimDepReason(reason string) string {
 // reverse-bold over all of it.
 func depRowStyle(r runview.DepRowVM, selected bool) Style {
     if (selected)         { return DefaultStyle().WithReverse().WithBold() }
-    if (r.IsFailed)       { return DefaultStyle().WithBold().WithFg(BrightRed()) }
-    if (r.IsUnsupported)  { return DefaultStyle().WithBold().WithFg(BrightYellow()) }
+    if (r.IsFailed)       { return DefaultStyle().WithBold().WithFg(BrightRed) }
+    if (r.IsUnsupported)  { return DefaultStyle().WithBold().WithFg(BrightYellow) }
     if (r.IsSkipped)      { return DefaultStyle().WithDim() }
-    if (r.IsDone)         { return DefaultStyle().WithFg(BrightGreen()) }
-    return DefaultStyle().WithFg(BrightCyan())
+    if (r.IsDone)         { return DefaultStyle().WithFg(BrightGreen) }
+    return DefaultStyle().WithFg(BrightCyan)
 }
 
 // s8Actions is the per-node action bar for the cursored dependency: each of the four
@@ -1504,9 +1504,9 @@ func depActionChild(label string, keyHint string, enabled bool, msg Msg) LayoutC
 func depsSavedIndicator(m Model) Widget {
     if (!m.Persist) { return Text("") }
     if (m.ForestSaveOk) {
-        return TextStyled("  forest saved ✓", DefaultStyle().WithDim().WithFg(BrightGreen()))
+        return TextStyled("  forest saved ✓", DefaultStyle().WithDim().WithFg(BrightGreen))
     }
-    return TextStyled("  forest save failed ✗", DefaultStyle().WithFg(BrightYellow()))
+    return TextStyled("  forest save failed ✗", DefaultStyle().WithFg(BrightYellow))
 }
 
 func s8Footer() Widget =
@@ -1522,7 +1522,7 @@ func btnWidget(label string, focused bool, msg Msg) Widget {
     val style = if (focused)
         DefaultStyle().WithReverse().WithBold()
     else
-        DefaultStyle().WithBold().WithFg(BrightGreen())
+        DefaultStyle().WithBold().WithFg(BrightGreen)
     return TextStyled(txt, style).OnClick(msg)
 }
 
@@ -1544,12 +1544,12 @@ func cyclerWidget(value string, focused bool, msg Msg) Widget {
     val style = if (focused)
         DefaultStyle().WithReverse().WithBold()
     else
-        DefaultStyle().WithFg(BrightCyan())
+        DefaultStyle().WithFg(BrightCyan)
     return TextStyled(txt, style).OnClick(msg)
 }
 
 func stepperWidget(value int, focused bool) Widget {
-    val arrow = DefaultStyle().WithBold().WithFg(BrightCyan())
+    val arrow = DefaultStyle().WithBold().WithFg(BrightCyan)
     val valStyle = if (focused)
         DefaultStyle().WithReverse().WithBold()
     else
@@ -1567,7 +1567,7 @@ func radioCell(selected bool, groupFocused bool, label string, msg Msg) LayoutCh
     val style = if (groupFocused && selected)
         base.WithReverse().WithBold()
     else if (selected)
-        base.WithBold().WithFg(BrightCyan())
+        base.WithBold().WithFg(BrightCyan)
     else
         base.WithDim()
     val w = RuneCount(mark + label) + 2
@@ -1577,7 +1577,7 @@ func radioCell(selected bool, groupFocused bool, label string, msg Msg) LayoutCh
 func resizeNotice(m Model) Widget {
     val msg = s"Resize to ≥ ${MinCols()}×${MinRows()}"
     val body = Column(ArrayOf[LayoutChild](
-        Fixed(1, TextStyled(msg, DefaultStyle().WithBold().WithFg(BrightYellow()))),
+        Fixed(1, TextStyled(msg, DefaultStyle().WithBold().WithFg(BrightYellow))),
         Fixed(1, TextStyled("(terminal too small)", DefaultStyle().WithDim())),
     ))
     return body.Centered(m.Cols, m.Rows)

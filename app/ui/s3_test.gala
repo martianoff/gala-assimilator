@@ -177,6 +177,8 @@ func mkDoneUnit(id string, flags Array[engine.UnsupportedFlag]) engine.UnitRun =
         ),
         Status = engine.Done(Output = engine.Result(
             Task = engine.TaskId(Value = id), TargetText = "out", Rationale = "r", Flags = flags)),
+        SourceTests = EmptyArray[engine.SourceTestRef](),
+        Attempts = 0,
     )
 
 // flagFixtureState is a settled run with one unsupported-construct-flagged unit and
