@@ -114,7 +114,7 @@ func encodeRecent(idx RecentIndex) string {
     return w.String()
 }
 
-func encRecentEntry(w *json.JsonEncoderImpl, e RecentEntry) {
+func encRecentEntry(w Ptr[json.JsonEncoderImpl], e RecentEntry) {
     w.WriteStartObject()
     w.WriteKey("root");    w.WriteString(e.Root)
     w.WriteKey("done");    w.WriteInt(e.Done)
@@ -133,7 +133,7 @@ func decodeRecent(s string) RecentIndex {
     return RecentIndex(Entries = entries)
 }
 
-func decRecentEntry(d *json.JsonDecoderImpl) RecentEntry {
+func decRecentEntry(d Ptr[json.JsonDecoderImpl]) RecentEntry {
     d.StartObject()
     d.ReadKey(); val root    = d.ReadString()
     d.ReadKey(); val done    = d.ReadInt()

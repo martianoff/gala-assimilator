@@ -147,7 +147,7 @@ func encodeCheckpoint(cp Checkpoint) string {
 }
 
 // encArray writes a JSON array, delegating each element to `enc`.
-func encArray[T any](w *json.JsonEncoderImpl, arr Array[T], enc func(*json.JsonEncoderImpl, T)) {
+func encArray[T any](w Ptr[json.JsonEncoderImpl], arr Array[T], enc func(Ptr[json.JsonEncoderImpl], T)) {
     w.WriteStartArray()
     var i = 0
     for i < arr.Length() {
@@ -157,12 +157,12 @@ func encArray[T any](w *json.JsonEncoderImpl, arr Array[T], enc func(*json.JsonE
     w.WriteEndArray()
 }
 
-func encStr(w *json.JsonEncoderImpl, s string) { w.WriteString(s) }
+func encStr(w Ptr[json.JsonEncoderImpl], s string) { w.WriteString(s) }
 
-func encUnitId(w *json.JsonEncoderImpl, id UnitId) { w.WriteString(id.Value) }
-func encTaskId(w *json.JsonEncoderImpl, id TaskId) { w.WriteString(id.Value) }
+func encUnitId(w Ptr[json.JsonEncoderImpl], id UnitId) { w.WriteString(id.Value) }
+func encTaskId(w Ptr[json.JsonEncoderImpl], id TaskId) { w.WriteString(id.Value) }
 
-func encUnitRun(w *json.JsonEncoderImpl, u UnitRun) {
+func encUnitRun(w Ptr[json.JsonEncoderImpl], u UnitRun) {
     w.WriteStartObject()
     w.WriteKey("unit");        encUnitId(w, u.Unit)
     w.WriteKey("assignment");  encAssignment(w, u.Assignment)
@@ -172,7 +172,7 @@ func encUnitRun(w *json.JsonEncoderImpl, u UnitRun) {
     w.WriteEndObject()
 }
 
-func encAssignment(w *json.JsonEncoderImpl, a TaskAssignment) {
+func encAssignment(w Ptr[json.JsonEncoderImpl], a TaskAssignment) {
     w.WriteStartObject()
     w.WriteKey("task");   encTaskId(w, a.Task)
     w.WriteKey("unit");   encUnitId(w, a.Unit)
@@ -184,28 +184,28 @@ func encAssignment(w *json.JsonEncoderImpl, a TaskAssignment) {
     w.WriteEndObject()
 }
 
-func encSourceContext(w *json.JsonEncoderImpl, s SourceContext) {
+func encSourceContext(w Ptr[json.JsonEncoderImpl], s SourceContext) {
     w.WriteStartObject()
     w.WriteKey("sourceText");   w.WriteString(s.SourceText)
     w.WriteKey("dependencies"); encArray[DependencySnippet](w, s.Dependencies, encDependency)
     w.WriteEndObject()
 }
 
-func encDependency(w *json.JsonEncoderImpl, d DependencySnippet) {
+func encDependency(w Ptr[json.JsonEncoderImpl], d DependencySnippet) {
     w.WriteStartObject()
     w.WriteKey("name"); w.WriteString(d.Name)
     w.WriteKey("text"); w.WriteString(d.Text)
     w.WriteEndObject()
 }
 
-func encTargetConventions(w *json.JsonEncoderImpl, t TargetConventions) {
+func encTargetConventions(w Ptr[json.JsonEncoderImpl], t TargetConventions) {
     w.WriteStartObject()
     w.WriteKey("language"); w.WriteString(t.Language)
     w.WriteKey("notes");    encArray[string](w, t.Notes, encStr)
     w.WriteEndObject()
 }
 
-func encPriorFailure(w *json.JsonEncoderImpl, pf PriorFailure) {
+func encPriorFailure(w Ptr[json.JsonEncoderImpl], pf PriorFailure) {
     w.WriteStartObject()
     w.WriteKey("summary"); w.WriteString(pf.Summary)
     w.WriteKey("output");  w.WriteString(pf.Output)
@@ -213,21 +213,21 @@ func encPriorFailure(w *json.JsonEncoderImpl, pf PriorFailure) {
     w.WriteEndObject()
 }
 
-func encFlag(w *json.JsonEncoderImpl, f UnsupportedFlag) {
+func encFlag(w Ptr[json.JsonEncoderImpl], f UnsupportedFlag) {
     w.WriteStartObject()
     w.WriteKey("construct"); w.WriteString(f.Construct)
     w.WriteKey("reason");    w.WriteString(f.Reason)
     w.WriteEndObject()
 }
 
-func encAnswer(w *json.JsonEncoderImpl, a Answer) {
+func encAnswer(w Ptr[json.JsonEncoderImpl], a Answer) {
     w.WriteStartObject()
     w.WriteKey("task");     encTaskId(w, a.Task)
     w.WriteKey("response"); w.WriteString(a.Response)
     w.WriteEndObject()
 }
 
-func encSourceTestRef(w *json.JsonEncoderImpl, st SourceTestRef) {
+func encSourceTestRef(w Ptr[json.JsonEncoderImpl], st SourceTestRef) {
     w.WriteStartObject()
     w.WriteKey("unit");   encUnitId(w, st.Unit)
     w.WriteKey("path");   w.WriteString(st.Path)
@@ -235,7 +235,7 @@ func encSourceTestRef(w *json.JsonEncoderImpl, st SourceTestRef) {
     w.WriteEndObject()
 }
 
-func encResult(w *json.JsonEncoderImpl, r Result) {
+func encResult(w Ptr[json.JsonEncoderImpl], r Result) {
     w.WriteStartObject()
     w.WriteKey("task");       encTaskId(w, r.Task)
     w.WriteKey("targetText"); w.WriteString(r.TargetText)
@@ -244,7 +244,7 @@ func encResult(w *json.JsonEncoderImpl, r Result) {
     w.WriteEndObject()
 }
 
-func encClarification(w *json.JsonEncoderImpl, c Clarification) {
+func encClarification(w Ptr[json.JsonEncoderImpl], c Clarification) {
     w.WriteStartObject()
     w.WriteKey("task");     encTaskId(w, c.Task)
     w.WriteKey("question"); w.WriteString(c.Question)
@@ -252,7 +252,7 @@ func encClarification(w *json.JsonEncoderImpl, c Clarification) {
 }
 
 // encUnitStatus tags the sealed case with "k" and writes only that case's payload.
-func encUnitStatus(w *json.JsonEncoderImpl, s UnitStatus) {
+func encUnitStatus(w Ptr[json.JsonEncoderImpl], s UnitStatus) {
     w.WriteStartObject()
     w.WriteKey("k")
     s match {
@@ -267,7 +267,7 @@ func encUnitStatus(w *json.JsonEncoderImpl, s UnitStatus) {
     w.WriteEndObject()
 }
 
-func encProgressUpdate(w *json.JsonEncoderImpl, p ProgressUpdate) {
+func encProgressUpdate(w Ptr[json.JsonEncoderImpl], p ProgressUpdate) {
     w.WriteStartObject()
     w.WriteKey("task");  encTaskId(w, p.Task)
     w.WriteKey("phase"); w.WriteString(phaseToTag(p.Phase))
@@ -282,7 +282,7 @@ func phaseToTag(p ProgressPhase) string = p match {
 }
 
 // encEngineEvent tags the sealed case with "k" and writes that case's payload.
-func encEngineEvent(w *json.JsonEncoderImpl, e EngineEvent) {
+func encEngineEvent(w Ptr[json.JsonEncoderImpl], e EngineEvent) {
     w.WriteStartObject()
     w.WriteKey("k")
     e match {
@@ -323,7 +323,7 @@ func decodeCheckpoint(s string) Checkpoint {
 }
 
 // decArray reads a JSON array, delegating each element to `dec`.
-func decArray[T any](d *json.JsonDecoderImpl, dec func(*json.JsonDecoderImpl) T) Array[T] {
+func decArray[T any](d Ptr[json.JsonDecoderImpl], dec func(Ptr[json.JsonDecoderImpl]) T) Array[T] {
     d.StartArray()
     var out = EmptyArray[T]()
     for d.HasMoreElements() {
@@ -333,11 +333,11 @@ func decArray[T any](d *json.JsonDecoderImpl, dec func(*json.JsonDecoderImpl) T)
     return out
 }
 
-func decStr(d *json.JsonDecoderImpl) string = d.ReadString()
-func decUnitId(d *json.JsonDecoderImpl) UnitId = UnitId(Value = d.ReadString())
-func decTaskId(d *json.JsonDecoderImpl) TaskId = TaskId(Value = d.ReadString())
+func decStr(d Ptr[json.JsonDecoderImpl]) string = d.ReadString()
+func decUnitId(d Ptr[json.JsonDecoderImpl]) UnitId = UnitId(Value = d.ReadString())
+func decTaskId(d Ptr[json.JsonDecoderImpl]) TaskId = TaskId(Value = d.ReadString())
 
-func decUnitRun(d *json.JsonDecoderImpl) UnitRun {
+func decUnitRun(d Ptr[json.JsonDecoderImpl]) UnitRun {
     d.StartObject()
     d.ReadKey(); val unit        = decUnitId(d)
     d.ReadKey(); val assignment  = decAssignment(d)
@@ -348,7 +348,7 @@ func decUnitRun(d *json.JsonDecoderImpl) UnitRun {
     return UnitRun(Unit = unit, Assignment = assignment, Status = status, SourceTests = sourceTests, Attempts = attempts)
 }
 
-func decAssignment(d *json.JsonDecoderImpl) TaskAssignment {
+func decAssignment(d Ptr[json.JsonDecoderImpl]) TaskAssignment {
     d.StartObject()
     d.ReadKey(); val task   = decTaskId(d)
     d.ReadKey(); val unit   = decUnitId(d)
@@ -363,12 +363,12 @@ func decAssignment(d *json.JsonDecoderImpl) TaskAssignment {
     )
 }
 
-func decOptionPriorFailure(d *json.JsonDecoderImpl) Option[PriorFailure] {
+func decOptionPriorFailure(d Ptr[json.JsonDecoderImpl]) Option[PriorFailure] {
     if d.IsNull() { d.ReadNull(); return None[PriorFailure]() }
     return Some[PriorFailure](decPriorFailure(d))
 }
 
-func decSourceContext(d *json.JsonDecoderImpl) SourceContext {
+func decSourceContext(d Ptr[json.JsonDecoderImpl]) SourceContext {
     d.StartObject()
     d.ReadKey(); val text = d.ReadString()
     d.ReadKey(); val deps = decArray[DependencySnippet](d, decDependency)
@@ -376,7 +376,7 @@ func decSourceContext(d *json.JsonDecoderImpl) SourceContext {
     return SourceContext(SourceText = text, Dependencies = deps)
 }
 
-func decDependency(d *json.JsonDecoderImpl) DependencySnippet {
+func decDependency(d Ptr[json.JsonDecoderImpl]) DependencySnippet {
     d.StartObject()
     d.ReadKey(); val name = d.ReadString()
     d.ReadKey(); val text = d.ReadString()
@@ -384,7 +384,7 @@ func decDependency(d *json.JsonDecoderImpl) DependencySnippet {
     return DependencySnippet(Name = name, Text = text)
 }
 
-func decTargetConventions(d *json.JsonDecoderImpl) TargetConventions {
+func decTargetConventions(d Ptr[json.JsonDecoderImpl]) TargetConventions {
     d.StartObject()
     d.ReadKey(); val lang  = d.ReadString()
     d.ReadKey(); val notes = decArray[string](d, decStr)
@@ -392,7 +392,7 @@ func decTargetConventions(d *json.JsonDecoderImpl) TargetConventions {
     return TargetConventions(Language = lang, Notes = notes)
 }
 
-func decPriorFailure(d *json.JsonDecoderImpl) PriorFailure {
+func decPriorFailure(d Ptr[json.JsonDecoderImpl]) PriorFailure {
     d.StartObject()
     d.ReadKey(); val summary = d.ReadString()
     d.ReadKey(); val output  = d.ReadString()
@@ -401,7 +401,7 @@ func decPriorFailure(d *json.JsonDecoderImpl) PriorFailure {
     return PriorFailure(Summary = summary, Output = output, Flags = flags)
 }
 
-func decFlag(d *json.JsonDecoderImpl) UnsupportedFlag {
+func decFlag(d Ptr[json.JsonDecoderImpl]) UnsupportedFlag {
     d.StartObject()
     d.ReadKey(); val construct = d.ReadString()
     d.ReadKey(); val reason    = d.ReadString()
@@ -409,7 +409,7 @@ func decFlag(d *json.JsonDecoderImpl) UnsupportedFlag {
     return UnsupportedFlag(Construct = construct, Reason = reason)
 }
 
-func decAnswer(d *json.JsonDecoderImpl) Answer {
+func decAnswer(d Ptr[json.JsonDecoderImpl]) Answer {
     d.StartObject()
     d.ReadKey(); val task     = decTaskId(d)
     d.ReadKey(); val response = d.ReadString()
@@ -417,7 +417,7 @@ func decAnswer(d *json.JsonDecoderImpl) Answer {
     return Answer(Task = task, Response = response)
 }
 
-func decSourceTestRef(d *json.JsonDecoderImpl) SourceTestRef {
+func decSourceTestRef(d Ptr[json.JsonDecoderImpl]) SourceTestRef {
     d.StartObject()
     d.ReadKey(); val unit   = decUnitId(d)
     d.ReadKey(); val path   = d.ReadString()
@@ -426,7 +426,7 @@ func decSourceTestRef(d *json.JsonDecoderImpl) SourceTestRef {
     return SourceTestRef(Unit = unit, Path = path, Source = source)
 }
 
-func decResult(d *json.JsonDecoderImpl) Result {
+func decResult(d Ptr[json.JsonDecoderImpl]) Result {
     d.StartObject()
     d.ReadKey(); val task   = decTaskId(d)
     d.ReadKey(); val target = d.ReadString()
@@ -436,7 +436,7 @@ func decResult(d *json.JsonDecoderImpl) Result {
     return Result(Task = task, TargetText = target, Rationale = rat, Flags = flags)
 }
 
-func decClarification(d *json.JsonDecoderImpl) Clarification {
+func decClarification(d Ptr[json.JsonDecoderImpl]) Clarification {
     d.StartObject()
     d.ReadKey(); val task     = decTaskId(d)
     d.ReadKey(); val question = d.ReadString()
@@ -444,7 +444,7 @@ func decClarification(d *json.JsonDecoderImpl) Clarification {
     return Clarification(Task = task, Question = question)
 }
 
-func decUnitStatus(d *json.JsonDecoderImpl) UnitStatus {
+func decUnitStatus(d Ptr[json.JsonDecoderImpl]) UnitStatus {
     d.StartObject()
     d.ReadKey(); val tag = d.ReadString()
     val status = decUnitStatusByTag(d, tag)
@@ -452,7 +452,7 @@ func decUnitStatus(d *json.JsonDecoderImpl) UnitStatus {
     return status
 }
 
-func decUnitStatusByTag(d *json.JsonDecoderImpl, tag string) UnitStatus {
+func decUnitStatusByTag(d Ptr[json.JsonDecoderImpl], tag string) UnitStatus {
     if tag == "queued"      { return Queued() }
     if tag == "translating" { return Translating() }
     if tag == "verifying"   { return Verifying() }
@@ -463,7 +463,7 @@ func decUnitStatusByTag(d *json.JsonDecoderImpl, tag string) UnitStatus {
     go_builtins.Panic("unknown UnitStatus tag: " + tag)
 }
 
-func decProgressUpdate(d *json.JsonDecoderImpl) ProgressUpdate {
+func decProgressUpdate(d Ptr[json.JsonDecoderImpl]) ProgressUpdate {
     d.StartObject()
     d.ReadKey(); val task  = decTaskId(d)
     d.ReadKey(); val phase = phaseFromTag(d.ReadString())
@@ -472,7 +472,7 @@ func decProgressUpdate(d *json.JsonDecoderImpl) ProgressUpdate {
     return ProgressUpdate(Task = task, Phase = phase, Note = note)
 }
 
-func decEngineEvent(d *json.JsonDecoderImpl) EngineEvent {
+func decEngineEvent(d Ptr[json.JsonDecoderImpl]) EngineEvent {
     d.StartObject()
     d.ReadKey(); val tag = d.ReadString()
     val ev = decEngineEventByTag(d, tag)
@@ -480,7 +480,7 @@ func decEngineEvent(d *json.JsonDecoderImpl) EngineEvent {
     return ev
 }
 
-func decEngineEventByTag(d *json.JsonDecoderImpl, tag string) EngineEvent {
+func decEngineEventByTag(d Ptr[json.JsonDecoderImpl], tag string) EngineEvent {
     if tag == "progress" {
         d.ReadKey(); val unit = decUnitId(d)
         d.ReadKey(); val event = decProgressUpdate(d)

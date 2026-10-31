@@ -81,7 +81,7 @@ func encodeForest(forest DependencyForest) string {
     return w.String()
 }
 
-func encDependencyRun(w *json.JsonEncoderImpl, d DependencyRun) {
+func encDependencyRun(w Ptr[json.JsonEncoderImpl], d DependencyRun) {
     w.WriteStartObject()
     w.WriteKey("node");     encDependencyNode(w, d.Node)
     w.WriteKey("dest");     w.WriteString(d.Dest)
@@ -91,9 +91,9 @@ func encDependencyRun(w *json.JsonEncoderImpl, d DependencyRun) {
     w.WriteEndObject()
 }
 
-func encDependencyId(w *json.JsonEncoderImpl, id DependencyId) { w.WriteString(id.Value) }
+func encDependencyId(w Ptr[json.JsonEncoderImpl], id DependencyId) { w.WriteString(id.Value) }
 
-func encDependencyNode(w *json.JsonEncoderImpl, n DependencyNode) {
+func encDependencyNode(w Ptr[json.JsonEncoderImpl], n DependencyNode) {
     w.WriteStartObject()
     w.WriteKey("id");      w.WriteString(n.Id.Value)
     w.WriteKey("module");  w.WriteString(n.Coord.Module)
@@ -105,7 +105,7 @@ func encDependencyNode(w *json.JsonEncoderImpl, n DependencyNode) {
 
 // encDepResolution tags the sealed case with "k" and writes that case's payload —
 // including, for an in-flight dependency, its WHOLE embedded RunState / WorkspaceModel.
-func encDepResolution(w *json.JsonEncoderImpl, s DepResolution) {
+func encDepResolution(w Ptr[json.JsonEncoderImpl], s DepResolution) {
     w.WriteStartObject()
     w.WriteKey("k")
     s match {
@@ -123,14 +123,14 @@ func encDepResolution(w *json.JsonEncoderImpl, s DepResolution) {
 
 // encRunState writes the embedded per-dependency run (its units + event log), reusing
 // persist.gala's UnitRun / EngineEvent element encoders.
-func encRunState(w *json.JsonEncoderImpl, run RunState) {
+func encRunState(w Ptr[json.JsonEncoderImpl], run RunState) {
     w.WriteStartObject()
     w.WriteKey("units"); encArray[UnitRun](w, run.Units, encUnitRun)
     w.WriteKey("log");   encArray[EngineEvent](w, run.Log, encEngineEvent)
     w.WriteEndObject()
 }
 
-func encWorkspaceModel(w *json.JsonEncoderImpl, m WorkspaceModel) {
+func encWorkspaceModel(w Ptr[json.JsonEncoderImpl], m WorkspaceModel) {
     w.WriteStartObject()
     w.WriteKey("root");       w.WriteString(m.Root)
     w.WriteKey("packages");   encArray[Package](w, m.Packages, encPackage)
@@ -138,7 +138,7 @@ func encWorkspaceModel(w *json.JsonEncoderImpl, m WorkspaceModel) {
     w.WriteEndObject()
 }
 
-func encPackage(w *json.JsonEncoderImpl, p Package) {
+func encPackage(w Ptr[json.JsonEncoderImpl], p Package) {
     w.WriteStartObject()
     w.WriteKey("id");         w.WriteString(p.Id.Value)
     w.WriteKey("modulePath"); w.WriteString(p.ModulePath)
@@ -147,7 +147,7 @@ func encPackage(w *json.JsonEncoderImpl, p Package) {
     w.WriteEndObject()
 }
 
-func encUnit(w *json.JsonEncoderImpl, u Unit) {
+func encUnit(w Ptr[json.JsonEncoderImpl], u Unit) {
     w.WriteStartObject()
     w.WriteKey("id");     w.WriteString(u.Id.Value)
     w.WriteKey("path");   w.WriteString(u.Path)
@@ -156,7 +156,7 @@ func encUnit(w *json.JsonEncoderImpl, u Unit) {
     w.WriteEndObject()
 }
 
-func encDepEdge(w *json.JsonEncoderImpl, e DepEdge) {
+func encDepEdge(w Ptr[json.JsonEncoderImpl], e DepEdge) {
     w.WriteStartObject()
     w.WriteKey("from"); w.WriteString(e.From)
     w.WriteKey("to");   w.WriteString(e.To)
@@ -195,7 +195,7 @@ func decodeForest(s string) DependencyForest {
     return rebuildForest(deps, visited, maxDepth, depsBase)
 }
 
-func decDependencyRun(d *json.JsonDecoderImpl) DependencyRun {
+func decDependencyRun(d Ptr[json.JsonDecoderImpl]) DependencyRun {
     d.StartObject()
     d.ReadKey(); val node     = decDependencyNode(d)
     d.ReadKey(); val dest     = d.ReadString()
@@ -206,9 +206,9 @@ func decDependencyRun(d *json.JsonDecoderImpl) DependencyRun {
     return DependencyRun(Node = node, Dest = dest, Status = status, Depth = depth, Children = children)
 }
 
-func decDependencyId(d *json.JsonDecoderImpl) DependencyId = DependencyId(Value = d.ReadString())
+func decDependencyId(d Ptr[json.JsonDecoderImpl]) DependencyId = DependencyId(Value = d.ReadString())
 
-func decDependencyNode(d *json.JsonDecoderImpl) DependencyNode {
+func decDependencyNode(d Ptr[json.JsonDecoderImpl]) DependencyNode {
     d.StartObject()
     d.ReadKey(); val id      = d.ReadString()
     d.ReadKey(); val module  = d.ReadString()
@@ -224,7 +224,7 @@ func decDependencyNode(d *json.JsonDecoderImpl) DependencyNode {
     )
 }
 
-func decDepResolution(d *json.JsonDecoderImpl) DepResolution {
+func decDepResolution(d Ptr[json.JsonDecoderImpl]) DepResolution {
     d.StartObject()
     d.ReadKey(); val tag = d.ReadString()
     val status = decDepResolutionByTag(d, tag)
@@ -232,7 +232,7 @@ func decDepResolution(d *json.JsonDecoderImpl) DepResolution {
     return status
 }
 
-func decDepResolutionByTag(d *json.JsonDecoderImpl, tag string) DepResolution {
+func decDepResolutionByTag(d Ptr[json.JsonDecoderImpl], tag string) DepResolution {
     if tag == "pending"      { return DepPending() }
     if tag == "cloning"      { return DepCloning() }
     if tag == "resolved"     { d.ReadKey(); return DepResolved(Workspace = decWorkspaceModel(d)) }
@@ -244,7 +244,7 @@ func decDepResolutionByTag(d *json.JsonDecoderImpl, tag string) DepResolution {
     go_builtins.Panic("unknown DepResolution tag: " + tag)
 }
 
-func decRunState(d *json.JsonDecoderImpl) RunState {
+func decRunState(d Ptr[json.JsonDecoderImpl]) RunState {
     d.StartObject()
     d.ReadKey(); val units = decArray[UnitRun](d, decUnitRun)
     d.ReadKey(); val log   = decArray[EngineEvent](d, decEngineEvent)
@@ -252,7 +252,7 @@ func decRunState(d *json.JsonDecoderImpl) RunState {
     return RunState(Units = units, Log = log)
 }
 
-func decWorkspaceModel(d *json.JsonDecoderImpl) WorkspaceModel {
+func decWorkspaceModel(d Ptr[json.JsonDecoderImpl]) WorkspaceModel {
     d.StartObject()
     d.ReadKey(); val root     = d.ReadString()
     d.ReadKey(); val packages = decArray[Package](d, decPackage)
@@ -261,7 +261,7 @@ func decWorkspaceModel(d *json.JsonDecoderImpl) WorkspaceModel {
     return NewWorkspaceModelFull(packages, cross, root)
 }
 
-func decPackage(d *json.JsonDecoderImpl) Package {
+func decPackage(d Ptr[json.JsonDecoderImpl]) Package {
     d.StartObject()
     d.ReadKey(); val id     = d.ReadString()
     d.ReadKey(); val module = d.ReadString()
@@ -271,7 +271,7 @@ func decPackage(d *json.JsonDecoderImpl) Package {
     return Package(Id = PackageId(Value = id), ModulePath = module, Units = units, Edges = edges)
 }
 
-func decUnit(d *json.JsonDecoderImpl) Unit {
+func decUnit(d Ptr[json.JsonDecoderImpl]) Unit {
     d.StartObject()
     d.ReadKey(); val id     = d.ReadString()
     d.ReadKey(); val p      = d.ReadString()
@@ -281,7 +281,7 @@ func decUnit(d *json.JsonDecoderImpl) Unit {
     return Unit(Id = UnitId(Value = id), Path = p, Kind = kind, Source = source)
 }
 
-func decDepEdge(d *json.JsonDecoderImpl) DepEdge {
+func decDepEdge(d Ptr[json.JsonDecoderImpl]) DepEdge {
     d.StartObject()
     d.ReadKey(); val from = d.ReadString()
     d.ReadKey(); val to   = d.ReadString()
