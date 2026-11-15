@@ -15,7 +15,6 @@ package engine
 // readable reference fixture and a runnable target for the built binary.
 
 import (
-    . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
     . "martianoff/gala/test"
     "martianoff/gala/fs"

@@ -2,7 +2,6 @@ package ui
 
 import (
     . "github.com/martianoff/gala-tui"
-    "github.com/martianoff/gala-assimilator/app/engine"
     . "martianoff/gala/collection_immutable"
     str "martianoff/gala/strings"
     . "martianoff/gala/test"

@@ -7,7 +7,6 @@ package engine
 // needs real credentials); this proves the engine-side machinery it leans on.
 
 import (
-    . "martianoff/gala/std"
     . "martianoff/gala/test"
     strings "martianoff/gala/strings"
 )

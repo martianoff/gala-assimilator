@@ -1,8 +1,6 @@
 package engine
 
 import (
-    . "martianoff/gala/collection_immutable"
-    . "martianoff/gala/std"
     . "martianoff/gala/test"
     "martianoff/gala/fs"
     "martianoff/gala/path"

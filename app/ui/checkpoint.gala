@@ -3,7 +3,6 @@ package ui
 import (
     . "github.com/martianoff/gala-tui"
     "github.com/martianoff/gala-assimilator/app/engine"
-    "martianoff/gala/concurrent"
     "martianoff/gala/fs"
     "martianoff/gala/path"
 )

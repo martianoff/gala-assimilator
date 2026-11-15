@@ -3,7 +3,6 @@ package engine
 // Tests for the workspace model + Go-scanner stub.
 
 import (
-    . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
     . "martianoff/gala/test"
 )

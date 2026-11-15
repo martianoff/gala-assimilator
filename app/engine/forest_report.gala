@@ -9,11 +9,6 @@ package engine
 // Pure data -> string: no IO, no gala_tui, no app/ui. The UI writes the returned text
 // to <root>/.assimilator/deps.log at the same point it checkpoints the forest.
 
-import (
-    . "martianoff/gala/collection_immutable"
-    . "martianoff/gala/std"
-)
-
 // ForestReport renders the whole forest: a header, a one-line summary (done /
 // unsupported / failed counts), then one block per dependency with its coordinate,
 // resolved repo URL, depth, and — for the off-ramp states — the FULL reason.

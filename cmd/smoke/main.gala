@@ -20,7 +20,6 @@ package main
 import (
     "os"
     "fmt"
-    . "martianoff/gala/std"
     "martianoff/gala/fs"
     "martianoff/gala/path"
     "github.com/martianoff/gala-assimilator/app/engine"

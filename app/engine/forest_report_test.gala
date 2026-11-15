@@ -6,7 +6,6 @@ package engine
 
 import (
     . "martianoff/gala/collection_immutable"
-    . "martianoff/gala/std"
     . "martianoff/gala/test"
     strings "martianoff/gala/strings"
 )

@@ -5,7 +5,6 @@ import (
     "github.com/martianoff/gala-assimilator/app/engine"
     "github.com/martianoff/gala-assimilator/app/runview"
     "github.com/martianoff/gala-tui/harness"
-    . "martianoff/gala/collection_immutable"
     . "martianoff/gala/test"
 )
 
