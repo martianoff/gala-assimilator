@@ -3,7 +3,6 @@ package runview
 import (
     . "github.com/martianoff/gala-assimilator/app/engine"
     . "martianoff/gala/collection_immutable"
-    . "martianoff/gala/std"
     . "martianoff/gala/test"
 )
 

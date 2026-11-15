@@ -7,7 +7,6 @@ package engine
 // materialized to a temp dir (the suite does not stage testdata/).
 
 import (
-    . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
     . "martianoff/gala/test"
     "martianoff/gala/fs"

@@ -6,7 +6,6 @@ import (
     "github.com/martianoff/gala-assimilator/app/runview"
     . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
-    "martianoff/gala/concurrent"
     str "martianoff/gala/strings"
     . "martianoff/gala/time_utils"
     "unicode"

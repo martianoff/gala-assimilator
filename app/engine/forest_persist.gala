@@ -20,7 +20,6 @@ package engine
 
 import (
     . "martianoff/gala/std"
-    . "martianoff/gala/collection_immutable"
     "martianoff/gala/fs"
     "martianoff/gala/go_builtins"
     json "martianoff/gala/json"

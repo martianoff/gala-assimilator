@@ -18,7 +18,6 @@ package engine
 // and no acp.* run-contract type crosses into the assertions.
 
 import (
-    . "martianoff/gala/collection_immutable"
     . "martianoff/gala/std"
     . "martianoff/gala/test"
     "martianoff/gala/fs"

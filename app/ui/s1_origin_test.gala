@@ -4,7 +4,6 @@ import (
     . "github.com/martianoff/gala-tui"
     "github.com/martianoff/gala-assimilator/app/engine"
     . "martianoff/gala/collection_immutable"
-    . "martianoff/gala/std"
     str "martianoff/gala/strings"
     . "martianoff/gala/test"
 )
